@@ -1,13 +1,13 @@
 {
   "name": "blender-rocks",
   "main": "worker.mjs",
-  "compatibility_date": "2026-11-19",
+  "compatibility_date": "2026-11-17",
   "workers_dev": false,
   "preview_urls": false,
   "routes": [{ "pattern": "blender.rocks", "custom_domain": true }],
   "assets": {
     "directory": "dist/public",
-    "binding": "ASSETS",
     "run_worker_first": ["/blender.wasm", "/blender-assets.data"]
-  }
+  },
+  "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "blender-rocks-releases" }]
 }
