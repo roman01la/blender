@@ -7,7 +7,7 @@
   "routes": [{ "pattern": "blender.rocks", "custom_domain": true }],
   "assets": {
     "directory": "dist/public",
+    "binding": "ASSETS",
     "run_worker_first": ["/blender.wasm", "/blender-assets.data"]
-  },
-  "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "blender-rocks-releases" }]
+  }
 }

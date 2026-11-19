@@ -611,9 +611,7 @@ The favicon is Blender’s transparent 48-pixel Windows app icon from that
 checkout.
 
 From the web repository, deploy a verified browser package with Node.js, Python
-3.11 or later, and an authenticated Wrangler account. The following commands
-assume the dedicated R2 bucket already exists. To provision it once, run
-`npx wrangler@4.160.0 r2 bucket create blender-rocks-releases`.
+3.11 or later, and an authenticated Wrangler account.
 
 ```sh
 npx wrangler@4.160.0 whoami
@@ -621,10 +619,12 @@ python3 cloudflare/deploy.py /path/to/blender-browser
 ```
 
 Push the source commit to the public GitHub repository configured as `origin`
-before deploying. The deployed page links to that exact commit. The deployer
-uploads gzip-compressed Wasm and resource bundles to content-addressed R2 keys. Smaller
-runtime files go to Workers Static Assets. Both paths send the isolation
-headers required by Blender’s Wasm threads.
+before deploying. The deployed page links to that exact commit. Wrangler
+uploads the runtime to Workers Static Assets. The deployer gzip-compresses
+the Wasm and Blender resource bundle and splits them into pieces below
+Cloudflare's per-file limit. The Worker streams the pieces as a single
+response per runtime file. Both paths send the isolation headers required
+by Blender’s Wasm threads.
 
 Use `--stage-only` to generate `cloudflare/dist` for
 `npx wrangler@4.160.0 deploy --dry-run --config cloudflare/wrangler.jsonc`.
