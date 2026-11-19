@@ -1,7 +1,8 @@
 # Blender browser port
 
-The upstream Blender 5.4.0-alpha source at `4831affe` is in the sibling
-`blender/` checkout. Run the commands from the workspace root with
+Put this repository in the `web/` directory and clone
+[Blender 5.4.0-alpha at 4831affe](https://projects.blender.org/blender/blender/src/commit/4831affec6ebefd54061c41d60ab26a0189def42)
+into the sibling `blender/` directory. Run the commands from the workspace root with
 Emscripten 6.0.1 active. They also require CMake 3.24 or newer, Ninja, Git LFS,
 and host Python 3.13. The dependency build uses Meson and pkg-config for Rubber Band
 and Blender’s pinned Cython for generating NumPy sources. It also uses Cargo
@@ -619,13 +620,16 @@ npx wrangler@4.160.0 whoami
 python3 cloudflare/deploy.py /path/to/blender-browser
 ```
 
-The deployer uploads the Wasm, resource bundle, and release source archive to
-content-addressed R2 keys before deploying the Worker. Smaller files go to
-Workers Static Assets. Both paths send the isolation headers required by
-Blender’s Wasm threads. The source archive includes the committed port,
-pinned upstream Blender source, and its Git LFS references. The pinned Blender
-checkout and dependency build instructions above supply the LFS assets and
-external dependencies.
+Push the source commit to the public GitHub repository configured as `origin`
+before deploying. The deployed page links to that exact commit. The deployer
+uploads the Wasm and resource bundle to content-addressed R2 keys. Smaller
+runtime files go to Workers Static Assets. Both paths send the isolation
+headers required by Blender’s Wasm threads.
 
 Use `--stage-only` to generate `cloudflare/dist` for
 `npx wrangler@4.160.0 deploy --dry-run --config cloudflare/wrangler.jsonc`.
+
+## License
+
+This port of Blender is distributed under the [GNU GPL v3 or later](LICENSE).
+Individual source files and bundled dependencies retain their stated licenses.

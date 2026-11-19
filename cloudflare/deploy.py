@@ -3,41 +3,45 @@
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
-import tarfile
 import tempfile
+from urllib.request import urlopen
 
 
 PORT = Path(__file__).resolve().parents[1]
 CLOUDFLARE = PORT / "cloudflare"
-UPSTREAM = "4831affec6ebefd54061c41d60ab26a0189def42"
 BUCKET = "blender-rocks-releases"
 WRANGLER = ["npx", "--yes", "wrangler@4.160.0"]
 R2_FILES = {
     "blender.wasm": "application/wasm",
     "blender-assets.data": "application/octet-stream",
-    "blender-source.tar.gz": "application/gzip",
 }
 STATIC_LIMIT = 25 * 1024**2
 WRANGLER_R2_LIMIT = 300 * 1024**2
 
 
-def add_git_archive(target, checkout, revision, prefix):
-    env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
-    command = ["git", "-C", checkout, "archive", f"--prefix={prefix}/", revision]
-    with subprocess.Popen(command, stdout=subprocess.PIPE, env=env) as process:
-        with tarfile.open(fileobj=process.stdout, mode="r|") as source:
-            for member in source:
-                target.addfile(member, source.extractfile(member) if member.isfile() else None)
-        if process.wait():
-            raise subprocess.CalledProcessError(process.returncode, command)
+def source_url(repository, verify):
+    match = re.fullmatch(r"https://github\.com/([\w.-]+/[\w.-]+?)(?:\.git)?/?", repository)
+    if not match:
+        raise ValueError("origin must point to a public GitHub repository over HTTPS")
+    path = match[1]
+    commit = subprocess.check_output(
+        ["git", "-C", PORT, "rev-parse", "HEAD"], text=True
+    ).strip()
+    if verify:
+        raw_readme = f"https://raw.githubusercontent.com/{path}/{commit}/README.md"
+        try:
+            with urlopen(raw_readme, timeout=15) as response:
+                response.read(1)
+        except OSError as error:
+            raise ValueError(f"GitHub source commit {commit} must be publicly accessible") from error
+    return f"https://github.com/{path}/tree/{commit}"
 
 
-def stage(package, output):
+def stage(package, output, source):
     for name in ("index.html", "blender.js", "blender.wasm", "blender-assets.data",
                  "blender-cycles-webgpu.data", "oidn-webgpu.mjs",
                  "oidn-weights/rt_hdr_calb_cnrm_large.tza"):
@@ -47,6 +51,7 @@ def stage(package, output):
     public = output / "public"
     shutil.copytree(package, public, ignore=shutil.ignore_patterns(*R2_FILES))
     shutil.copyfile(PORT / "favicon.png", public / "favicon.png")
+    shutil.copyfile(PORT / "LICENSE", public / "license.txt")
     launcher = public / "index.html"
     html = launcher.read_text()
     html, favicon_count = re.subn(
@@ -57,27 +62,27 @@ def stage(package, output):
         raise ValueError("browser package has an unexpected editor launcher")
     html = html.replace(
         "</style>",
-        "  #source { color: #ddd; font-size: 0.75rem; margin: 1rem auto 0; }\n</style>",
-    ).replace(indicator, indicator + '\n  <a id="source" href="/blender-source.tar.gz">Source code</a>')
+        "  #source { font-size: 0.75rem; margin: 1rem auto 0; }\n"
+        "  #source a { color: #ddd; }\n</style>",
+    ).replace(
+        indicator,
+        f'{indicator}\n  <p id="source"><a href="{source}">Source code</a> · '
+        '<a href="./license.txt">License</a></p>',
+    )
     launcher.write_text(html)
     (public / "_headers").write_text(
         "/*\n"
         "  Cross-Origin-Opener-Policy: same-origin\n"
         "  Cross-Origin-Embedder-Policy: require-corp\n"
         "  Cross-Origin-Resource-Policy: same-origin\n"
+        "/\n"
+        f'  Link: <{source}>; rel="alternate"; title="Source code"\n'
     )
     for path in public.rglob("*"):
         if path.is_file() and path.stat().st_size > STATIC_LIMIT:
             raise ValueError(f"static asset exceeds Cloudflare's 25 MiB limit: {path}")
 
-    with tarfile.open(output / "blender-source.tar.gz", "w:gz", compresslevel=4) as source:
-        add_git_archive(source, PORT.parent / "blender", UPSTREAM, "blender")
-        add_git_archive(source, PORT, "HEAD", "web")
-
-    files = {
-        name: (output if name == "blender-source.tar.gz" else package) / name
-        for name in R2_FILES
-    }
+    files = {name: package / name for name in R2_FILES}
     objects = {}
     for name, path in files.items():
         if path.stat().st_size > WRANGLER_R2_LIMIT:
@@ -106,14 +111,17 @@ if __name__ == "__main__":
     parser.add_argument("--stage-only", action="store_true")
     args = parser.parse_args()
     try:
+        origin = subprocess.check_output(
+            ["git", "-C", PORT, "remote", "get-url", "origin"], text=True
+        ).strip()
+        source = source_url(origin, verify=not args.stage_only)
         output = CLOUDFLARE / "dist"
         with tempfile.TemporaryDirectory(dir=CLOUDFLARE, prefix=".stage-") as directory:
             staged = Path(directory) / "dist"
-            files, objects = stage(args.browser_package.resolve(), staged)
+            files, objects = stage(args.browser_package.resolve(), staged, source)
             if output.is_dir():
                 shutil.rmtree(output)
             staged.rename(output)
-        files["blender-source.tar.gz"] = output / "blender-source.tar.gz"
         if not args.stage_only:
             deploy(files, objects)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
