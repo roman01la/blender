@@ -622,7 +622,7 @@ python3 cloudflare/deploy.py /path/to/blender-browser
 
 Push the source commit to the public GitHub repository configured as `origin`
 before deploying. The deployed page links to that exact commit. The deployer
-uploads the Wasm and resource bundle to content-addressed R2 keys. Smaller
+uploads gzip-compressed Wasm and resource bundles to content-addressed R2 keys. Smaller
 runtime files go to Workers Static Assets. Both paths send the isolation
 headers required by Blender’s Wasm threads.
 

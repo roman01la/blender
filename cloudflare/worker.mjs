@@ -28,6 +28,6 @@ export default {
       return new Response(null, { status: 304, headers });
     }
     headers.set("Content-Length", String(object.size));
-    return new Response(object.body ?? null, { headers });
+    return new Response(object.body ?? null, { headers, encodeBody: "manual" });
   },
 };

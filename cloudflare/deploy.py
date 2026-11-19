@@ -16,8 +16,8 @@ CLOUDFLARE = PORT / "cloudflare"
 BUCKET = "blender-rocks-releases"
 WRANGLER = ["npx", "--yes", "wrangler@4.160.0"]
 R2_FILES = {
-    "blender.wasm": "application/wasm",
-    "blender-assets.data": "application/octet-stream",
+    "blender.wasm": ("application/wasm", "-6"),
+    "blender-assets.data": ("application/octet-stream", "-3"),
 }
 STATIC_LIMIT = 25 * 1024**2
 WRANGLER_R2_LIMIT = 300 * 1024**2
@@ -82,23 +82,30 @@ def stage(package, output, source):
         if path.is_file() and path.stat().st_size > STATIC_LIMIT:
             raise ValueError(f"static asset exceeds Cloudflare's 25 MiB limit: {path}")
 
-    files = {name: package / name for name in R2_FILES}
+    runtime = output / "runtime"
+    runtime.mkdir()
     objects = {}
-    for name, path in files.items():
+    for name, (_, level) in R2_FILES.items():
+        path = runtime / name
+        with path.open("wb") as compressed:
+            subprocess.run(
+                ["gzip", "-n", level, "-c", package / name], stdout=compressed, check=True
+            )
         if path.stat().st_size > WRANGLER_R2_LIMIT:
             raise ValueError(f"object exceeds Wrangler's 300 MiB single-upload limit: {path}")
         with path.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         objects[f"/{name}"] = f"{digest}/{name}"
     (output / "objects.json").write_text(json.dumps(objects, indent=2) + "\n")
-    return files, objects
+    return objects
 
 
-def deploy(files, objects):
-    for name, path in files.items():
+def deploy(objects, output):
+    for name, (content_type, _) in R2_FILES.items():
         subprocess.run(
             [*WRANGLER, "r2", "object", "put", f"{BUCKET}/{objects[f'/{name}']}",
-             "--file", path, "--content-type", R2_FILES[name], "--remote"],
+             "--file", output / "runtime" / name, "--content-type", content_type,
+             "--content-encoding", "gzip", "--remote"],
             cwd=CLOUDFLARE,
             check=True,
         )
@@ -118,11 +125,11 @@ if __name__ == "__main__":
         output = CLOUDFLARE / "dist"
         with tempfile.TemporaryDirectory(dir=CLOUDFLARE, prefix=".stage-") as directory:
             staged = Path(directory) / "dist"
-            files, objects = stage(args.browser_package.resolve(), staged, source)
+            objects = stage(args.browser_package.resolve(), staged, source)
             if output.is_dir():
                 shutil.rmtree(output)
             staged.rename(output)
         if not args.stage_only:
-            deploy(files, objects)
+            deploy(objects, output)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"{error}\n")
