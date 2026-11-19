@@ -1,0 +1,25 @@
+[binaries]
+c = '@CMAKE_C_COMPILER@'
+cpp = '@CMAKE_CXX_COMPILER@'
+ar = '@wasm_ar@'
+cython = ['@BLENDER_WEB_NUMPY_BUILD_PYTHON@', '-m', 'cython']
+python = '@BLENDER_WEB_NUMPY_BUILD_PYTHON@'
+pkg-config = '@pkg_config_program@'
+
+[host_machine]
+system = 'emscripten'
+cpu_family = '@wasm_architecture@'
+cpu = '@wasm_architecture@'
+endian = 'little'
+
+[properties]
+needs_exe_wrapper = true
+wasm_native_exceptions = @numpy_native_exceptions@
+pkg_config_libdir = ['@BLENDER_WEB_SYSROOT@/lib/pkgconfig']
+longdouble_format = 'IEEE_QUAD_LE'
+
+[built-in options]
+c_args = ['@numpy_c_flags@']
+cpp_args = ['@numpy_cxx_flags@']
+c_link_args = ['@numpy_c_flags@']
+cpp_link_args = ['@numpy_cxx_flags@']

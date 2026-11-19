@@ -1,0 +1,47 @@
+--- a/opensubdiv/far/stencilBuilder.cpp
++++ b/opensubdiv/far/stencilBuilder.cpp
+@@ -113,6 +113,11 @@
+         , _coarseVertCount(coarseVerts)
+         , _compactWeights(compactWeights)
+     {
++#if defined(__EMSCRIPTEN__)
++        if (_compactWeights && !genCtrlVertStencils) {
++            _lastSourceOffset.resize(coarseVerts, -1);
++        }
++#endif
+         // These numbers were chosen by profiling production assets at uniform
+         // level 3.
+         size_t n = std::max(coarseVerts,
+@@ -303,6 +308,20 @@
+                // performance than accessing the class members directly.
+                int lastOffset, int tableSize, WACCUM weights)
+     {
++#if defined(__EMSCRIPTEN__)
++        // A coarse vertex's last offset is a hit only inside the current stencil.
++        // This keeps the original weight order and avoids clearing between stencils.
++        if (static_cast<size_t>(src) < _lastSourceOffset.size()) {
++            int& previous = _lastSourceOffset[src];
++            if (previous >= lastOffset && previous < tableSize && _dests[lastOffset] == dst) {
++                weights.Add(previous, weight*weightFactor);
++                return;
++            }
++            previous = tableSize;
++            add(src, dst, weight*weightFactor, weights);
++            return;
++        }
++#endif
+         // The lastOffset is the vertex we're currently processing, by
+         // leveraging this we need not lookup the dest stencil size or offset.
+         //
+@@ -385,6 +404,11 @@
+     std::vector<int> _indices;
+     std::vector<int> _sizes;
+ 
++#if defined(__EMSCRIPTEN__)
++    // Newest entry for each coarse control vertex in compacted stencils.
++    std::vector<int> _lastSourceOffset;
++#endif
++
+     // Acceleration members to avoid pointer chasing and reverse loops.
+     int _size;
+     int _lastOffset;

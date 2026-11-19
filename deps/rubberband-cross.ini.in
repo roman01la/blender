@@ -1,0 +1,21 @@
+[binaries]
+c = '@CMAKE_C_COMPILER@'
+cpp = '@CMAKE_CXX_COMPILER@'
+ar = '@wasm_ar@'
+pkg-config = '@pkg_config_program@'
+
+[host_machine]
+system = 'emscripten'
+cpu_family = '@wasm_architecture@'
+cpu = '@wasm_architecture@'
+endian = 'little'
+
+[properties]
+needs_exe_wrapper = true
+pkg_config_libdir = ['@BLENDER_WEB_SYSROOT@/lib/pkgconfig']
+
+[built-in options]
+c_args = ['@meson_c_flags@']
+cpp_args = ['@meson_cxx_flags@']
+c_link_args = ['@meson_c_flags@']
+cpp_link_args = ['@meson_cxx_flags@']

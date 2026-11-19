@@ -1,0 +1,109 @@
+--- a/intern/cycles/blender/addon/properties.py
++++ b/intern/cycles/blender/addon/properties.py
+@@ -22,6 +22,8 @@
+ 
+ from math import pi
+ 
++import os
++import sys
+ import warnings
+ 
+ # enums
+@@ -425,6 +427,20 @@
+     return value
+ 
+ 
++def webgpu_available():
++    if sys.platform != 'emscripten':
++        return False
++
++    import _cycles
++    return bool(_cycles.available_devices('WEBGPU'))
++
++
++def webgpu_denoising_available():
++    import _cycles
++    return (webgpu_available() and _cycles.with_openimagedenoise and
++            os.path.isfile('/cycles-webgpu/oidn-webgpu.enabled'))
++
++
+ class CyclesRenderSettings(bpy.types.PropertyGroup):
+     __slots__ = ()
+ 
+@@ -432,7 +448,7 @@
+         name="Device",
+         description="Device to use for rendering",
+         items=enum_devices,
+-        default='CPU',
++        default='GPU' if webgpu_available() else 'CPU',
+         update=update_render_passes,
+     )
+     shading_system: BoolProperty(
+@@ -481,7 +497,7 @@
+     denoising_use_gpu: BoolProperty(
+         name="Denoise on GPU",
+         description="Perform denoising on GPU devices configured in the system tab in the user preferences. This is significantly faster than on CPU, but requires additional GPU memory. When large scenes need more GPU memory, this option can be disabled",
+-        default=False,
++        default=webgpu_denoising_available(),
+     )
+ 
+     use_preview_denoising: BoolProperty(
+@@ -1683,6 +1699,9 @@
+ 
+     @staticmethod
+     def default_device():
++        if webgpu_available():
++            return 7  # WEBGPU
++
+         import platform
+         # Default to selecting the Metal compute device on Apple Silicon GPUs
+         # (drivers are tightly integrated with macOS so pose no stability risk)
+--- a/intern/cycles/blender/addon/__init__.py
++++ b/intern/cycles/blender/addon/__init__.py
+@@ -130,6 +130,22 @@
+ cli_commands = []
+ 
+ 
++@bpy.app.handlers.persistent
++def init_webgpu_preferences(_):
++    addon = bpy.context.preferences.addons.get(__package__)
++    if addon and addon.preferences.compute_device_type == 'WEBGPU':
++        # Use Cycles' existing device registration and retain stored device flags.
++        addon.preferences.get_device_list('WEBGPU')
++
++
++@bpy.app.handlers.persistent
++def init_webgpu_startup_scene(_):
++    if not bpy.context.preferences.app_template:
++        scene = bpy.context.scene
++        if scene is not None and scene.render.engine == 'BLENDER_EEVEE':
++            scene.render.engine = CyclesRender.bl_idname
++
++
+ def register():
+     from bpy.utils import register_class
+     from . import ui
+@@ -155,6 +171,11 @@
+ 
+     bpy.app.handlers.version_update.append(version_update.do_versions)
+ 
++    if properties.webgpu_available():
++        init_webgpu_preferences(None)
++        bpy.app.handlers.load_factory_preferences_post.append(init_webgpu_preferences)
++        bpy.app.handlers.load_factory_startup_post.append(init_webgpu_startup_scene)
++
+     cli_commands.append(bpy.utils.register_cli_command("maketx", maketx_command))
+ 
+ 
+@@ -166,6 +187,11 @@
+     from . import presets
+ 
+     bpy.app.handlers.version_update.remove(version_update.do_versions)
++    for handlers, callback in (
++            (bpy.app.handlers.load_factory_preferences_post, init_webgpu_preferences),
++            (bpy.app.handlers.load_factory_startup_post, init_webgpu_startup_scene)):
++        if callback in handlers:
++            handlers.remove(callback)
+ 
+     for cmd in cli_commands:
+         bpy.utils.unregister_cli_command(cmd)

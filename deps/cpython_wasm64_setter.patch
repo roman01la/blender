@@ -1,0 +1,79 @@
+--- a/Include/internal/pycore_emscripten_trampoline.h
++++ b/Include/internal/pycore_emscripten_trampoline.h
+@@ -53,8 +53,14 @@
+ #define _PyCFunctionWithKeywords_TrampolineCall(meth, self, args, kw) \
+     _PyEM_TrampolineCall((meth), (self), (args), (kw))
+ 
++#ifdef __wasm64__
++int _PyEM_TrampolineCall_Setter(setter set, PyObject *obj, PyObject *value, void *closure);
++#define descr_set_trampoline_call(set, obj, value, closure) \
++    _PyEM_TrampolineCall_Setter((set), (obj), (value), (closure))
++#else
+ #define descr_set_trampoline_call(set, obj, value, closure) \
+     ((int)_PyEM_TrampolineCall((PyCFunctionWithKeywords)(set), (obj), (value), (PyObject*)(closure)))
++#endif
+ 
+ #define descr_get_trampoline_call(get, obj, closure) \
+     _PyEM_TrampolineCall((PyCFunctionWithKeywords)(get), (obj), (PyObject*)(closure), NULL)
+--- a/Python/emscripten_trampoline.c
++++ b/Python/emscripten_trampoline.c
+@@ -5,6 +5,11 @@
+ #include "pycore_runtime.h"         // _PyRuntime
+ 
+ 
++#if defined(__wasm64__)
++EM_JS(int, _PyEM_detect_type_reflection, (void), {
++    return true;
++});
++#else
+ /**
+  * This is the GoogleChromeLabs approved way to feature detect type-reflection:
+  * https://github.com/GoogleChromeLabs/wasm-feature-detect/blob/main/src/detectors/type-reflection/index.js
+@@ -22,6 +27,7 @@
+     }
+     return true;
+ });
++#endif
+ 
+ void
+ _Py_EmscriptenTrampoline_Init(_PyRuntimeState *runtime)
+@@ -42,6 +48,16 @@
+ }
+ );
+ 
++#if defined(__wasm64__)
++/*
++ * Wasm functions expose their parameter count through length. Read the function
++ * itself because the dynamic loader can reuse a table slot. This lets callers
++ * use typed Wasm calls and keep the stack suspendable with JSPI.
++ */
++EM_JS(int, _PyEM_CountFuncParams, (PyCFunctionWithKeywords func), {
++    return wasmTable.get(func).length;
++});
++#else
+ /**
+  * In runtimes with WebAssembly type reflection, count the number of parameters
+  * and cast to the appropriate signature
+@@ -60,6 +76,22 @@
+ _PyEM_CountFuncParams.cache = new Map();
+ )
+ 
++#endif
++
++
++#ifdef __wasm64__
++/* Setters return i32, unlike getters and methods that return an i64 pointer. */
++int
++_PyEM_TrampolineCall_Setter(setter set, PyObject *obj, PyObject *value, void *closure)
++{
++    switch (_PyEM_CountFuncParams((PyCFunctionWithKeywords)set)) {
++        case 0: return ((int (*)(void))set)();
++        case 1: return ((int (*)(PyObject *))set)(obj);
++        case 2: return ((int (*)(PyObject *, PyObject *))set)(obj, value);
++        default: return set(obj, value, closure);
++    }
++}
++#endif
+ 
+ typedef PyObject* (*zero_arg)(void);
+ typedef PyObject* (*one_arg)(PyObject*);

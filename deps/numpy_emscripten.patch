@@ -1,0 +1,66 @@
+--- a/vendored-meson/meson/mesonbuild/scripts/python_info.py
++++ b/vendored-meson/meson/mesonbuild/scripts/python_info.py
+@@ -110,6 +110,14 @@
+ # Whether we're targeting a free-threaded CPython interpreter
+ is_freethreaded = bool(variables.get('Py_GIL_DISABLED', False))
+ 
++# The build-time interpreter runs on the host. Describe the target CPython
++# headers and extension format to Meson when building the Wasm package.
++wasm_include = os.environ.get('BLENDER_WASM_PYTHON_INCLUDE')
++if wasm_include:
++    paths.update(include=wasm_include, platinclude=wasm_include)
++    variables.update(INCLUDEPY=wasm_include, LIBPC=None, LIBPYTHON='')
++    suffix = limited_api_suffix = '.so'
++
+ print(json.dumps({
+   'variables': variables,
+   'paths': paths,
+--- a/vendored-meson/meson/mesonbuild/scripts/depfixer.py
++++ b/vendored-meson/meson/mesonbuild/scripts/depfixer.py
+@@ -475,6 +475,10 @@
+             pass
+         else:
+             raise
++    # Wasm side modules have no native rpaths.
++    with open(fname, 'rb') as module:
++        if module.read(4) == b'\0asm':
++            return
+     # We don't look for this on import because it will do a useless PATH lookup
+     # on non-mac platforms. That can be expensive on some Windows machines
+     # (up to 30ms), which is significant with --only-changed. For details, see:
+--- a/vendored-meson/meson/mesonbuild/modules/python.py
++++ b/vendored-meson/meson/mesonbuild/modules/python.py
+@@ -217,6 +217,12 @@
+                 kwargs['link_args'] = new_link_args
+ 
+         kwargs['dependencies'] = new_deps
++
++        if self.interpreter.environment.machines[kwargs['native']].system == 'emscripten':
++            # Expose the Python entry point without interposing C++ internals in the main module.
++            link_args = mesonlib.extract_as_list(kwargs, 'link_args')
++            link_args.extend(('-sSIDE_MODULE=2', f'-Wl,-Bsymbolic,--export=PyInit_{args[0]}'))
++            kwargs['link_args'] = link_args
+ 
+         # msys2's python3 has "-cpython-36m.dll", we have to be clever
+         # FIXME: explain what the specific cleverness is here
+--- a/numpy/_core/meson.build
++++ b/numpy/_core/meson.build
+@@ -715,8 +715,15 @@
+-# CPP exceptions are handled in the unique_hash code and therefore the `-fexceptions`
+-# flag.
++# The unique_hash code catches C++ exceptions.
+ unique_hash_cpp_args = c_args_common
++unique_hash_exceptions = '-fexceptions'
++if host_machine.system() == 'emscripten'
++  # Keep libc++ template instantiations local to the NumPy extension.
++  unique_hash_cpp_args += ['-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS', '-fvisibility=hidden']
++  if meson.get_external_property('wasm_native_exceptions', false)
++    unique_hash_exceptions = '-fwasm-exceptions'
++  endif
++endif
+ if cc.get_argument_syntax() != 'msvc'
+   unique_hash_cpp_args += [
+-    '-fexceptions',
++    unique_hash_exceptions,
+     '-fno-rtti',  # no runtime type information
+   ]

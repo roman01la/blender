@@ -1,0 +1,21 @@
+[package]
+name = "blender-web-shader-translator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+naga = { version = "=30.0.1", features = ["spv-in", "wgsl-out"] }
+spirv = "0.4"
+
+[dev-dependencies]
+naga = { version = "=30.0.1", features = ["wgsl-in"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

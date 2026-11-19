@@ -1,0 +1,18 @@
+--- a/src/cmake/Config.cmake.in
++++ b/src/cmake/Config.cmake.in
+@@ -22,6 +22,15 @@
+     # configuration error about unknown targets being linked in.
+     find_dependency(TIFF)
+     find_dependency(OpenColorIO)
++    find_dependency(OpenEXR CONFIG)
++    find_dependency(OpenJPEG CONFIG)
++    find_dependency(WebP CONFIG)
++    find_dependency(libheif CONFIG)
++    find_dependency(libjpeg-turbo CONFIG)
++    find_dependency(pugixml CONFIG)
++    if (TARGET pugixml AND NOT TARGET pugixml::pugixml)
++        add_library(pugixml::pugixml ALIAS pugixml)
++    endif ()
+     if (@JPEG_FOUND@)
+         find_dependency(JPEG)
+     endif()

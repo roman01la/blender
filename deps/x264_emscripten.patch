@@ -1,0 +1,25 @@
+--- a/config.sub
++++ b/config.sub
+@@ -1371,7 +1371,7 @@
+ 	      | -interix* | -uwin* | -mks* | -rhapsody* | -darwin* | -opened* \
+ 	      | -openstep* | -oskit* | -conix* | -pw32* | -nonstopux* \
+ 	      | -storm-chaos* | -tops10* | -tenex* | -tops20* | -its* \
+-	      | -os2* | -vos* | -palmos* | -uclinux* | -nucleus* \
++	      | -os2* | -vos* | -palmos* | -uclinux* | -nucleus* | -emscripten* \
+ 	      | -morphos* | -superux* | -rtmk* | -rtmk-nova* | -windiss* \
+ 	      | -powermax* | -dnix* | -nx6 | -nx7 | -sei* | -dragonfly* \
+ 	      | -skyos* | -haiku* | -rdos* | -toppers* | -drops* | -es*)
+--- a/configure
++++ b/configure
+@@ -684,6 +684,11 @@
+         define HAVE_MALLOC_H
+         libm="-lm"
+         ;;
++    emscripten*)
++        SYS="EMSCRIPTEN"
++        define HAVE_MALLOC_H
++        libm="-lm"
++        ;;
+     gnu*)
+         SYS="HURD"
+         define HAVE_MALLOC_H

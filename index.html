@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="./favicon.png">
+<title>Blender WebGPU smoke test</title>
+<canvas id="gpu" width="512" height="512" aria-label="WebGPU test output"></canvas>
+<p id="status" role="status">Starting WebGPU…</p>
+<script type="module">
+  import createModule from "./webgpu-smoke.mjs";
+
+  const status = document.querySelector("#status");
+  try {
+    await createModule({ setGpuStatus: (message) => { status.textContent = message; } });
+  } catch (error) {
+    status.textContent = error.message;
+  }
+</script>
+</html>

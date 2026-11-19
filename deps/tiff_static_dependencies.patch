@@ -1,0 +1,21 @@
+--- a/cmake/TiffConfig.cmake.in
++++ b/cmake/TiffConfig.cmake.in
+@@ -1,5 +1,17 @@
+ if(NOT "@BUILD_SHARED_LIBS@")
+-    # TODO: import dependencies
++    include(CMakeFindDependencyMacro)
++    if(@ZLIB_SUPPORT@)
++        find_dependency(ZLIB)
++    endif()
++    if(@LIBDEFLATE_SUPPORT@)
++        find_dependency(libdeflate CONFIG)
++        if(NOT TARGET Deflate::Deflate)
++            add_library(Deflate::Deflate ALIAS libdeflate::libdeflate_static)
++        endif()
++    endif()
++    if(@JPEG_SUPPORT@)
++        find_dependency(JPEG)
++    endif()
+ endif()
+ 
+ function(set_variable_from_rel_or_absolute_path var root rel_or_abs_path)

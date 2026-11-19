@@ -1,0 +1,2 @@
+[binaries]
+cython = ['@BLENDER_WEB_NUMPY_BUILD_PYTHON@', '-m', 'cython']

@@ -1,0 +1,11 @@
+--- a/common/sys/alloc.cpp
++++ b/common/sys/alloc.cpp
+@@ -368,7 +368,7 @@
+   /* hint for transparent huge pages (THP) */
+   void os_advise(void* pptr, size_t bytes)
+   {
+-#if defined(MADV_HUGEPAGE)
++#if defined(MADV_HUGEPAGE) && !defined(__EMSCRIPTEN__)
+     madvise(pptr,bytes,MADV_HUGEPAGE); 
+ #endif
+   }
