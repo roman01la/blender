@@ -1,5 +1,34 @@
 # Blender browser port
 
+An experimental port of Blender 5.4.0-alpha to WebAssembly and WebGPU.
+It runs Blender's editor in a browser worker and reuses Blender's rendering
+code for EEVEE and Cycles.
+
+**[Open Blender in your browser](https://blender.rocks/)**
+
+The hosted build was tested in Chrome on macOS. It requires WebAssembly
+Memory64, threads, WebGPU, and an OffscreenCanvas in a worker. After the
+workspace opens, choose **Render → Render Image** or press **F12**.
+
+## Rendering status
+
+- The factory General scene in the hosted build selects Cycles, WebGPU
+  tracing, and WebGPU Open Image Denoise (OIDN).
+- Supported Cycles renders use adaptive sampling and update Blender's Render
+  Result and progress bar while the editor remains responsive. The live
+  preview is drawn on WebGPU. The film stays on WebGPU through denoising and
+  is read back when Cycles hands the finished film to Blender's Render Result.
+- Supported compositor-enabled F12 renders run Blender's stock CPU
+  compositor in the background after that handoff. Unsupported Cycles
+  features can use CPU tracing. See the [Cycles WebGPU notes](cycles-webgpu/README.md)
+  for supported materials, lighting, and render passes.
+
+The hosted build completed a 2560 × 1440 adaptive render in Chrome with an
+area light, point fill, and HDRI. Cycles tracing and all three OIDN filters
+ran on WebGPU, and the stock Exposure compositor graph ran on CPU.
+
+## Build from source
+
 Put this repository in the `web/` directory and clone
 [Blender 5.4.0-alpha at 4831affe](https://projects.blender.org/blender/blender/src/commit/4831affec6ebefd54061c41d60ab26a0189def42)
 into the sibling `blender/` directory. Run the commands from the workspace root with
@@ -520,6 +549,12 @@ python3 web/package_blender.py build/blender-install build/blender-browser
 python3 web/serve.py build/blender-browser
 ```
 
+To package the Cycles WebGPU and OIDN features from the hosted build, generate
+the [Cycles scheduler shaders](cycles-webgpu/README.md#build-the-scheduler-shaders),
+including the adaptive shaders and [OIDN runtime](cycles-webgpu/README.md#cycles-denoising),
+in one output directory. Pass that directory as `--cycles-webgpu` when running
+`package_blender.py`.
+
 On macOS and Linux, the development launcher allows one listening server per
 project checkout. If it is already running, the launcher reports its URL.
 The page transfers its canvas to a dedicated editor worker and forwards input
@@ -552,7 +587,7 @@ Build the Python child runtime with the same Wasm64 dependency sysroot as
 Blender, then pass its output directory to the browser packager.
 
 ```sh
-python3 web/python-process/build.py build/web-deps/sysroot build/python-process
+python3 web/python-process/build.py build/deps64/sysroot build/python-process
 python3 web/package_blender.py build/blender-install build/blender-browser \
   --python-process build/python-process
 ```
@@ -586,8 +621,8 @@ the optional shared-memory worker profile with position-independent CPython,
 zlib, bzip2, and Expat archives from a clean build of `web/deps`.
 
 ```sh
-python3 web/python-process/build.py build/web-deps/sysroot build/python-process \
-  --shared-memory-sysroot build/web-deps/sysroot
+python3 web/python-process/build.py build/deps64/sysroot build/python-process \
+  --shared-memory-sysroot build/deps64/sysroot
 ```
 
 The profile relocates each interpreter into a private 64 MiB arena in
@@ -605,10 +640,9 @@ children remain pending.
 
 ## Deploy to blender.rocks
 
-This repository contains the browser port. Keep the upstream Blender checkout
-as the sibling `blender/` directory at `4831affec6ebefd54061c41d60ab26a0189def42`.
-The favicon is Blender’s transparent 48-pixel Windows app icon from that
-checkout.
+The [live site](https://blender.rocks/) uses a Cloudflare Worker on the
+`blender.rocks` custom domain. Its favicon comes from Blender's Windows app
+assets in the pinned upstream checkout.
 
 From the web repository, deploy a verified browser package with Node.js, Python
 3.11 or later, and an authenticated Wrangler account. The following commands
@@ -621,10 +655,10 @@ python3 cloudflare/deploy.py /path/to/blender-browser
 ```
 
 Push the source commit to the public GitHub repository configured as `origin`
-before deploying. The deployed page links to that exact commit. The deployer
-uploads gzip-compressed Wasm and resource bundles to content-addressed R2 keys. Smaller
-runtime files go to Workers Static Assets. Both paths send the isolation
-headers required by Blender’s Wasm threads.
+before deploying. The site links directly to that commit on GitHub. Cloudflare
+serves the gzip-compressed Wasm and resource bundle from R2 and the other
+runtime files from Workers Static Assets. Both paths send the isolation
+headers required by Blender's Wasm threads.
 
 Use `--stage-only` to generate `cloudflare/dist` for
 `npx wrangler@4.160.0 deploy --dry-run --config cloudflare/wrangler.jsonc`.
