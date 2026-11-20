@@ -81,8 +81,27 @@ self.BlenderLocalFiles = class {
     return state;
   }
 
+  addFile(path, file) {
+    const node = this.fs.create(path, 0o666);
+    node.usedBytes = file.size;
+    node.mtime = file.lastModified;
+    this.watch(node, file);
+  }
+
   async mount(handle, writable) {
     const root = "/home/web_user/Local Folders/" + crypto.randomUUID();
+    if (Array.isArray(handle)) {
+      if (writable) throw new Error("Choose a folder for write access.");
+      const names = new Set(handle.map(file => file.name));
+      if (names.size !== handle.length ||
+          [...names].some(name => !name || name === "." || name === ".." || /[/\\]/.test(name))) {
+        throw new Error("The selected files must have distinct, valid names.");
+      }
+      const path = root + "/Selected Files";
+      this.fs.mkdirTree(path);
+      for (const file of handle) this.addFile(path + "/" + file.name, file);
+      return path;
+    }
     this.fs.mkdirTree(root);
     const entries = new Map();
     const populate = async (directory, path) => {
@@ -93,10 +112,7 @@ self.BlenderLocalFiles = class {
           await populate(entry, child);
         } else {
           const file = await entry.getFile();
-          const node = this.fs.create(child, 0o666);
-          node.usedBytes = file.size;
-          node.mtime = file.lastModified;
-          this.watch(node, file);
+          this.addFile(child, file);
           entries.set(child, file);
         }
       }

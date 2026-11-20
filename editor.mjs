@@ -43,19 +43,19 @@ export function startEditor(assets) {
     types: [{ description: "Blender Projects", accept: { "application/x-blender": [".blend"] } }],
   };
 
-  function chooseBlendFromInput() {
+  function chooseFilesFromInput({ accept = "", multiple = false } = {}) {
     return new Promise((resolve, reject) => {
       const picker = document.createElement("input");
       picker.type = "file";
-      picker.accept = ".blend";
+      picker.accept = accept;
+      picker.multiple = multiple;
       picker.hidden = true;
       function finish(value) {
         picker.remove();
         resolve(value);
       }
       picker.addEventListener("change", () => {
-        const file = picker.files[0];
-        finish(file ? { file, handle: null } : null);
+        finish(picker.files.length ? [...picker.files] : null);
       }, { once: true });
       picker.addEventListener("cancel", () => finish(null), { once: true });
       document.body.append(picker);
@@ -69,7 +69,7 @@ export function startEditor(assets) {
     });
   }
 
-  function requestFilePicker(title, action, choose) {
+  function requestFilePicker(title, action, choose, alternative) {
     let dialog;
     let settled = false;
     const cleanup = () => dialog?.remove();
@@ -86,9 +86,9 @@ export function startEditor(assets) {
         send("filePickerResult", null, error.message || String(error));
       }
     };
-    const run = async () => {
+    const run = async pick => {
       try {
-        finish(await choose());
+        finish(await pick());
       } catch (error) {
         if (error.name === "AbortError") {
           finish(null);
@@ -103,26 +103,31 @@ export function startEditor(assets) {
       dialog = document.createElement("dialog");
       dialog.style.colorScheme = "dark";
       dialog.setAttribute("aria-label", title);
-      const confirm = document.createElement("button");
-      confirm.textContent = action;
+      const choices = [{ action, choose }];
+      if (alternative) choices.push(alternative);
+      const buttons = choices.map(choice => {
+        const button = document.createElement("button");
+        button.textContent = choice.action;
+        button.addEventListener("click", () => {
+          for (const button of buttons) button.disabled = true;
+          void run(choice.choose);
+        }, { once: true });
+        return button;
+      });
       const cancel = document.createElement("button");
       cancel.textContent = "Cancel";
-      confirm.addEventListener("click", () => {
-        confirm.disabled = true;
-        void run();
-      }, { once: true });
       cancel.addEventListener("click", () => finish(null), { once: true });
       dialog.addEventListener("cancel", event => {
         event.preventDefault();
         finish(null);
       }, { once: true });
-      dialog.append(confirm, " ", cancel);
+      dialog.append(...buttons.flatMap(button => [button, " "]), cancel);
       document.body.append(dialog);
       dialog.showModal();
     }
 
     signal.addEventListener("abort", cleanup, { once: true });
-    if (navigator.userActivation?.isActive !== false) void run();
+    if (!alternative && navigator.userActivation?.isActive !== false) void run(choose);
     else promptForClick();
   }
 
@@ -229,7 +234,10 @@ export function startEditor(assets) {
           break;
         case "chooseBlendFile":
           requestFilePicker("Open Blender Project", "Choose .blend File", async () => {
-            if (!window.showOpenFilePicker) return chooseBlendFromInput();
+            if (!window.showOpenFilePicker) {
+              const files = await chooseFilesFromInput({ accept: ".blend" });
+              return files ? { file: files[0], handle: null } : null;
+            }
             const [handle] = await window.showOpenFilePicker(blendPickerOptions);
             return { file: await handle.getFile(), handle };
           });
@@ -243,15 +251,21 @@ export function startEditor(assets) {
             window.showSaveFilePicker({ ...blendPickerOptions, suggestedName: args[0] })
           ));
           break;
-        case "chooseLocalDirectory":
-          if (!window.showDirectoryPicker) {
+        case "chooseLocalDirectory": {
+          const mode = args[0];
+          const chooseFolder = window.showDirectoryPicker &&
+            (() => window.showDirectoryPicker({ mode }));
+          if (mode === "read") {
+            requestFilePicker("Open Local Files", "Choose Files",
+              () => chooseFilesFromInput({ multiple: true }),
+              chooseFolder ? { action: "Choose Folder", choose: chooseFolder } : undefined);
+          } else if (chooseFolder) {
+            requestFilePicker("Select a Local Folder", "Choose Folder", chooseFolder);
+          } else {
             send("filePickerResult", null, "This browser does not support selecting a local folder.");
-            break;
           }
-          requestFilePicker("Select a Local Folder", "Choose Folder", () => (
-            window.showDirectoryPicker({ mode: args[0] })
-          ));
           break;
+        }
         case "requestBlendFileWrite":
           requestFilePicker("Allow Blender to Write", "Allow Write Access", async () => (
             await args[0].requestPermission({ mode: "readwrite" }) === "granted"
