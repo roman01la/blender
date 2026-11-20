@@ -435,6 +435,7 @@ void WebGPUShader::init(const ShaderCreateInfo &info, const bool is_codegen_only
   for (const auto &builtin : info.builtins_) {
     if (builtin.conditions.evaluate(info.compilation_constants_)) {
       point_builtins |= builtin.bit & (BuiltinBits::POINT_SIZE | BuiltinBits::POINT_COORD);
+      barycentric_coords_ |= bool(builtin.bit & BuiltinBits::BARYCENTRIC_COORD);
     }
   }
   point_sprites_ = point_builtins != BuiltinBits::NONE;
@@ -448,11 +449,13 @@ void WebGPUShader::init(const ShaderCreateInfo &info, const bool is_codegen_only
     error_ = "the WebGPU adapter does not support dual-source color blending";
     return;
   }
-  if (point_sprites_) {
+  if (point_sprites_ || barycentric_coords_) {
     for (const auto &attribute : info.vertex_inputs_) {
-      point_vertex_id_location_ = std::max(point_vertex_id_location_,
-                                           uint32_t(attribute.index) + 1);
-      point_inputs_.push_back({uint32_t(attribute.index), attribute.type, attribute.name.c_str()});
+      if (point_sprites_) {
+        point_vertex_id_location_ = std::max(point_vertex_id_location_,
+                                             uint32_t(attribute.index) + 1);
+      }
+      pull_inputs_.push_back({uint32_t(attribute.index), attribute.type, attribute.name.c_str()});
     }
   }
   if (!info.geometry_source_.is_empty()) {
@@ -980,9 +983,9 @@ std::string WebGPUShader::resources_declare(const ShaderCreateInfo &info) const
    * the per-draw uniform block in std140 layout. */
   if (point_sprites_) {
     out << "struct BlenderPointState { vec2 pixel_to_ndc; float fixed_size; "
-           "int instance; uint indexed; uvec4 stream_offsets[4]; };\n";
+           "int instance; uint indexed; };\n";
   }
-  if (!info.push_constants_.is_empty() || point_sprites_) {
+  if (!info.push_constants_.is_empty() || point_sprites_ || barycentric_coords_) {
     out << "layout(set=0,binding=0,std140) uniform BlenderDrawConstants {\n";
     for (const auto &constant : info.push_constants_) {
       out << constant.type << " " << constant.name;
@@ -993,6 +996,9 @@ std::string WebGPUShader::resources_declare(const ShaderCreateInfo &info) const
     }
     if (point_sprites_) {
       out << "BlenderPointState blender_point_state;\n";
+    }
+    if (point_sprites_ || barycentric_coords_) {
+      out << "uvec4 blender_vertex_stream_offsets[4];\n";
     }
     out << "};\n";
   }
@@ -1061,14 +1067,15 @@ std::string WebGPUShader::vertex_interface_declare(const ShaderCreateInfo &info)
 {
   std::ostringstream out;
   std::ostringstream transfer;
+  const bool can_pull = point_sprites_ || barycentric_coords_;
   for (const auto &attribute : info.vertex_inputs_) {
-    if (point_sprites_) {
-      out << "#ifdef BLENDER_INDIRECT_POINT_DRAW\n"
+    if (can_pull) {
+      out << "#ifdef BLENDER_VERTEX_PULL\n"
           << attribute.type << " " << attribute.name << ";\n#else\n";
     }
     out << "layout(location=" << attribute.index << ") in " << attribute.type << " "
         << attribute.name << ";\n";
-    if (point_sprites_) {
+    if (can_pull) {
       out << "#endif\n";
     }
   }
@@ -1076,25 +1083,34 @@ std::string WebGPUShader::vertex_interface_declare(const ShaderCreateInfo &info)
   if (point_coord_) {
     out << "layout(location=" << location << ") noperspective out vec2 blender_point_coord;\n";
   }
-  if (point_sprites_) {
-    /* The four strip vertices share the attributes of a single point instance.
-     * Keep the original point and instance IDs visible to Blender's shader
-     * code. */
-    out << "float blender_point_size;\n"
-           "#define gl_PointSize blender_point_size\n"
+  if (barycentric_coords_) {
+    /* Use the same corner order and interpolation as Blender's OpenGL geometry shader. */
+    out << "layout(location=" << location << ") smooth out vec3 gpu_BaryCoord;\n";
+  }
+  if (can_pull) {
+    out << "#ifdef BLENDER_VERTEX_PULL\n"
            "#undef gl_VertexID\n"
            "#undef gl_InstanceID\n"
            "#undef gpu_InstanceIndex\n"
-           "#ifdef BLENDER_INDIRECT_POINT_DRAW\n"
-           "layout(set=0,binding=1,std140) uniform BlenderPointCommand { uvec4 blender_point_cmd; "
+           "layout(set=0,binding=1,std140) uniform BlenderVertexPullCommand {\n"
+           "  uvec4 blender_vertex_pull_cmd;\n"
            "};\n"
-           "uint blender_point_id;\n"
-           "uint blender_load_point(uint ordinal);\n"
-           "void blender_load_point_attributes(uint point);\n"
-           "#define gl_VertexID int(blender_point_id)\n"
-           "#define gl_InstanceID int(blender_point_cmd.z + uint(gl_InstanceIndex))\n"
+           "uint blender_pulled_vertex;\n"
+           "uint blender_load_vertex(uint ordinal);\n"
+           "void blender_load_vertex_attributes(uint vertex);\n"
+           "#define gl_VertexID int(blender_pulled_vertex)\n"
+           "#define gl_InstanceID int(blender_vertex_pull_cmd.z + uint(gl_InstanceIndex))\n"
            "#define gpu_InstanceIndex gl_InstanceID\n"
-           "#else\n"
+           "#endif\n";
+  }
+  if (point_sprites_) {
+    /* The four strip vertices share the attributes of a single point instance. */
+    out << "float blender_point_size;\n"
+           "#define gl_PointSize blender_point_size\n"
+           "#ifndef BLENDER_VERTEX_PULL\n"
+           "#undef gl_VertexID\n"
+           "#undef gl_InstanceID\n"
+           "#undef gpu_InstanceIndex\n"
         << "layout(location=" << point_vertex_id_location_ << ") in uint blender_point_index;\n"
         << "#define gl_VertexID (blender_point_state.indexed != 0u ? "
            "int(blender_point_index) : gl_InstanceIndex)\n"
@@ -1109,16 +1125,23 @@ std::string WebGPUShader::vertex_interface_declare(const ShaderCreateInfo &info)
     out << "blender_init_specializations();\n";
   }
   if (point_sprites_) {
-    out << "blender_point_size = blender_point_state.fixed_size;\n"
-           "#ifdef BLENDER_INDIRECT_POINT_DRAW\n"
-           "blender_point_id = blender_load_point(uint(gl_VertexIndex) / 6u);\n"
-           "blender_load_point_attributes(blender_point_id);\n"
+    out << "blender_point_size = blender_point_state.fixed_size;\n";
+  }
+  if (can_pull) {
+    out << "#ifdef BLENDER_VERTEX_PULL\n"
+           "blender_pulled_vertex = blender_load_vertex(uint(gl_VertexIndex)"
+        << (point_sprites_ ? " / 6u" : "") << ");\n"
+        << "blender_load_vertex_attributes(blender_pulled_vertex);\n"
            "#endif\n";
+  }
+  if (barycentric_coords_) {
+    out << "uint bary_corner = uint(gl_VertexIndex) % 3u;\n"
+           "gpu_BaryCoord = vec3(bary_corner == 0u, bary_corner == 1u, bary_corner == 2u);\n";
   }
   out << "blender_vertex_main();\n";
   out << transfer.str();
   if (point_sprites_) {
-    out << "#ifdef BLENDER_INDIRECT_POINT_DRAW\n"
+    out << "#ifdef BLENDER_VERTEX_PULL\n"
            "const uint corners[6] = uint[6](0u, 1u, 2u, 2u, 1u, 3u);\n"
            "uint corner_index = corners[uint(gl_VertexIndex) % 6u];\n"
            "vec2 corner = vec2(corner_index & 1u, corner_index >> 1u);\n"
@@ -1152,6 +1175,9 @@ std::string WebGPUShader::fragment_interface_declare(const ShaderCreateInfo &inf
     out << "layout(location=" << location
         << ") noperspective in vec2 blender_point_coord;\n"
            "#define gl_PointCoord blender_point_coord\n";
+  }
+  if (barycentric_coords_) {
+    out << "layout(location=" << location << ") smooth in vec3 gpu_BaryCoord;\n";
   }
   for (const auto &input : info.subpass_inputs_) {
     if (!input.conditions.evaluate(info.compilation_constants_)) {
@@ -1251,8 +1277,8 @@ void WebGPUShader::vertex_shader_from_glsl(const ShaderCreateInfo &info,
         });
     std::string source = combined_glsl(
         "#define GPU_VERTEX_SHADER\n", sources, true, uses_uint_textures_);
-    if (point_sprites_) {
-      point_vertex_source_ = source;
+    if (point_sprites_ || barycentric_coords_) {
+      pull_vertex_source_ = source;
     }
     if (!skip_preprocessor) {
       source = Shader::run_preprocessor(source, G.debug & G_DEBUG_GPU_SHADER_NO_DCE);
@@ -1273,11 +1299,13 @@ void WebGPUShader::fragment_shader_from_glsl(const ShaderCreateInfo &info,
                                              MutableSpan<StringRefNull> sources)
 {
   if (error_.empty()) {
+    const char *stage_define = info.fragment_source_ == "eevee_surf_volume.bsl.hh" ?
+                                   "#define GPU_FRAGMENT_SHADER\n#define GPU_VOLUME_FROXEL_SHADER\n" :
+                                   "#define GPU_FRAGMENT_SHADER\n";
     fragment_ = compile_stage(
         name,
         GLSLANG_STAGE_FRAGMENT,
-        combined_glsl(
-            "#define GPU_FRAGMENT_SHADER\n", sources, skip_preprocessor, uses_uint_textures_),
+        combined_glsl(stage_define, sources, skip_preprocessor, uses_uint_textures_),
         depth_bindings_,
         error_,
         fragment_bindings_.data(),
@@ -1610,7 +1638,11 @@ void WebGPUShader::init_draw_interface(const ShaderCreateInfo &info)
   }
   if (point_sprites_) {
     point_state_offset_ = align_to(size, 16);
-    size = point_state_offset_ + 32 + 16 * sizeof(uint32_t);
+    size = point_state_offset_ + 32;
+  }
+  if (point_sprites_ || barycentric_coords_) {
+    pull_stream_offsets_ = align_to(size, 16);
+    size = pull_stream_offsets_ + 16 * sizeof(uint32_t);
   }
   uniform_data_.resize(align_to(size, 16));
   if (!uniform_data_.empty()) {
@@ -1796,23 +1828,23 @@ const wgpu::ShaderModule &WebGPUShader::vertex_module(const uint32_t packed_norm
   return packed_vertex_modules_.emplace(packed_normals, std::move(module)).first->second;
 }
 
-enum class PointComponent { Float, Unsigned, Signed, Unorm, Snorm };
+enum class PullComponent { Float, Unsigned, Signed, Unorm, Snorm };
 
-struct PointAttributeFormat {
+struct PullAttributeFormat {
   wgpu::VertexFormat format;
   uint32_t bits;
   uint32_t lanes;
-  PointComponent component;
+  PullComponent component;
 };
 
-static PointAttributeFormat point_attribute_format(const WebGPUVertexAttribute &input)
+static PullAttributeFormat pull_attribute_format(const WebGPUVertexAttribute &input)
 {
   using W = wgpu::VertexFormat;
-  using T = PointComponent;
+  using T = PullComponent;
   if (input.packed_snorm) {
     return {input.format, 10, 4, T::Snorm};
   }
-  static constexpr PointAttributeFormat formats[] = {
+  static constexpr PullAttributeFormat formats[] = {
       {W::Float32, 32, 1, T::Float},         {W::Float32x2, 32, 2, T::Float},
       {W::Float32x3, 32, 3, T::Float},       {W::Float32x4, 32, 4, T::Float},
       {W::Float16x2, 16, 2, T::Float},       {W::Float16x4, 16, 4, T::Float},
@@ -1839,26 +1871,26 @@ static PointAttributeFormat point_attribute_format(const WebGPUVertexAttribute &
       return format;
     }
   }
-  webgpu_draw_unsupported("pulling this indirect point vertex format");
+  webgpu_draw_unsupported("pulling this vertex format");
 }
 
-static const char *point_component_type(const PointComponent component)
+static const char *pull_component_type(const PullComponent component)
 {
   switch (component) {
-    case PointComponent::Unsigned:
+    case PullComponent::Unsigned:
       return "uint";
-    case PointComponent::Signed:
+    case PullComponent::Signed:
       return "int";
     default:
       return "float";
   }
 }
 
-static void point_input_value(std::ostream &out,
-                              const WebGPURenderPipelineKey &key,
-                              uint32_t location,
-                              uint32_t lanes,
-                              const char *type)
+static void pull_input_value(std::ostream &out,
+                             const WebGPURenderPipelineKey &key,
+                             uint32_t location,
+                             uint32_t lanes,
+                             const char *type)
 {
   for (size_t slot = 0; slot < key.vertices.size(); slot++) {
     const auto &layout = key.vertices[slot];
@@ -1869,14 +1901,14 @@ static void point_input_value(std::ostream &out,
       if (input.location != location) {
         continue;
       }
-      const auto format = point_attribute_format(input);
+      const auto format = pull_attribute_format(input);
       out << type << "(";
       for (uint32_t lane = 0; lane < lanes; lane++) {
         if (lane != 0) {
           out << ", ";
         }
         if (lane >= format.lanes) {
-          out << point_component_type(format.component) << "(" << (lane == 3 ? 1 : 0) << ")";
+          out << pull_component_type(format.component) << "(" << (lane == 3 ? 1 : 0) << ")";
           continue;
         }
         const bool packed = format.bits == 10;
@@ -1884,23 +1916,23 @@ static void point_input_value(std::ostream &out,
         const uint32_t bits = packed && lane == 3 ? 2 : format.bits;
         out << "blender_point_";
         switch (format.component) {
-          case PointComponent::Float:
+          case PullComponent::Float:
             out << (bits == 16 ? "half" : "float");
             break;
-          case PointComponent::Signed:
+          case PullComponent::Signed:
             out << "sint";
             break;
-          case PointComponent::Snorm:
+          case PullComponent::Snorm:
             out << "snorm";
             break;
-          case PointComponent::Unorm:
+          case PullComponent::Unorm:
             out << "unorm";
             break;
-          case PointComponent::Unsigned:
+          case PullComponent::Unsigned:
             out << "uint";
             break;
         }
-        out << "(blender_point_stream_" << slot << "[(base_" << slot << " + " << byte_offset
+        out << "(blender_vertex_stream_" << slot << "[(base_" << slot << " + " << byte_offset
             << "u) >> 2u], "
             << (packed ? std::to_string(lane * 10) + "u" :
                          "((base_" + std::to_string(slot) + " + " + std::to_string(byte_offset) +
@@ -1918,37 +1950,34 @@ static void point_input_value(std::ostream &out,
   out << ")";
 }
 
-const wgpu::ShaderModule &WebGPUShader::indirect_point_module(const WebGPURenderPipelineKey &key)
+const wgpu::ShaderModule &WebGPUShader::vertex_pull_module(const WebGPURenderPipelineKey &key)
 {
-  PointModuleKey modules_key{key.point_index_format, key.vertices};
-  if (const auto it = indirect_point_modules_.find(modules_key);
-      it != indirect_point_modules_.end())
-  {
+  PullModuleKey modules_key{key.pull_index_format, key.vertices};
+  if (const auto it = vertex_pull_modules_.find(modules_key); it != vertex_pull_modules_.end()) {
     return it->second;
   }
 
   constexpr std::string_view vertex_define = "#define GPU_VERTEX_SHADER\n";
-  std::string source = point_vertex_source_;
+  std::string source = pull_vertex_source_;
   const size_t vertex_define_position = source.find(vertex_define);
   if (vertex_define_position == std::string::npos) {
-    webgpu_draw_unsupported("finding the indirect point vertex shader declaration");
+    webgpu_draw_unsupported("finding the vertex pull shader declaration");
   }
-  source.insert(vertex_define_position + vertex_define.size(),
-                "#define BLENDER_INDIRECT_POINT_DRAW\n");
+  source.insert(vertex_define_position + vertex_define.size(), "#define BLENDER_VERTEX_PULL\n");
 
   std::ostringstream pull;
-  if (key.point_index_format != wgpu::IndexFormat::Undefined) {
-    pull << "layout(set=0,binding=2,std430) readonly buffer BlenderPointIndices "
-            "{ uint blender_point_indices[]; };\n";
+  if (key.pull_index_format != wgpu::IndexFormat::Undefined) {
+    pull << "layout(set=0,binding=2,std430) readonly buffer BlenderPulledIndices "
+            "{ uint blender_pulled_indices[]; };\n";
   }
-  pull << "uint blender_load_point(uint ordinal) {\n"
-          "uint at = blender_point_cmd.x + ordinal;\n";
-  if (key.point_index_format == wgpu::IndexFormat::Uint16) {
-    pull << "return ((blender_point_indices[at >> 1u] >> ((at & 1u) * 16u)) & 65535u) + "
-            "blender_point_cmd.y;\n";
+  pull << "uint blender_load_vertex(uint ordinal) {\n"
+          "uint at = blender_vertex_pull_cmd.x + ordinal;\n";
+  if (key.pull_index_format == wgpu::IndexFormat::Uint16) {
+    pull << "return ((blender_pulled_indices[at >> 1u] >> ((at & 1u) * 16u)) & 65535u) + "
+            "blender_vertex_pull_cmd.y;\n";
   }
-  else if (key.point_index_format == wgpu::IndexFormat::Uint32) {
-    pull << "return blender_point_indices[at] + blender_point_cmd.y;\n";
+  else if (key.pull_index_format == wgpu::IndexFormat::Uint32) {
+    pull << "return blender_pulled_indices[at] + blender_vertex_pull_cmd.y;\n";
   }
   else {
     pull << "return at;\n";
@@ -1956,8 +1985,8 @@ const wgpu::ShaderModule &WebGPUShader::indirect_point_module(const WebGPURender
   pull << "}\n";
   for (size_t slot = 0; slot < key.vertices.size(); slot++) {
     if (key.vertices[slot].stride != 0) {
-      pull << "layout(set=0,binding=" << 3 + slot << ",std430) readonly buffer BlenderPointStream"
-           << slot << " { uint blender_point_stream_" << slot << "[]; };\n";
+      pull << "layout(set=0,binding=" << 3 + slot << ",std430) readonly buffer BlenderVertexStream"
+           << slot << " { uint blender_vertex_stream_" << slot << "[]; };\n";
     }
   }
   pull << R"(
@@ -1979,15 +2008,15 @@ float blender_point_snorm(uint word, uint shift, uint bits)
 {
   return max(-1.0, float(blender_point_sint(word, shift, bits)) / float((1u << (bits - 1u)) - 1u));
 }
-void blender_load_point_attributes(uint point) {
+void blender_load_vertex_attributes(uint vertex) {
 )";
   for (size_t slot = 0; slot < key.vertices.size(); slot++) {
     if (key.vertices[slot].stride != 0) {
-      pull << "uint base_" << slot << " = blender_point_state.stream_offsets[" << slot / 4 << "]["
-           << slot % 4 << "] + point * " << key.vertices[slot].stride << "u;\n";
+      pull << "uint base_" << slot << " = blender_vertex_stream_offsets[" << slot / 4 << "]["
+           << slot % 4 << "] + vertex * " << key.vertices[slot].stride << "u;\n";
     }
   }
-  for (const auto &input : point_inputs_) {
+  for (const auto &input : pull_inputs_) {
     pull << input.name << " = ";
     if (ELEM(input.type, Type::float3x3_t, Type::float4x4_t)) {
       const uint32_t length = input.type == Type::float3x3_t ? 3 : 4;
@@ -1996,7 +2025,7 @@ void blender_load_point_attributes(uint point) {
         if (column != 0) {
           pull << ", ";
         }
-        point_input_value(
+        pull_input_value(
             pull, key, input.location + column, length, length == 3 ? "vec3" : "vec4");
       }
       pull << ")";
@@ -2004,7 +2033,7 @@ void blender_load_point_attributes(uint point) {
     else {
       std::ostringstream type;
       type << input.type;
-      point_input_value(
+      pull_input_value(
           pull, key, input.location, to_component_count(input.type), type.str().c_str());
     }
     pull << ";\n";
@@ -2019,16 +2048,26 @@ void blender_load_point_attributes(uint point) {
   auto module = compile_stage(
       name, GLSLANG_STAGE_VERTEX, std::move(source), depth_bindings_, error, nullptr, nullptr);
   if (!module) {
-    std::cerr << "WebGPU indirect point shader '" << name << "': " << error << '\n';
-    webgpu_draw_unsupported("rendering this indirect point shader");
+    std::cerr << "WebGPU vertex pull shader '" << name << "': " << error << '\n';
+    webgpu_draw_unsupported("rendering this vertex pull shader");
   }
-  return indirect_point_modules_.emplace(std::move(modules_key), std::move(module)).first->second;
+  return vertex_pull_modules_.emplace(std::move(modules_key), std::move(module)).first->second;
 }
 
-wgpu::PipelineLayout WebGPUShader::indirect_point_layout(const WebGPURenderPipelineKey &key) const
+wgpu::PipelineLayout WebGPUShader::vertex_pull_layout(const WebGPURenderPipelineKey &key) const
 {
   const auto &device = webgpu_active_device();
   std::vector<wgpu::BindGroupLayoutEntry> bindings = groups_[0].bindings;
+  /* Fixed-function vertex fetch can leave binding zero unused. The pulled variant uses it for
+   * its stream offsets regardless of the original shader's reflected bindings. */
+  if (bindings.empty()) {
+    wgpu::BindGroupLayoutEntry draw{};
+    draw.buffer.type = wgpu::BufferBindingType::Uniform;
+    draw.buffer.hasDynamicOffset = true;
+    draw.buffer.minBindingSize = uniform_data_.size();
+    bindings.push_back(draw);
+  }
+  bindings.front().visibility |= wgpu::ShaderStage::Vertex;
   wgpu::BindGroupLayoutEntry command{};
   command.binding = 1;
   command.visibility = wgpu::ShaderStage::Vertex;
@@ -2043,7 +2082,7 @@ wgpu::PipelineLayout WebGPUShader::indirect_point_layout(const WebGPURenderPipel
     entry.buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
     bindings.push_back(entry);
   };
-  if (key.point_index_format != wgpu::IndexFormat::Undefined) {
+  if (key.pull_index_format != wgpu::IndexFormat::Undefined) {
     add_stream(2);
   }
   for (size_t slot = 0; slot < key.vertices.size(); slot++) {
@@ -2125,9 +2164,9 @@ const wgpu::RenderPipeline &WebGPUShader::render_pipeline(const WebGPURenderPipe
 
   const wgpu::Device &device = webgpu_active_device();
   ensure_pipeline_layout(device);
-  const auto layout = key.indirect_point_sprites ? indirect_point_layout(key) : pipeline_layout_;
+  const auto layout = key.vertex_pulling ? vertex_pull_layout(key) : pipeline_layout_;
 
-  const size_t vertex_streams = key.indirect_point_sprites ? 0 : key.vertices.size();
+  const size_t vertex_streams = key.vertex_pulling ? 0 : key.vertices.size();
   std::vector<std::vector<wgpu::VertexAttribute>> attributes(vertex_streams);
   std::vector<wgpu::VertexBufferLayout> layouts(vertex_streams);
   uint32_t packed_normals = 0;
@@ -2229,8 +2268,8 @@ const wgpu::RenderPipeline &WebGPUShader::render_pipeline(const WebGPURenderPipe
   wgpu::RenderPipelineDescriptor pipeline{};
   pipeline.label = name;
   pipeline.layout = layout;
-  pipeline.vertex.module = key.indirect_point_sprites ? indirect_point_module(key) :
-                                                        vertex_module(packed_normals);
+  pipeline.vertex.module = key.vertex_pulling ? vertex_pull_module(key) :
+                                                vertex_module(packed_normals);
   pipeline.vertex.entryPoint = "main";
   pipeline.vertex.bufferCount = layouts.size();
   pipeline.vertex.buffers = layouts.data();
@@ -2270,20 +2309,24 @@ void WebGPUShader::ensure_pipeline_layout(const wgpu::Device &device)
   pipeline_layout_ = device.CreatePipelineLayout(&desc);
 }
 
-void WebGPUShader::draw_indirect_points(const wgpu::RenderPassEncoder &pass,
+void WebGPUShader::draw_pulled_vertices(const wgpu::RenderPassEncoder &pass,
                                         const wgpu::RenderPipeline &pipeline,
-                                        const WebGPUPointCommands &commands,
+                                        const WebGPUVertexPullCommands &commands,
                                         const wgpu::Buffer &indices,
                                         const std::span<const wgpu::Buffer> streams,
                                         const std::span<const uint32_t> stream_offsets,
-                                        const uint32_t count)
+                                        const uint32_t count,
+                                        const uint32_t direct_vertex_count,
+                                        const uint32_t direct_instance_count)
 {
   if (stream_offsets.size() > 16) {
-    webgpu_draw_unsupported("this number of indirect point streams");
+    webgpu_draw_unsupported("this number of vertex pull streams");
   }
-  set_point_draw_state(0);
+  if (point_sprites_) {
+    set_point_draw_state(0);
+  }
   if (!stream_offsets.empty()) {
-    std::memcpy(uniform_data_.data() + point_state_offset_ + 32,
+    std::memcpy(uniform_data_.data() + pull_stream_offsets_,
                 stream_offsets.data(),
                 stream_offsets.size_bytes());
   }
@@ -2318,9 +2361,15 @@ void WebGPUShader::draw_indirect_points(const wgpu::RenderPassEncoder &pass,
     }
   }
   for (uint32_t command = 0; command < count; command++) {
-    const uint32_t offsets[2]{uniform.offset, command * commands.shader_stride};
+    const uint32_t offsets[2]{uniform.offset,
+                              commands.shader_offset + command * commands.shader_stride};
     webgpu_render_set_bind_group(0, group, offsets);
-    pass.DrawIndirect(commands.draw_arguments, uint64_t(command) * 16);
+    if (commands.draw_arguments) {
+      pass.DrawIndirect(commands.draw_arguments, uint64_t(command) * 16);
+    }
+    else {
+      pass.Draw(direct_vertex_count, direct_instance_count);
+    }
   }
 }
 

@@ -11,6 +11,7 @@
 #include "webgpu_shader.hh"
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <cstdio>
 #include <cstdlib>
@@ -269,6 +270,9 @@ static WebGPURenderPipelineKey pipeline_key(const Context &context,
   WebGPURenderPipelineKey key{};
   key.targets = webgpu_render_targets();
   key.point_sprites = shader.uses_point_sprites();
+  if (shader.uses_barycentric_coords() && type != GPU_PRIM_TRIS) {
+    webgpu_draw_unsupported("barycentric coordinates outside triangle-list draws");
+  }
   if (key.point_sprites && type != GPU_PRIM_POINTS) {
     webgpu_draw_unsupported("using a point sprite shader with non-point geometry");
   }
@@ -381,6 +385,73 @@ static wgpu::RenderPassEncoder prepare_batch_draw(WebGPUBatch &batch,
   return pass;
 }
 
+struct VertexPullStreams {
+  wgpu::Buffer indices;
+  std::vector<wgpu::Buffer> vertices;
+  std::vector<uint32_t> offsets;
+  uint32_t capacity;
+};
+
+static VertexPullStreams prepare_vertex_pulling(WebGPUBatch &batch,
+                                                const WebGPUShader &shader,
+                                                WebGPURenderPipelineKey &key)
+{
+  key.vertex_pulling = true;
+  key.pull_index_format = batch_index_format(batch);
+  key.topology = wgpu::PrimitiveTopology::TriangleList;
+  const auto bindings = build_vertex_layouts(batch, *shader.interface, key.vertices);
+  VertexPullStreams streams;
+  streams.capacity = key.point_sprites ? UINT32_MAX / 6 : UINT32_MAX;
+  if (batch.elem) {
+    streams.indices = static_cast<WebGPUIndexBuffer *>(batch.elem)->buffer_for_use().handle();
+    streams.capacity = std::min(streams.capacity,
+                                batch.elem->index_start_get() + batch.elem->index_len_get());
+  }
+  streams.vertices.resize(bindings.size());
+  streams.offsets.resize(bindings.size());
+  for (size_t slot = 0; slot < bindings.size(); slot++) {
+    if (key.vertices[slot].stride == 0) {
+      continue;
+    }
+    if (bindings[slot].offset > UINT32_MAX) {
+      webgpu_draw_unsupported("this vertex pull stream offset");
+    }
+    streams.vertices[slot] = bindings[slot].buffer;
+    streams.offsets[slot] = uint32_t(bindings[slot].offset);
+    if (!batch.elem) {
+      streams.capacity = std::min(streams.capacity, bindings[slot].vertex_count);
+    }
+  }
+  return streams;
+}
+
+static void draw_vertex_pull(const Context &context,
+                             WebGPUShader &shader,
+                             const WebGPURenderPipelineKey &key,
+                             const VertexPullStreams &streams,
+                             const WebGPUVertexPullCommands &commands,
+                             const uint32_t count,
+                             const uint32_t direct_vertex_count = 0,
+                             const uint32_t direct_instance_count = 0)
+{
+  if (const auto pass = webgpu_render_pass()) {
+    const auto &pipeline = shader.render_pipeline(key);
+    webgpu_render_set_pipeline(pipeline);
+    if (key.targets.stencil) {
+      webgpu_render_set_stencil_reference(context.state_manager->mutable_state.stencil_reference);
+    }
+    shader.draw_pulled_vertices(pass,
+                                pipeline,
+                                commands,
+                                streams.indices,
+                                streams.vertices,
+                                streams.offsets,
+                                count,
+                                direct_vertex_count,
+                                direct_instance_count);
+  }
+}
+
 void WebGPUBatch::draw(const int vertex_first,
                        const int vertex_count,
                        const int instance_first,
@@ -401,6 +472,21 @@ void WebGPUBatch::draw(const int vertex_first,
   auto &shader = static_cast<WebGPUShader &>(*context.shader);
   const auto index_format = batch_index_format(*this);
   auto key = pipeline_key(context, shader, expand_fan ? GPU_PRIM_TRIS : prim_type, index_format);
+  if (shader.uses_barycentric_coords()) {
+    if (expand_fan) {
+      webgpu_draw_unsupported("barycentric coordinates on a triangle fan");
+    }
+    const auto streams = prepare_vertex_pulling(*this, shader, key);
+    const std::array<uint32_t, 4> command{uint32_t(vertex_first) +
+                                              (elem ? elem->index_start_get() : 0u),
+                                          elem ? elem->index_base_get() : 0u,
+                                          uint32_t(instance_first),
+                                          0u};
+    const auto arguments = webgpu_upload_draw_uniforms(std::as_bytes(std::span(command)));
+    const WebGPUVertexPullCommands pull{{}, arguments.buffer, 0, arguments.offset};
+    draw_vertex_pull(context, shader, key, streams, pull, 1, vertex_count, instance_count);
+    return;
+  }
   const auto pass = prepare_batch_draw(
       *this, shader, index_format, key, vertex_first, vertex_count);
   if (!pass) {
@@ -462,48 +548,16 @@ void WebGPUBatch::multi_draw_indirect(StorageBuf *indirect,
   auto &shader = static_cast<WebGPUShader &>(*context.shader);
   const auto index_format = batch_index_format(*this);
   auto key = pipeline_key(context, shader, prim_type, index_format);
-  if (key.point_sprites) {
-    key.indirect_point_sprites = true;
-    key.point_index_format = index_format;
-    key.topology = wgpu::PrimitiveTopology::TriangleList;
-    const auto bindings = build_vertex_layouts(*this, *shader.interface, key.vertices);
-    const wgpu::Buffer indices =
-        elem ? static_cast<WebGPUIndexBuffer *>(elem)->buffer_for_use().handle() : wgpu::Buffer{};
-    uint32_t point_capacity = UINT32_MAX / 6;
-    if (elem) {
-      point_capacity = std::min(point_capacity, elem->index_start_get() + elem->index_len_get());
-    }
-    std::vector<wgpu::Buffer> streams(bindings.size());
-    std::vector<uint32_t> stream_offsets(bindings.size());
-    for (size_t slot = 0; slot < bindings.size(); slot++) {
-      if (key.vertices[slot].stride == 0) {
-        continue;
-      }
-      if (bindings[slot].offset > UINT32_MAX) {
-        webgpu_draw_unsupported("this indirect point vertex stream offset");
-      }
-      streams[slot] = bindings[slot].buffer;
-      stream_offsets[slot] = uint32_t(bindings[slot].offset);
-      if (!elem) {
-        point_capacity = std::min(point_capacity, bindings[slot].vertex_count);
-      }
-    }
-    const auto expanded = webgpu_expand_point_commands(commands,
-                                                       uint32_t(offset / 4),
-                                                       uint32_t(step / 4),
-                                                       uint32_t(count),
-                                                       point_capacity,
-                                                       elem != nullptr);
-    const auto pass = webgpu_render_pass();
-    if (pass) {
-      const auto &pipeline = shader.render_pipeline(key);
-      webgpu_render_set_pipeline(pipeline);
-      if (key.targets.stencil) {
-        webgpu_render_set_stencil_reference(context.state_manager->mutable_state.stencil_reference);
-      }
-      shader.draw_indirect_points(
-          pass, pipeline, expanded, indices, streams, stream_offsets, count);
-    }
+  if (key.point_sprites || shader.uses_barycentric_coords()) {
+    const auto streams = prepare_vertex_pulling(*this, shader, key);
+    const auto expanded = webgpu_expand_vertex_pull_commands(commands,
+                                                             uint32_t(offset / 4),
+                                                             uint32_t(step / 4),
+                                                             uint32_t(count),
+                                                             streams.capacity,
+                                                             key.point_sprites ? 6 : 1,
+                                                             elem != nullptr);
+    draw_vertex_pull(context, shader, key, streams, expanded, count);
     return;
   }
   const auto pass = prepare_batch_draw(*this, shader, index_format, key);

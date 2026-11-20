@@ -128,7 +128,13 @@ ccl_device bool setup_glass(MicrofacetBsdf &bsdf,
     return false;
   }
 
+  const bool refraction = glass.z == CYCLES_WEBGPU_REFRACTION_GGX ||
+                          glass.z == CYCLES_WEBGPU_REFRACTION_BECKMANN;
+  const Spectrum color = rgb(material);
   bsdf.weight = make_spectrum(glass.x * weights.w);
+  if (refraction) {
+    bsdf.weight *= color;
+  }
   bsdf.sample_weight = closure_sample_weight(0, bsdf.weight);
   if (!(bsdf.sample_weight > 0.0f)) {
     return false;
@@ -138,7 +144,15 @@ ccl_device bool setup_glass(MicrofacetBsdf &bsdf,
   bsdf.alpha_x = bsdf.alpha_y = tint_alpha.w;
   bsdf.ior = normal.w != 0.0f ? 1.0f / glass.y : glass.y;
   bsdf.T = zero_float3();
-  const Spectrum color = rgb(material);
+  if (refraction) {
+    if (glass.z == CYCLES_WEBGPU_REFRACTION_BECKMANN) {
+      bsdf_microfacet_beckmann_refraction_setup(&bsdf);
+    }
+    else {
+      bsdf_microfacet_ggx_refraction_setup(&bsdf);
+    }
+    return true;
+  }
   if (glass.z != 0.0f) {
     fresnel = {.thin_film = {},
                .tint = {color, color},
@@ -150,10 +164,21 @@ ccl_device bool setup_glass(MicrofacetBsdf &bsdf,
     fresnel = generalized_schlick_setup(
         glass.y, true, true, rgb(tint_alpha), sqrt(min(color, one_spectrum())), {});
   }
-  bsdf_microfacet_ggx_glass_setup(&bsdf);
+  if (glass.z == CYCLES_WEBGPU_GLASS_BECKMANN) {
+    bsdf_microfacet_beckmann_glass_setup(&bsdf);
+  }
+  else {
+    bsdf_microfacet_ggx_glass_setup(&bsdf);
+  }
   bsdf_microfacet_setup_fresnel_generalized_schlick(
       &energy_globals, &bsdf, wi, &fresnel, material.w == CYCLES_WEBGPU_MATERIAL_MULTISCATTER_GGX);
   return true;
+}
+
+ccl_device bool is_beckmann_transmission(const ClosureType type)
+{
+  return type == CLOSURE_BSDF_MICROFACET_BECKMANN_GLASS_ID ||
+         type == CLOSURE_BSDF_MICROFACET_BECKMANN_REFRACTION_ID;
 }
 
 ccl_device void accumulate_glass(const MicrofacetBsdf &bsdf,
@@ -163,8 +188,11 @@ ccl_device void accumulate_glass(const MicrofacetBsdf &bsdf,
                                  float &pdf)
 {
   float lobe_pdf = 0.0f;
-  const Spectrum lobe_eval = bsdf_microfacet_ggx_eval(
-      &energy_globals, reinterpret_cast<const ShaderClosure *>(&bsdf), wi, wo, &lobe_pdf);
+  const auto *closure = reinterpret_cast<const ShaderClosure *>(&bsdf);
+  const Spectrum lobe_eval =
+      is_beckmann_transmission(bsdf.type) ?
+          bsdf_microfacet_beckmann_eval(&energy_globals, closure, wi, wo, &lobe_pdf) :
+          bsdf_microfacet_ggx_eval(&energy_globals, closure, wi, wo, &lobe_pdf);
   if (lobe_pdf != 0.0f) {
     eval += lobe_eval * bsdf.weight;
     pdf += lobe_pdf * bsdf.sample_weight;
@@ -536,16 +564,15 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
   else if (glass_enabled && lobe == Glass) {
     float2 sampled_roughness;
     float eta;
-    label = bsdf_microfacet_ggx_sample(&energy_globals,
-                                      reinterpret_cast<const ShaderClosure *>(&glass_bsdf),
-                                      Ng,
-                                      wi,
-                                      random,
-                                      &eval,
-                                      &wo,
-                                      &pdf,
-                                      &sampled_roughness,
-                                      &eta);
+    const auto *closure = reinterpret_cast<const ShaderClosure *>(&glass_bsdf);
+    if (is_beckmann_transmission(glass_bsdf.type)) {
+      label = bsdf_microfacet_beckmann_sample(
+          &energy_globals, closure, Ng, wi, random, &eval, &wo, &pdf, &sampled_roughness, &eta);
+    }
+    else {
+      label = bsdf_microfacet_ggx_sample(
+          &energy_globals, closure, Ng, wi, random, &eval, &wo, &pdf, &sampled_roughness, &eta);
+    }
     eval *= glass_bsdf.weight;
     selected_weight = glass_weight;
   }
@@ -676,7 +703,7 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
       features.add(glass_bsdf.weight * estimate,
                    specular_N,
                    glass_bsdf.alpha_x,
-                   CLOSURE_BSDF_MICROFACET_GGX_GLASS_ID,
+                   glass_bsdf.type,
                    roughness_weighting);
     }
     if (glass.x > CLOSURE_WEIGHT_CUTOFF) {

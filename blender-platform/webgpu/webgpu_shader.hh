@@ -63,18 +63,24 @@ class WebGPUShader final : public Shader {
   {
     return point_sprites_;
   }
+  bool uses_barycentric_coords() const
+  {
+    return barycentric_coords_;
+  }
   uint32_t point_vertex_id_location() const
   {
     return point_vertex_id_location_;
   }
   void set_point_draw_state(int instance, bool indexed = false);
-  void draw_indirect_points(const wgpu::RenderPassEncoder &pass,
+  void draw_pulled_vertices(const wgpu::RenderPassEncoder &pass,
                             const wgpu::RenderPipeline &pipeline,
-                            const WebGPUPointCommands &commands,
+                            const WebGPUVertexPullCommands &commands,
                             const wgpu::Buffer &indices,
                             std::span<const wgpu::Buffer> streams,
                             std::span<const uint32_t> stream_offsets,
-                            uint32_t count);
+                            uint32_t count,
+                            uint32_t direct_vertex_count,
+                            uint32_t direct_instance_count);
 
  private:
   struct Uniform {
@@ -120,24 +126,26 @@ class WebGPUShader final : public Shader {
   template<typename Pass> void bind_uniforms(const Pass &pass);
   void update_draw_uniform(int location, int comp_len, int array_size, const void *data);
   const wgpu::ShaderModule &vertex_module(uint32_t packed_normals);
-  const wgpu::ShaderModule &indirect_point_module(const WebGPURenderPipelineKey &key);
-  wgpu::PipelineLayout indirect_point_layout(const WebGPURenderPipelineKey &key) const;
+  const wgpu::ShaderModule &vertex_pull_module(const WebGPURenderPipelineKey &key);
+  wgpu::PipelineLayout vertex_pull_layout(const WebGPURenderPipelineKey &key) const;
 
   std::vector<Uniform> uniforms_;
   std::vector<std::byte> uniform_data_;
   bool point_sprites_ = false;
   bool point_coord_ = false;
+  bool barycentric_coords_ = false;
   uint32_t point_vertex_id_location_ = 0;
   size_t point_state_offset_ = 0;
-  struct PointInput {
+  size_t pull_stream_offsets_ = 0;
+  struct PullInput {
     uint32_t location;
     shader::Type type;
     std::string name;
   };
-  std::vector<PointInput> point_inputs_;
-  std::string point_vertex_source_;
-  using PointModuleKey = std::pair<wgpu::IndexFormat, std::vector<WebGPUVertexLayout>>;
-  std::map<PointModuleKey, wgpu::ShaderModule> indirect_point_modules_;
+  std::vector<PullInput> pull_inputs_;
+  std::string pull_vertex_source_;
+  using PullModuleKey = std::pair<wgpu::IndexFormat, std::vector<WebGPUVertexLayout>>;
+  std::map<PullModuleKey, wgpu::ShaderModule> vertex_pull_modules_;
   bool unsupported_draw_resources_ = false;
   uint64_t depth_bindings_ = 0;
   uint64_t atomic_sampler_slots_ = 0;

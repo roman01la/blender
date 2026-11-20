@@ -122,10 +122,13 @@ constexpr DeviceKernel surface_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE;
 constexpr DeviceKernel background_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE_BACKGROUND;
 constexpr DeviceKernel tree_background_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE_DEDICATED_LIGHT;
 constexpr DeviceKernel tree_light_kernel = DEVICE_KERNEL_INTEGRATOR_INTERSECT_DEDICATED_LIGHT;
+constexpr DeviceKernel tree_transmission_kernel = DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE;
 constexpr DeviceKernel init_state_kernel = DEVICE_KERNEL_INTEGRATOR_RESET;
-constexpr DeviceKernel svm_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE;
+constexpr DeviceKernel svm_core_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE;
+constexpr DeviceKernel svm_extended_kernel = DEVICE_KERNEL_SHADER_EVAL_VOLUME_DENSITY;
 constexpr DeviceKernel wavefront_light_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE_LIGHT_FORWARD;
 constexpr DeviceKernel point_distribution_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE_SHADOW;
+constexpr DeviceKernel point_transmission_kernel = DEVICE_KERNEL_INTEGRATOR_SHADOW_PATH_MNEE_PENDING;
 constexpr DeviceKernel path_update_kernel = DEVICE_KERNEL_INTEGRATOR_MEGAKERNEL;
 constexpr DeviceKernel reflection_light_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE_LIGHT_NEE;
 constexpr DeviceKernel reflection_update_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME;
@@ -176,7 +179,10 @@ constexpr WebGPUKernelBinding svm_bindings[] = {{0, storage, 8},
                                                 {1, storage, 32},
                                                 {2, storage, 52},
                                                 {3, storage, material_bytes},
-                                                {4, storage, 32}};
+                                                {4, storage, 32},
+                                                {5, storage, CYCLES_WEBGPU_PATH_WORDS * sizeof(uint32_t)},
+                                                {6, storage, CYCLES_WEBGPU_CAMERA_WORDS * sizeof(uint32_t)},
+                                                {7, storage, CYCLES_WEBGPU_SURFACE_OFFSETS * sizeof(uint32_t)}};
 constexpr WebGPUKernelBinding wavefront_light_bindings[] = {
     {0, storage, 40},
     {1, storage, 52},
@@ -334,6 +340,9 @@ struct WebGPURenderPipeline::Impl {
   DeviceKernel light_kernel = wavefront_light_kernel;
   DeviceKernel update_kernel = path_update_kernel;
   DeviceKernel active_background_kernel = background_kernel;
+  DeviceKernel active_svm_kernel = svm_core_kernel;
+  bool svm_core_loaded = false;
+  bool svm_extended_loaded = false;
   bool deferred_shadow = false;
   bool reflection_deferred = false;
   bool full_deferred = false;
@@ -341,8 +350,12 @@ struct WebGPURenderPipeline::Impl {
   bool reflection_shading_loaded = false;
   bool reflection_update_loaded = false;
   bool point_distribution_loaded = false;
+  bool point_transmission_loaded = false;
   bool light_tree_loaded = false;
+  bool tree_transmission_loaded = false;
+  bool tree_background_loaded = false;
   bool shading_loaded = false;
+  bool transmission_update_loaded = false;
   bool background_loaded = false;
   std::string (*load_shader)(const char *name) = nullptr;
   IntegratorQueueCounter queue_counts{};
@@ -384,6 +397,33 @@ struct WebGPURenderPipeline::Impl {
     return device_webgpu_register_kernel(device, kernel, source, workgroup_size, bindings, entry);
   }
 
+  bool prepare_svm(const bool requires_extended_svm)
+  {
+    if (!requires_extended_svm) {
+      if (!svm_core_loaded) {
+        const auto source = load_shader("svm-compact-core.wgsl");
+        if (!source.empty()) {
+          svm_core_loaded = register_kernel(svm_core_kernel, source, svm_bindings);
+          if (!svm_core_loaded) {
+            return false;
+          }
+        }
+      }
+      if (svm_core_loaded) {
+        active_svm_kernel = svm_core_kernel;
+        return true;
+      }
+    }
+
+    if (!svm_extended_loaded) {
+      const auto source = load_shader("svm-compact.wgsl");
+      svm_extended_loaded = !source.empty() &&
+                            register_kernel(svm_extended_kernel, source, svm_bindings);
+    }
+    active_svm_kernel = svm_extended_kernel;
+    return svm_extended_loaded;
+  }
+
   bool prepare_shadow()
   {
     if (!shadow_loaded) {
@@ -406,35 +446,47 @@ struct WebGPURenderPipeline::Impl {
     return !lighting.empty() && register_kernel(kernel, lighting, wavefront_light_bindings);
   }
 
-  bool prepare_reflection_update(const std::string_view update)
+  bool prepare_path_update(const bool has_transmission)
   {
-    if (!reflection_update_loaded) {
-      reflection_update_loaded = !update.empty() &&
-                                 register_kernel(reflection_update_kernel, update, path_update_bindings);
+    bool &loaded = has_transmission ? transmission_update_loaded : reflection_update_loaded;
+    if (!loaded) {
+      const auto kernel = has_transmission ? path_update_kernel : reflection_update_kernel;
+      const auto update = load_shader(has_transmission ? "path-update.wgsl" :
+                                                         "path-update-reflection.wgsl");
+      loaded = !update.empty() && register_kernel(kernel, update, path_update_bindings);
     }
-    return reflection_update_loaded;
+    return loaded;
   }
 
-  bool prepare_light_tree()
+  bool prepare_light_tree(const bool has_transmission)
   {
-    if (!light_tree_loaded) {
-      const auto light = load_shader("wavefront-light-deferred-reflection-tree.wgsl");
-      const auto background = load_shader("shade-background-tree.wgsl");
-      const auto update = load_shader("path-update-reflection.wgsl");
-      if (light.empty() || background.empty() || update.empty()) {
+    const auto kernel = has_transmission ? tree_transmission_kernel : tree_light_kernel;
+    bool &loaded = has_transmission ? tree_transmission_loaded : light_tree_loaded;
+    if (!loaded) {
+      const auto light = load_shader(has_transmission ? "wavefront-light-deferred-tree.wgsl" :
+                                                         "wavefront-light-deferred-reflection-tree.wgsl");
+      if (light.empty()) {
         return fail("Cycles WebGPU needs the Light Tree shader set");
       }
       LOG_INFO << "Cycles WebGPU compiling the stock Light Tree and world sampling shaders";
-      if (!prepare_shadow() || !prepare_reflection_update(update) ||
-          !register_kernel(tree_light_kernel, light, deferred_light_bindings) ||
-          !register_kernel(tree_background_kernel, background, background_bindings))
+      if (!prepare_path_update(has_transmission) || !prepare_shadow() ||
+          !register_kernel(kernel, light, deferred_light_bindings))
       {
         return fail("Cycles WebGPU could not compile the Light Tree shaders");
       }
-      light_tree_loaded = true;
+      loaded = true;
     }
-    light_kernel = tree_light_kernel;
-    update_kernel = reflection_update_kernel;
+    if (!tree_background_loaded) {
+      const auto background = load_shader("shade-background-tree.wgsl");
+      if (background.empty() ||
+          !register_kernel(tree_background_kernel, background, background_bindings))
+      {
+        return fail("Cycles WebGPU needs the Light Tree background shader");
+      }
+      tree_background_loaded = true;
+    }
+    light_kernel = kernel;
+    update_kernel = has_transmission ? path_update_kernel : reflection_update_kernel;
     active_background_kernel = tree_background_kernel;
     deferred_shadow = true;
     return true;
@@ -444,29 +496,27 @@ struct WebGPURenderPipeline::Impl {
   {
     active_background_kernel = background_kernel;
     if (sampling == LightSampling::Tree) {
-      return has_transmission ? fail("Cycles WebGPU Light Tree needs opaque materials") :
-                                prepare_light_tree();
+      return prepare_light_tree(has_transmission);
     }
     if (sampling == LightSampling::PointDistribution) {
-      if (has_transmission) {
-        return fail("Cycles WebGPU point-light distributions need opaque materials");
-      }
-      if (!point_distribution_loaded) {
-        const auto light = load_shader("wavefront-light-deferred-multi-point-reflection.wgsl");
-        const auto update = load_shader("path-update-reflection.wgsl");
-        if (light.empty() || update.empty()) {
+      const auto kernel = has_transmission ? point_transmission_kernel : point_distribution_kernel;
+      bool &loaded = has_transmission ? point_transmission_loaded : point_distribution_loaded;
+      if (!loaded) {
+        const auto light = load_shader(has_transmission ? "wavefront-light-deferred-multi-point.wgsl" :
+                                                          "wavefront-light-deferred-multi-point-reflection.wgsl");
+        if (light.empty()) {
           return fail("Cycles WebGPU needs the point-light distribution shader set");
         }
         LOG_INFO << "Cycles WebGPU compiling the stock point-light distribution shader";
-        if (!prepare_shadow() || !prepare_reflection_update(update) ||
-            !register_kernel(point_distribution_kernel, light, deferred_light_bindings))
+        if (!prepare_path_update(has_transmission) || !prepare_shadow() ||
+            !register_kernel(kernel, light, deferred_light_bindings))
         {
           return fail("Cycles WebGPU could not compile the point-light distribution shader");
         }
-        point_distribution_loaded = true;
+        loaded = true;
       }
-      light_kernel = point_distribution_kernel;
-      update_kernel = reflection_update_kernel;
+      light_kernel = kernel;
+      update_kernel = has_transmission ? path_update_kernel : reflection_update_kernel;
       deferred_shadow = true;
       return true;
     }
@@ -476,7 +526,7 @@ struct WebGPURenderPipeline::Impl {
         if (!update.empty()) {
           LOG_INFO << "Cycles WebGPU compiling reflection-only wavefront shaders";
           if (!prepare_light(reflection_light_kernel, true, reflection_deferred) ||
-              !prepare_reflection_update(update))
+              !prepare_path_update(false))
           {
             return fail("Cycles WebGPU could not compile the reflection-only wavefront shaders");
           }
@@ -492,13 +542,9 @@ struct WebGPURenderPipeline::Impl {
     }
 
     if (!shading_loaded) {
-      const auto update = load_shader("path-update.wgsl");
-      if (update.empty()) {
-        return fail("Cycles WebGPU needs both wavefront shading shaders");
-      }
       LOG_INFO << "Cycles WebGPU compiling transmission-capable wavefront shaders";
       if (!prepare_light(wavefront_light_kernel, false, full_deferred) ||
-          !register_kernel(path_update_kernel, update, path_update_bindings))
+          !prepare_path_update(true))
       {
         return fail("Cycles WebGPU could not compile the transmission-capable wavefront shaders");
       }
@@ -618,7 +664,7 @@ bool WebGPURenderPipeline::initialize(const WebGPURenderShaders &shaders)
   }
   if (!shaders.load_shader || shaders.camera.empty() || shaders.bvh2.empty() ||
       shaders.surface.empty() || shaders.film.empty() || shaders.state_init.empty() ||
-      shaders.svm.empty() || shaders.wavefront_queue.empty())
+      shaders.wavefront_queue.empty())
   {
     return p.fail("Cycles WebGPU render pipeline needs the stock scheduler shader set");
   }
@@ -627,7 +673,6 @@ bool WebGPURenderPipeline::initialize(const WebGPURenderShaders &shaders)
       !p.register_kernel(bvh_kernel, shaders.bvh2, bvh_bindings) ||
       !p.register_kernel(surface_kernel, shaders.surface, surface_bindings) ||
       !p.register_kernel(init_state_kernel, shaders.state_init, init_state_bindings) ||
-      !p.register_kernel(svm_kernel, shaders.svm, svm_bindings) ||
       !p.register_kernel(
           accumulate_kernel, shaders.film, accumulate_bindings, "accumulate_render_buffer") ||
       !p.wavefront_queue.initialize(shaders.wavefront_queue))
@@ -693,7 +738,7 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
   else if (point_distribution) {
     light_prefix = light[CYCLES_WEBGPU_POINT_LIGHTS_OFFSET];
   }
-  constexpr size_t surface_offsets = 5;
+  constexpr size_t surface_offsets = CYCLES_WEBGPU_SURFACE_OFFSETS;
   if (scene.size() < 10 || !valid_offsets(scene.subspan(1, 9), 10, scene.size()) ||
       surface.size() < surface_offsets ||
       !valid_offsets(surface.first(surface_offsets), surface_offsets, surface.size()) ||
@@ -748,6 +793,9 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
   p.scene_uploaded = false;
   p.film_ready = false;
   p.batch_active = false;
+  if (!p.prepare_svm((svm[1] & CYCLES_WEBGPU_SVM_EXTENDED) != 0)) {
+    return p.fail("Cycles WebGPU could not load the SVM material shader");
+  }
   const LightSampling mode = light_tree ? LightSampling::Tree :
                                point_distribution ? LightSampling::PointDistribution :
                                                     LightSampling::Legacy;
@@ -772,7 +820,7 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
   return true;
 }
 
-bool WebGPURenderPipeline::reset(std::span<const float, 32> camera,
+bool WebGPURenderPipeline::reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WORDS> camera,
                                  std::span<const uint32_t, 16> denoising_config,
                                  const BufferParams &params,
                                  const size_t film_words,
@@ -1081,7 +1129,8 @@ bool WebGPURenderPipeline::enqueue_stage(const DeviceKernel stage)
   }
 
   const auto surface = p.bind(p.scene.bvh, p.scene.surface, p.rays, p.hits, p.points);
-  const auto svm = p.bind(p.scene.svm, p.points, p.rays, p.materials, p.hits);
+  const auto svm = p.bind(
+      p.scene.svm, p.points, p.rays, p.materials, p.hits, paths, p.camera, p.scene.surface);
   const auto light = p.bind(p.deferred_shadow ? p.shadow_rays : p.scene.bvh,
                             p.rays,
                             p.hits,
@@ -1099,7 +1148,7 @@ bool WebGPURenderPipeline::enqueue_stage(const DeviceKernel stage)
       p.rays, p.hits, p.points, p.pixels, p.sampling, p.materials, p.radiance, paths);
   const WebGPUDispatch shading[] = {
       {surface_kernel, surface, count},
-      {svm_kernel, svm, count},
+      {p.active_svm_kernel, svm, count},
       {p.light_kernel, light, count},
       {p.update_kernel, update, count},
       accumulate};

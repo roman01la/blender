@@ -45,8 +45,8 @@ struct WebGPURenderPipelineKey {
   uint8_t stencil_compare_mask;
   uint8_t stencil_write_mask;
   bool point_sprites;
-  bool indirect_point_sprites = false;
-  wgpu::IndexFormat point_index_format = wgpu::IndexFormat::Undefined;
+  bool vertex_pulling = false;
+  wgpu::IndexFormat pull_index_format = wgpu::IndexFormat::Undefined;
   std::vector<WebGPUVertexLayout> vertices;
 
   auto operator<=>(const WebGPURenderPipelineKey &) const = default;

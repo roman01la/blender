@@ -889,23 +889,25 @@ fn main(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) group
     return result;
   }
 
-  WebGPUPointCommands expand_point_commands(const wgpu::Buffer &input,
-                                            const uint32_t first_word,
-                                            const uint32_t stride_words,
-                                            const uint32_t count,
-                                            const uint32_t point_capacity,
-                                            const bool indexed)
+  WebGPUVertexPullCommands expand_vertex_pull_commands(const wgpu::Buffer &input,
+                                                       const uint32_t first_word,
+                                                       const uint32_t stride_words,
+                                                       const uint32_t count,
+                                                       const uint32_t vertex_capacity,
+                                                       const uint32_t vertices_per_input,
+                                                       const bool indexed)
   {
     const auto &device = ghost.device();
-    if (!point_commands_pipeline_) {
+    if (!vertex_pull_commands_pipeline_) {
       wgpu::ShaderSourceWGSL code{};
       code.code = R"(
 struct InputRange {
   first_word: u32,
   stride_words: u32,
   count: u32,
-  point_capacity: u32,
+  vertex_capacity: u32,
   state_words: u32,
+  vertices_per_input: u32,
   indexed: u32,
 }
 @group(0) @binding(0) var<storage, read> input: array<u32>;
@@ -919,14 +921,14 @@ fn main(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) group
   if command >= range.count { return; }
   let src = range.first_word + command * range.stride_words;
   let dst = command * range.state_words;
-  let first_point = input[src + 2u];
-  var points = 0u;
-  if first_point < range.point_capacity {
-    points = min(input[src], range.point_capacity - first_point);
+  let first_vertex = input[src + 2u];
+  var vertices = 0u;
+  if first_vertex < range.vertex_capacity {
+    vertices = min(input[src], range.vertex_capacity - first_vertex);
   }
   // Vertex fetch and the first instance are handled by the vertex stage.
-  draws[command] = vec4u(points * 6u, input[src + 1u], 0u, 0u);
-  state[dst] = first_point;
+  draws[command] = vec4u(vertices * range.vertices_per_input, input[src + 1u], 0u, 0u);
+  state[dst] = first_vertex;
   if range.indexed != 0u {
     state[dst + 1u] = input[src + 3u];
     state[dst + 2u] = input[src + 4u];
@@ -937,35 +939,41 @@ fn main(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) group
 }
 )";
       wgpu::ShaderModuleDescriptor shader{};
-      shader.label = "Blender indirect point command expansion";
+      shader.label = "Blender indirect vertex pull commands";
       shader.nextInChain = &code;
       wgpu::ComputePipelineDescriptor desc{};
       desc.label = shader.label;
       desc.compute.module = device.CreateShaderModule(&shader);
       desc.compute.entryPoint = "main";
-      point_commands_pipeline_ = device.CreateComputePipeline(&desc);
-      if (device.GetLimits(&point_command_limits_) != wgpu::Status::Success) {
-        unsupported("reading limits for indirect point draws");
+      vertex_pull_commands_pipeline_ = device.CreateComputePipeline(&desc);
+      if (device.GetLimits(&vertex_pull_command_limits_) != wgpu::Status::Success) {
+        unsupported("reading limits for indirect vertex pulling");
       }
     }
 
-    const uint32_t state_stride = std::max(16u,
-                                           point_command_limits_.minUniformBufferOffsetAlignment);
+    const uint32_t state_stride = std::max(
+        16u, vertex_pull_command_limits_.minUniformBufferOffsetAlignment);
     const uint64_t state_size = uint64_t(count) * state_stride;
-    if (state_size > point_command_limits_.maxStorageBufferBindingSize || state_size > UINT32_MAX)
+    if (state_size > vertex_pull_command_limits_.maxStorageBufferBindingSize ||
+        state_size > UINT32_MAX)
     {
-      unsupported("this indirect point command count");
+      unsupported("this indirect vertex pull command count");
     }
-    const std::array<uint32_t, 6> range{
-        first_word, stride_words, count, point_capacity, state_stride / 4, uint32_t(indexed)};
+    const std::array<uint32_t, 7> range{first_word,
+                                        stride_words,
+                                        count,
+                                        vertex_capacity,
+                                        state_stride / 4,
+                                        vertices_per_input,
+                                        uint32_t(indexed)};
     const auto uniform = upload_draw_uniforms(std::as_bytes(std::span(range)));
 
     wgpu::BufferDescriptor buffer{};
-    buffer.label = "Blender expanded point draw arguments";
+    buffer.label = "Blender pulled draw arguments";
     buffer.size = uint64_t(count) * 4 * sizeof(uint32_t);
     buffer.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::Indirect;
     const auto draw_arguments = device.CreateBuffer(&buffer);
-    buffer.label = "Blender expanded point shader arguments";
+    buffer.label = "Blender pulled shader arguments";
     buffer.size = state_size;
     buffer.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::Uniform;
     const auto shader_arguments = device.CreateBuffer(&buffer);
@@ -981,17 +989,17 @@ fn main(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) group
       entries[i].binding = i;
     }
     wgpu::BindGroupDescriptor group{};
-    group.layout = point_commands_pipeline_.GetBindGroupLayout(0);
+    group.layout = vertex_pull_commands_pipeline_.GetBindGroupLayout(0);
     group.entryCount = entries.size();
     group.entries = entries.data();
 
     end_render_pass();
     auto pass = encoder().BeginComputePass();
-    pass.SetPipeline(point_commands_pipeline_);
+    pass.SetPipeline(vertex_pull_commands_pipeline_);
     pass.SetBindGroup(0, device.CreateBindGroup(&group));
     const uint32_t groups = (count + 63u) / 64u;
-    const uint32_t groups_x = std::min(groups,
-                                       point_command_limits_.maxComputeWorkgroupsPerDimension);
+    const uint32_t groups_x = std::min(
+        groups, vertex_pull_command_limits_.maxComputeWorkgroupsPerDimension);
     pass.DispatchWorkgroups(groups_x, (groups + groups_x - 1u) / groups_x);
     pass.End();
     return {draw_arguments, shader_arguments, state_stride};
@@ -1280,8 +1288,8 @@ fn main(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) group
   wgpu::Buffer triangle_fan_indices_;
   wgpu::Buffer shadow_lights_snapshot_;
   wgpu::ComputePipeline point_gather_pipeline_;
-  wgpu::ComputePipeline point_commands_pipeline_;
-  wgpu::Limits point_command_limits_;
+  wgpu::ComputePipeline vertex_pull_commands_pipeline_;
+  wgpu::Limits vertex_pull_command_limits_;
   wgpu::ShaderModule texture_copy_shader_;
   std::map<std::tuple<wgpu::TextureFormat, wgpu::ColorWriteMask, bool>, wgpu::RenderPipeline>
       blit_pipelines_;
@@ -2540,15 +2548,16 @@ wgpu::Buffer webgpu_gather_indexed_points(const WebGPUIndexedPoints &points,
   return WebGPUContext::active().gather_indexed_points(points, source, offset, stride);
 }
 
-WebGPUPointCommands webgpu_expand_point_commands(const wgpu::Buffer &input,
-                                                 const uint32_t first_word,
-                                                 const uint32_t stride_words,
-                                                 const uint32_t count,
-                                                 const uint32_t point_capacity,
-                                                 const bool indexed)
+WebGPUVertexPullCommands webgpu_expand_vertex_pull_commands(const wgpu::Buffer &input,
+                                                            const uint32_t first_word,
+                                                            const uint32_t stride_words,
+                                                            const uint32_t count,
+                                                            const uint32_t vertex_capacity,
+                                                            const uint32_t vertices_per_input,
+                                                            const bool indexed)
 {
-  return WebGPUContext::active().expand_point_commands(
-      input, first_word, stride_words, count, point_capacity, indexed);
+  return WebGPUContext::active().expand_vertex_pull_commands(
+      input, first_word, stride_words, count, vertex_capacity, vertices_per_input, indexed);
 }
 
 WebGPUUniformSlice webgpu_upload_draw_uniforms(std::span<const std::byte> bytes)

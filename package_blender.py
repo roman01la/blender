@@ -58,6 +58,9 @@ def package(installation: Path, output: Path, python_process: Path | None = None
             "stock-camera.wgsl", "bvh2-compact.wgsl", "surface-compact.wgsl",
             "svm-compact.wgsl", "wavefront-light.wgsl", "path-update.wgsl",
         )]
+        svm_core = cycles_webgpu.resolve() / "svm-compact-core.wgsl"
+        if svm_core.is_file():
+            shaders.append(svm_core)
         shaders.extend(port / "cycles-webgpu" / name for name in (
             "film.wgsl", "path-state.wgsl", "wavefront-queue.wgsl",
         ))
@@ -78,6 +81,7 @@ def package(installation: Path, output: Path, python_process: Path | None = None
             shaders.append(reflection_update)
         deferred_lighting = [cycles_webgpu.resolve() / name for name in (
             "wavefront-light-deferred.wgsl", "wavefront-light-deferred-reflection.wgsl",
+            "wavefront-light-deferred-multi-point.wgsl", "wavefront-light-deferred-tree.wgsl",
         )] + [multi_point]
         if want_light_tree:
             shaders.extend(light_tree)

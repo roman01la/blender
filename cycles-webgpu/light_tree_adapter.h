@@ -109,9 +109,10 @@ ccl_device_inline bool webgpu_light_tree_select(KernelGlobals kg,
                                      const float rand,
                                      const float3 P,
                                      const float3 N,
+                                     const int runtime_flags,
                                      LightSample *light)
 {
-  if (!light_tree_sample<false>(kg, rand, P, N, 0.0f, OBJECT_NONE, SR_BSDF, light)) {
+  if (!light_tree_sample<false>(kg, rand, P, N, 0.0f, OBJECT_NONE, runtime_flags, light)) {
     return false;
   }
   light->prim = ~light_fetch(kg, light_tree_emitters_tag{}, light->emitter_id).light.id;
@@ -121,9 +122,10 @@ ccl_device_inline bool webgpu_light_tree_select(KernelGlobals kg,
 ccl_device_inline float webgpu_light_tree_pdf(KernelGlobals kg,
                                     const float3 P,
                                     const float3 N,
+                                    const uint path_flag,
                                     const uint emitter)
 {
-  return light_tree_pdf<false>(kg, P, N, 0.0f, 0, OBJECT_NONE, emitter, OBJECT_NONE);
+  return light_tree_pdf<false>(kg, P, N, 0.0f, path_flag, OBJECT_NONE, emitter, OBJECT_NONE);
 }
 
 }  // namespace ccl

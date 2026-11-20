@@ -3,6 +3,7 @@
 #pragma once
 
 #include "device/kernel.h"
+#include "device/webgpu/material_layout.h"
 #include "device/webgpu/scene.h"
 #include "util/unique_ptr.h"
 
@@ -49,7 +50,7 @@ class WebGPUPreview {
   Device &device_;
   unique_ptr<WebGPURenderPipeline> pipeline_;
   CyclesWebGPUScene scene_;
-  std::array<float, 32> camera_{};
+  std::array<float, CYCLES_WEBGPU_CAMERA_WORDS> camera_{};
   std::array<uint32_t, 16> denoising_config_{};
   std::vector<uint32_t> sampling_;
   bool scene_checked_ = false;

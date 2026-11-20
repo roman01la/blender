@@ -412,7 +412,8 @@ const char *find_environment_image(const Scene &scene,
     }
     if (environment.handle.empty() ||
         !cycles_webgpu_svm_image_info(scene, environment.handle.kernel_id(), image) ||
-        image.data_type != IMAGE_DATA_TYPE_FLOAT4 || image.extension != EXTENSION_REPEAT)
+        image.data_type != IMAGE_DATA_TYPE_FLOAT4 || image.extension != EXTENSION_REPEAT ||
+        (image.interpolation != INTERPOLATION_CLOSEST && image.interpolation != INTERPOLATION_LINEAR))
     {
       return "WebGPU Cycles needs a synchronized floating-point environment image with linear or "
              "closest interpolation";
@@ -763,11 +764,16 @@ const char *ggx_transmission_incompatibility(const DeviceScene &scene)
   if (scene.data.kernel_features & KERNEL_FEATURE_MNEE) {
     return "WebGPU Cycles glass needs shadow caustics turned off";
   }
-  if (scene.lights.data()[0].shader_id & SHADER_EXCLUDE_TRANSMIT) {
-    return "WebGPU Cycles glass needs transmission lighting enabled on the point light";
+  if (std::ranges::any_of(host_data(scene.lights), [](const KernelLight &light) {
+        return (light.shader_id & SHADER_EXCLUDE_TRANSMIT) != 0;
+      }))
+  {
+    return "WebGPU Cycles glass needs transmission lighting enabled on the lights";
   }
   const int world_shader = scene.data.background.surface_shader;
-  if (!(world_shader & SHADER_EXCLUDE_TRANSMIT)) {
+  const bool has_area_light = scene.lights.size() == 1 && scene.lights.data()[0].type == LIGHT_AREA;
+  if (!uses_stock_light_tree(scene) && !has_area_light && !(world_shader & SHADER_EXCLUDE_TRANSMIT))
+  {
     float3 emission;
     if (!constant_emission(scene, world_shader, emission) || emission.x != 0.0f ||
         emission.y != 0.0f || emission.z != 0.0f)
@@ -894,8 +900,10 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
     reason = "WebGPU Cycles needs synchronized normals for smooth triangles";
     return false;
   }
-  const uint64_t surface_words = 5 + 15 * uint64_t(dscene.objects.size()) +
-                                 uint64_t(dscene.tri_shader.size()) + dscene.shaders.size() +
+  const uint64_t surface_words = CYCLES_WEBGPU_SURFACE_OFFSETS +
+                                 (15 + CYCLES_WEBGPU_SURFACE_OBJECT_WORDS) *
+                                     uint64_t(dscene.objects.size()) +
+                                 uint64_t(dscene.tri_shader.size()) + 2 * dscene.shaders.size() +
                                  (have_smooth ? dscene.attributes_normal.size() : 0);
   const uint64_t base_words = bvh_words + surface_words + CYCLES_WEBGPU_LIGHT_HEADER_WORDS;
   if (base_words > WebGPURenderPipeline::max_scene_words) {
@@ -929,10 +937,6 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
   const bool multiple_points = !light_tree && dscene.lights.size() > 1;
   const bool area = !light_tree && !multiple_points &&
                     dscene.lights.data()[0].type == LIGHT_AREA;
-  if ((light_tree || multiple_points || area) && encoded.has_transmission) {
-    reason = "WebGPU Cycles needs opaque materials for area lighting or multiple lights";
-    return false;
-  }
   if (encoded.has_ggx) {
     const size_t lookup_words = CYCLES_WEBGPU_GGX_LOOKUP_WORDS +
                                 (encoded.has_transmission ? CYCLES_WEBGPU_GGX_GLASS_LOOKUP_WORDS :
@@ -998,7 +1002,7 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
 
   PackedWords surface;
   surface.words.reserve(size_t(surface_words));
-  surface.words.resize(5);
+  surface.words.resize(CYCLES_WEBGPU_SURFACE_OFFSETS);
   surface.words[0] = uint32_t(surface.words.size());
   for (size_t index = 0; index < dscene.objects.size(); ++index) {
     surface.words.push_back(dscene.object_flag.data()[index]);
@@ -1019,6 +1023,19 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
   surface.words[4] = uint32_t(surface.words.size());
   for (const KernelShader &shader : host_data(dscene.shaders)) {
     surface.words.push_back(uint32_t(shader.flags));
+  }
+
+  surface.words[CYCLES_WEBGPU_SURFACE_OBJECT_SVM_OFFSET] = uint32_t(surface.words.size());
+  for (const KernelObject &object : host_data(dscene.objects)) {
+    surface.append(object.itfm);
+    for (const float value : {object.color[0], object.color[1], object.color[2], object.alpha,
+                              object.pass_id, object.random_number}) {
+      surface.words.push_back(float_word(value));
+    }
+  }
+  surface.words[CYCLES_WEBGPU_SURFACE_SHADER_PASS_OFFSET] = uint32_t(surface.words.size());
+  for (const KernelShader &shader : host_data(dscene.shaders)) {
+    surface.words.push_back(uint32_t(shader.pass_id));
   }
 
   encoded.bvh = std::move(bvh.words);

@@ -205,6 +205,7 @@ bool sample_point_distribution(const unsigned int descriptor,
                                const UInt4 path,
                                const ccl::float3 P,
                                const ccl::float3 N,
+                               const int runtime_flags,
                                ccl::LightSample &light,
                                unsigned int &strength_offset,
                                const unsigned int subsurface_steps)
@@ -231,7 +232,9 @@ bool sample_point_distribution(const unsigned int descriptor,
   ccl::KernelLight lamp{};
   lamp.co = read_rgb(lamp_offset);
   lamp.spot.eval_fac = 0.25f * M_1_PI_F;
-  ccl::point_light_sample(&lamp, ccl::make_float2(random), P, N, ccl::SR_BSDF, &light);
+  if (!ccl::point_light_sample(&lamp, ccl::make_float2(random), P, N, runtime_flags, &light)) {
+    return false;
+  }
   light.pdf *= light.pdf_selection;
   strength_offset = lamp_offset + 4;
   return true;
@@ -317,6 +320,7 @@ ccl::Spectrum environment_radiance(const unsigned int width,
                          const unsigned int subsurface_steps,
                          const ccl::float3 P,
                          const ccl::float3 N,
+                         const int runtime_flags,
                          ccl::LightSample &light,
                          ccl::Spectrum &strength)
 {
@@ -324,7 +328,7 @@ ccl::Spectrum environment_radiance(const unsigned int width,
   ccl::setup_light_tree(globals, descriptor);
   setup_light_sampling(globals, cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_SAMPLING));
   const auto random = light_sample_random(&globals, sampling.x, sampling.y, bounce + subsurface_steps);
-  if (!ccl::webgpu_light_tree_select(&globals, random.z, P, N, &light)) {
+  if (!ccl::webgpu_light_tree_select(&globals, random.z, P, N, runtime_flags, &light)) {
     return false;
   }
 
@@ -336,7 +340,7 @@ ccl::Spectrum environment_radiance(const unsigned int width,
   light.shader = lamp.shader_id;
   const auto rand = ccl::make_float2(random);
   if (light.type == ccl::LIGHT_POINT) {
-    if (!ccl::point_light_sample(&lamp, rand, P, N, ccl::SR_BSDF, &light)) {
+    if (!ccl::point_light_sample(&lamp, rand, P, N, runtime_flags, &light)) {
       return false;
     }
   }
@@ -400,12 +404,20 @@ unsigned int direct_surface_light(UInt4 position,
   result = {0, 0, 0, 1};
   const ccl::float3 P = unpack_rgb(position);
   const ccl::float3 N = unpack_rgb(normal);
+  int runtime_flags = ccl::SR_BSDF;
+#if defined(CYCLES_WEBGPU_WAVEFRONT_LIGHT) && !defined(CYCLES_WEBGPU_REFLECTION_ONLY)
+  if (glass.x > 0.0f) {
+    runtime_flags |= ccl::SR_BSDF_HAS_TRANSMISSION;
+  }
+#endif
 
   ccl::LightSample light{};
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
 #  ifndef CYCLES_WEBGPU_SHADE_BACKGROUND
   ccl::Spectrum strength;
-  if (!sample_mixed_lights(descriptor, sampling, path.x, subsurface_steps, P, N, light, strength)) {
+  if (!sample_mixed_lights(
+          descriptor, sampling, path.x, subsurface_steps, P, N, runtime_flags, light, strength))
+  {
     return Backlit;
   }
 #  else
@@ -414,8 +426,9 @@ unsigned int direct_surface_light(UInt4 position,
 #else
   unsigned int strength_offset = 4;
 #  ifdef CYCLES_WEBGPU_POINT_DISTRIBUTION
-  if (!sample_point_distribution(descriptor, sampling, path, P, N, light, strength_offset,
-                                 subsurface_steps)) {
+  if (!sample_point_distribution(
+          descriptor, sampling, path, P, N, runtime_flags, light, strength_offset, subsurface_steps))
+  {
     return Backlit;
   }
 #else
@@ -438,12 +451,6 @@ unsigned int direct_surface_light(UInt4 position,
     /* A single normalized, radius-zero point light, as packed by PointLight::copy_to_kernel. */
     lamp.co = read_rgb(0);
     lamp.spot.eval_fac = 0.25f * M_1_PI_F;
-    int runtime_flags = ccl::SR_BSDF;
-#  if defined(CYCLES_WEBGPU_WAVEFRONT_LIGHT) && !defined(CYCLES_WEBGPU_REFLECTION_ONLY)
-    if (glass.x > 0.0f) {
-      runtime_flags |= ccl::SR_BSDF_HAS_TRANSMISSION;
-    }
-#  endif
     ccl::point_light_sample(&lamp, ccl::zero_float2(), P, N, runtime_flags, &light);
   }
 #  endif
@@ -632,7 +639,8 @@ Float4 background_radiance()
     float mis = 1.0f;
     if (!primary && !(path.y & ccl::PATH_RAY_MIS_SKIP)) {
       const unsigned int emitter = cycles_light_word(words + CYCLES_WEBGPU_TREE_LAMP_EMITTER);
-      const float pdf = eval.pdf * ccl::webgpu_light_tree_pdf(tree, ray.P, previous_N, emitter);
+      const float pdf = eval.pdf *
+                        ccl::webgpu_light_tree_pdf(tree, ray.P, previous_N, path.y, emitter);
       mis = ccl::power_heuristic(std::bit_cast<float>(path.z), pdf);
     }
     auto contribution = ccl::ensure_finite(
@@ -782,7 +790,7 @@ Float4 background_radiance()
       if (emitter != CYCLES_WEBGPU_TREE_NO_LAMP && !(path.y & ccl::PATH_RAY_MIS_SKIP) && !primary) {
         setup_world_sampling(tree, descriptor);
         const float pdf = ccl::background_map_pdf(&tree, direction) *
-                          ccl::webgpu_light_tree_pdf(&tree, previous_P, previous_N, emitter);
+                          ccl::webgpu_light_tree_pdf(&tree, previous_P, previous_N, path.y, emitter);
         rgb *= ccl::power_heuristic(std::bit_cast<float>(path.z), pdf);
       }
     }

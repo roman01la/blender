@@ -28,7 +28,7 @@ std::string read_shader(const char *name)
   return {std::istreambuf_iterator<char>(shader), std::istreambuf_iterator<char>()};
 }
 
-std::array<float, 32> pack_camera(const KernelCamera &cam, const float scrambling_distance)
+std::array<float, CYCLES_WEBGPU_CAMERA_WORDS> pack_camera(const KernelCamera &cam, const float scrambling_distance)
 {
   const std::array rows = {cam.rastertocamera.x,
                            cam.rastertocamera.y,
@@ -37,8 +37,16 @@ std::array<float, 32> pack_camera(const KernelCamera &cam, const float scramblin
                            cam.cameratoworld.x,
                            cam.cameratoworld.y,
                            cam.cameratoworld.z,
-                           make_float4(cam.nearclip, cam.cliplength, scrambling_distance, 0.0f)};
-  std::array<float, 32> camera;
+                           make_float4(cam.nearclip, cam.cliplength, scrambling_distance, 0.0f),
+                           cam.worldtocamera.x,
+                           cam.worldtocamera.y,
+                           cam.worldtocamera.z,
+                           cam.worldtondc.x,
+                           cam.worldtondc.y,
+                           cam.worldtondc.z,
+                           cam.worldtondc.w};
+  static_assert(rows.size() * 4 == CYCLES_WEBGPU_CAMERA_WORDS);
+  std::array<float, CYCLES_WEBGPU_CAMERA_WORDS> camera;
   for (size_t i = 0; i < rows.size(); ++i) {
     const auto &row = rows[i];
     camera[i * 4] = row.x;
@@ -214,11 +222,10 @@ bool WebGPUPreview::initialize()
   const auto surface = read_shader("surface-compact.wgsl");
   const auto film = read_shader("film.wgsl");
   const auto state_init = read_shader("path-state.wgsl");
-  const auto svm = read_shader("svm-compact.wgsl");
   const auto queue = read_shader("wavefront-queue.wgsl");
   pipeline_ = make_unique<WebGPURenderPipeline>(device_);
   return pipeline_->initialize(
-             {camera, bvh, surface, film, state_init, svm, queue, read_shader}) ||
+             {camera, bvh, surface, film, state_init, queue, read_shader}) ||
          report_error();
 }
 

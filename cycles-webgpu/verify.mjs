@@ -306,17 +306,24 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
     return { walksChecked: count, hits, maxAbsoluteError };
   }
 
-  async function svmTest({ bytecode, surfaces, hits, materials }, compact) {
-    const rayCount = surfaces.length / 8;
+  async function svmTest({ bytecode, surfaces, hits, raySlots, pathWords, cameraWords, surfaceMetadata, materials }, compact) {
+    const rayCount = hits.length / 8;
     const materialWords = 20;
+    const withContext = /@binding\(5\)/.test(code);
+    const withCamera = /@binding\(6\)/.test(code);
+    const withMetadata = /@binding\(7\)/.test(code);
     if (!Number.isInteger(rayCount) || rayCount === 0 || materials.length !== rayCount * materialWords ||
-        hits.length !== surfaces.length) {
+        ![8 * rayCount, 16 * rayCount].includes(surfaces.length) ||
+        (raySlots && raySlots.length !== 12 * rayCount) ||
+        (pathWords && pathWords.length !== 24 * rayCount) ||
+        (cameraWords && cameraWords.length !== 60)) {
       throw Error('SVM fixture has inconsistent surface and material records');
     }
     const workgroups = Math.ceil(rayCount / 64);
     const padding = 0xBADC0FFE;
-    const rays = new Uint32Array(compact ? 2 + rayCount * 13 : 1);
+    const rays = new Uint32Array(compact ? 2 + rayCount * 13 : 1 + rayCount * 12);
     rays[0] = rayCount;
+    if (raySlots) rays.set(raySlots, 1);
     const omitted = compact ? 0 : -1;
     if (compact) {
       const base = 1 + rayCount * 12;
@@ -326,11 +333,21 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
         if (lane !== omitted) rays[next++] = lane;
       }
     }
+    const surfaceData = new Uint32Array((withContext ? 16 : surfaces.length / rayCount) * rayCount);
+    surfaceData.set(surfaces);
+    const inputs = [new Uint32Array(bytecode), surfaceData, rays, new Uint32Array(hits)];
+    if (withContext) inputs.push(new Uint32Array(pathWords ?? 24 * rayCount));
+    if (withCamera) inputs.push(new Uint32Array(cameraWords ?? 60));
+    if (withMetadata) inputs.push(new Uint32Array(surfaceMetadata ?? 7));
     const [result] = await dispatch(
-      [new Uint32Array(bytecode), new Uint32Array(surfaces), rays, new Uint32Array(hits)],
+      inputs,
       [new Uint32Array(workgroups * 64 * materialWords).fill(padding)], workgroups,
       (pass, pipeline, buffers, groups) => {
-        return encodeDispatch(pass, pipeline, [...buffers.slice(0, 3), buffers[4], buffers[3]], groups);
+        const bindings = [...buffers.slice(0, 3), buffers[inputs.length], buffers[3]];
+        if (withContext) bindings.push(buffers[4]);
+        if (withCamera) bindings.push(buffers[5]);
+        if (withMetadata) bindings.push(buffers[6]);
+        return encodeDispatch(pass, pipeline, bindings, groups);
       },
     );
     const floats = new Float32Array(result.buffer);

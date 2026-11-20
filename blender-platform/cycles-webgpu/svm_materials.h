@@ -19,13 +19,14 @@ CCL_NAMESPACE_BEGIN
 struct WebGPUSvmImage {
   int id;
   KernelImageInfo info;
+  bool alpha = false;
 
-  float3 pixel(size_t index) const
+  float4 pixel(size_t index) const
   {
     if (info.data_type == IMAGE_DATA_TYPE_BYTE4) {
-      return color_byte_to_float(reinterpret_cast<const uchar4 *>(uintptr_t(info.data))[index]);
+      return color_uchar4_to_float4(reinterpret_cast<const uchar4 *>(uintptr_t(info.data))[index]);
     }
-    return make_float3(reinterpret_cast<const float4 *>(uintptr_t(info.data))[index]);
+    return reinterpret_cast<const float4 *>(uintptr_t(info.data))[index];
   }
 
   size_t pixel_count() const
@@ -53,8 +54,10 @@ inline bool cycles_webgpu_svm_image_info(const Scene &scene, int id, KernelImage
   return result.data &&
          (result.data_type == IMAGE_DATA_TYPE_FLOAT4 || result.data_type == IMAGE_DATA_TYPE_BYTE4) &&
          (result.interpolation == INTERPOLATION_CLOSEST ||
-          result.interpolation == INTERPOLATION_LINEAR) &&
-         (result.extension == EXTENSION_REPEAT || result.extension == EXTENSION_EXTEND) &&
+          result.interpolation == INTERPOLATION_LINEAR ||
+          webgpu_svm_uses_cubic_filter(result.interpolation)) &&
+         (result.extension == EXTENSION_REPEAT || result.extension == EXTENSION_EXTEND ||
+          result.extension == EXTENSION_CLIP || result.extension == EXTENSION_MIRROR) &&
          result.width > 0 && result.height > 0 && result.width <= 32768 && result.height <= 32768;
 }
 
@@ -178,6 +181,7 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   const size_t shader_count = dscene.shaders.size();
   const size_t header = webgpu_svm_header_words + webgpu_svm_texture_header_words;
   if (!count || max_words < header || count > max_words - header ||
+      shader_count > CYCLES_WEBGPU_SVM_SHADER_COUNT ||
       shader_count > count / webgpu_svm_jump_words || shader_count != scene.shaders.size())
   {
     reason = "WebGPU Cycles needs synchronized SVM bytecode within the scene budget";
@@ -187,8 +191,9 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   std::vector<WebGPUSvmImage> images;
   size_t image_slots = 0;
   size_t remaining = max_words - header - count;
+  bool requires_extended_svm = false;
   const auto fetch = [&](const uint index) { return uint(dscene.svm_nodes.data()[index]); };
-  const auto image = [&](int id, float2 uv, float3 &color) {
+  const auto image = [&](int id, float2 uv, bool alpha, float4 &color) {
     auto found = std::find_if(images.begin(), images.end(), [id](const WebGPUSvmImage &item) {
       return item.id == id;
     });
@@ -208,11 +213,19 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
       }
       remaining -= required;
       image_slots = slots;
+      requires_extended_svm |= webgpu_svm_uses_cubic_filter(item.info.interpolation);
       images.push_back(item);
       found = images.end() - 1;
     }
+    if (alpha && !found->alpha) {
+      if (found->pixel_count() > remaining) {
+        return false;
+      }
+      remaining -= found->pixel_count();
+      found->alpha = true;
+    }
     const auto &info = found->info;
-    color = webgpu_svm_sample_image(
+    color = webgpu_svm_sample_image<true>(
         [&](const uint index) { return found->pixel(index); },
         info.width,
         info.height,
@@ -271,6 +284,7 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     have_ggx |= decoded.ggx;
     have_transmission |= decoded.ggx && decoded.transmission > 0.0f;
     have_subsurface |= decoded.subsurface > 0.0f;
+    requires_extended_svm |= decoded.requires_extended_svm;
   }
 
   const size_t triangles = have_uv ? dscene.tri_shader.size() : 0;
@@ -287,7 +301,7 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   remaining -= generated_triangles * webgpu_svm_triangle_generated_words;
   std::vector<uint32_t> packed(max_words - remaining);
   packed[0] = uint32_t(count);
-  packed[1] = uint32_t(shader_count);
+  packed[1] = uint32_t(shader_count) | (requires_extended_svm ? CYCLES_WEBGPU_SVM_EXTENDED : 0);
   for (size_t i = 0; i < count; ++i) {
     packed[webgpu_svm_header_words + i] = uint32_t(dscene.svm_nodes.data()[i]);
   }
@@ -318,17 +332,27 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     packed[record++] = item.info.width;
     packed[record++] = item.info.height;
     packed[record++] = item.info.extension;
-    packed[record++] = item.info.interpolation;
+    packed[record++] = uint32_t(item.info.interpolation) |
+                       (item.alpha ? webgpu_svm_image_alpha : 0);
     packed[record++] = uint32_t(texel);
+    const size_t alpha_offset = texel + item.pixel_count() * 3;
     for (size_t i = 0; i < item.pixel_count(); ++i) {
-      const float3 rgb = item.pixel(i);
-      if (!(fabsf(rgb.x) <= 1.0e6f && fabsf(rgb.y) <= 1.0e6f && fabsf(rgb.z) <= 1.0e6f)) {
+      const float4 rgba = item.pixel(i);
+      if (!(fabsf(rgba.x) <= 1.0e6f && fabsf(rgba.y) <= 1.0e6f && fabsf(rgba.z) <= 1.0e6f) ||
+          (item.alpha && !(fabsf(rgba.w) <= 1.0e6f)))
+      {
         reason = "WebGPU Cycles needs finite texture colors";
         return false;
       }
-      packed[texel++] = std::bit_cast<uint32_t>(rgb.x);
-      packed[texel++] = std::bit_cast<uint32_t>(rgb.y);
-      packed[texel++] = std::bit_cast<uint32_t>(rgb.z);
+      packed[texel++] = std::bit_cast<uint32_t>(rgba.x);
+      packed[texel++] = std::bit_cast<uint32_t>(rgba.y);
+      packed[texel++] = std::bit_cast<uint32_t>(rgba.z);
+      if (item.alpha) {
+        packed[alpha_offset + i] = std::bit_cast<uint32_t>(rgba.w);
+      }
+    }
+    if (item.alpha) {
+      texel += item.pixel_count();
     }
   }
 

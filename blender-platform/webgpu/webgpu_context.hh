@@ -86,18 +86,20 @@ wgpu::Buffer webgpu_gather_indexed_points(const WebGPUIndexedPoints &points,
                                           size_t offset,
                                           uint32_t stride);
 
-struct WebGPUPointCommands {
+struct WebGPUVertexPullCommands {
   wgpu::Buffer draw_arguments;
   wgpu::Buffer shader_arguments;
-  uint32_t shader_stride;
+  uint32_t shader_stride = 0;
+  uint32_t shader_offset = 0;
 };
 
-WebGPUPointCommands webgpu_expand_point_commands(const wgpu::Buffer &input,
-                                                 uint32_t first_word,
-                                                 uint32_t stride_words,
-                                                 uint32_t count,
-                                                 uint32_t point_capacity,
-                                                 bool indexed);
+WebGPUVertexPullCommands webgpu_expand_vertex_pull_commands(const wgpu::Buffer &input,
+                                                            uint32_t first_word,
+                                                            uint32_t stride_words,
+                                                            uint32_t count,
+                                                            uint32_t vertex_capacity,
+                                                            uint32_t vertices_per_input,
+                                                            bool indexed);
 
 struct WebGPUUniformSlice {
   wgpu::Buffer buffer;

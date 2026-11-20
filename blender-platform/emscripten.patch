@@ -9294,13 +9294,17 @@ index e94eacb9..9c8d1851 100644
  
    const vector<pair<SymbolClass *, string>> image_types = {
 diff --git a/source/blender/gpu/shaders/gpu_shader_codegen_lib.glsl b/source/blender/gpu/shaders/gpu_shader_codegen_lib.glsl
-index 6d5d8831..03f7aa85 100644
 --- a/source/blender/gpu/shaders/gpu_shader_codegen_lib.glsl
 +++ b/source/blender/gpu/shaders/gpu_shader_codegen_lib.glsl
-@@ -293,6 +293,18 @@ float3 dF_impl([[maybe_unused]] float3 v)
+@@ -289,9 +289,21 @@
+
+ float3 dF_impl([[maybe_unused]] float3 v)
+ {
+-#ifndef GPU_FRAGMENT_SHADER
++#if !defined(GPU_FRAGMENT_SHADER) || defined(GPU_VOLUME_FROXEL_SHADER)
    return float3(0.0f);
  #elif defined(GPU_FAST_DERIVATIVE) /* TODO(@fclem): User Option? */
-   return float3(0.0f);
++  return float3(0.0f);
 +#elif defined(GPU_WEBGPU)
 +  /* The derivative mode lives in private shader state. Evaluate both directions
 +   * before selecting a direction so the full fragment quad participates. */
@@ -9312,10 +9316,9 @@ index 6d5d8831..03f7aa85 100644
 +  if (g_derivative_flag < 0) {
 +    return dy * g_derivative_filter_width;
 +  }
-+  return float3(0.0f);
+   return float3(0.0f);
  #else
    if (g_derivative_flag > 0) {
-     return gpu_dfdx(v) * g_derivative_filter_width;
 diff --git a/source/blender/gpu/shaders/gpu_shader_polyline.bsl.hh b/source/blender/gpu/shaders/gpu_shader_polyline.bsl.hh
 index a6d8c48f..7573d3e5 100644
 --- a/source/blender/gpu/shaders/gpu_shader_polyline.bsl.hh
@@ -11268,3 +11271,265 @@ diff --git a/source/blender/editors/space_node/node_shader_preview.cc b/source/b
                                WM_JOB_TYPE_RENDER_PREVIEW);
    ShaderNodesPreviewJob *job_data = MEM_new<ShaderNodesPreviewJob>(__func__);
  
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_nodetree_lib.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_nodetree_lib.bsl.hh
+--- a/source/blender/draw/engines/eevee/shaders/eevee_nodetree_lib.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_nodetree_lib.bsl.hh
+@@ -37,7 +37,7 @@
+ /* Resource for the raycast node implementation using screen space raytracing. */
+ struct Raycast {
+   [[sampler(PREPASS_NORMAL_TEX_SLOT)]] sampler2D prepass_normal_tx;
+-  [[sampler(RAYCAST_DEPTH_TEX_SLOT)]] sampler2D raycast_depth_tx;
++  [[sampler(RAYCAST_DEPTH_TEX_SLOT)]] sampler2DDepth raycast_depth_tx;
+   [[sampler(OBJECT_ID_TEX_SLOT)]] usampler2D object_id_tx;
+ };
+
+@@ -658,7 +658,9 @@
+         is_hit = true;
+         hit_position = ws_start + direction * result;
+         hit_distance = distance(position, hit_position);
+-        hit_normal = normalize(texture(raycast.prepass_normal_tx, hit_uv).xyz * 2.0f - 1.0f);
++        /* The prepass has one mip level and hits vary per fragment. */
++        hit_normal = normalize(textureLod(raycast.prepass_normal_tx, hit_uv, 0.0f).xyz * 2.0f -
++                               1.0f);
+         int2 hit_texel = int2(hit_uv * float2(textureSize(raycast.object_id_tx, 0)));
+         uint hit_id = texelFetch(raycast.object_id_tx, hit_texel, 0).x;
+         self_hit = self_only || (hit_id == self_id);
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_ray_trace_screen_lib.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_ray_trace_screen_lib.bsl.hh
+--- a/source/blender/draw/engines/eevee/shaders/eevee_ray_trace_screen_lib.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_ray_trace_screen_lib.bsl.hh
+@@ -265,7 +265,7 @@
+                         const float3 vs_origin,
+                         const float3 vs_end,
+                         const float3 vs_direction,
+-                        sampler2D depth_tx,
++                        sampler2DDepth depth_tx,
+                         const RayTraceData rt_data,
+                         const int max_steps,
+                         const float jitter,
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_surf_shadow.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_surf_shadow.bsl.hh
+--- a/source/blender/draw/engines/eevee/shaders/eevee_surf_shadow.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_surf_shadow.bsl.hh
+@@ -55,10 +55,12 @@
+ {
+   float linear_depth = length(shadow_clip.position);
+
+-  /* Clip to light shape. */
+-  if (dot(shadow_clip.vector, shadow_clip.vector) < 1.0f) {
+-    gpu_discard_fragment();
+-    return;
++  const bool outside_light = dot(shadow_clip.vector, shadow_clip.vector) < 1.0f;
++  if (!pipe.use_transparency) [[static_branch]] {
++    if (outside_light) {
++      gpu_discard_fragment();
++      return;
++    }
+   }
+
+   int2 texel_co = int2(frag_co.xy);
+@@ -76,13 +78,6 @@
+   uint page_packed = srt.render_map_buf[render_page_index];
+
+   if (pipe.use_transparency) [[static_branch]] {
+-    /* The page is not rendered by this view: reject before evaluating the material, which is
+-     * the expensive part of this shader.
+-     * Opaque materials have nothing to skip and keep the branch-less path below. */
+-    if (page_packed >= SHADOW_MAX_PAGE) {
+-      return;
+-    }
+-
+     const ViewMatrices view = views.get(shadow_iface.shadow_view_id);
+
+     float3 barycentric_co = float3(0.0f);
+@@ -101,7 +96,16 @@
+       init_globals_pointcloud(ptcloud_interp, sd);
+     }
+
++    /* Material evaluation can use screen derivatives, so it precedes the fragment-dependent
++     * light clip and page checks. */
+     nodetree_surface(kg, sd, 0.0f);
++    if (outside_light) {
++      gpu_discard_fragment();
++      return;
++    }
++    if (page_packed >= SHADOW_MAX_PAGE) {
++      return;
++    }
+
+     if (pipe.is_gsplat) [[static_branch]] {
+       sd.transmittance = gsplat_amend_transmittance(gsplat_interp, sd.transmittance);
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_occupancy_convert.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_occupancy_convert.bsl.hh
+--- a/source/blender/draw/engines/eevee/shaders/eevee_occupancy_convert.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_occupancy_convert.bsl.hh
+@@ -14,7 +14,7 @@
+ struct Convert {
+
+   [[image(VOLUME_HIT_DEPTH_SLOT, read, SFLOAT_32)]] const image3D hit_depth_img;
+-  [[image(VOLUME_HIT_COUNT_SLOT, read_write, UINT_32)]] uimage2D hit_count_img;
++  [[image(VOLUME_HIT_COUNT_SLOT, read_write, UINT_32)]] uimage2DAtomic hit_count_img;
+   [[image(VOLUME_OCCUPANCY_SLOT, read_write, UINT_32)]] uimage3DAtomic occupancy_img;
+ };
+
+@@ -109,7 +109,8 @@
+   }
+
+   /* Write the occupancy bits */
+-  for (int i = 0; i < imageSize(srt.occupancy_img).z; i++) {
++  const int occupancy_layers = (uni.uniform_buf.volumes.tex_size.z + 31) / 32;
++  for (int i = 0; i < occupancy_layers; i++) {
+     if (occupancy.bits[i] != 0u) {
+       /* NOTE: Doesn't have to be atomic but we need to blend with other method. */
+       imageAtomicOr(srt.occupancy_img, int3(texel, i), occupancy.bits[i]);
+
+diff --git a/source/blender/gpu/shaders/material/gpu_shader_material_bump.bsl.hh b/source/blender/gpu/shaders/material/gpu_shader_material_bump.bsl.hh
+--- a/source/blender/gpu/shaders/material/gpu_shader_material_bump.bsl.hh
++++ b/source/blender/gpu/shaders/material/gpu_shader_material_bump.bsl.hh
+@@ -35,7 +35,7 @@
+                float3 &result)
+ {
+   N = normalize(N);
+-#if defined(GPU_FRAGMENT_SHADER) || defined(GLSL_CPP_STUBS)
++#if (defined(GPU_FRAGMENT_SHADER) && !defined(GPU_VOLUME_FROXEL_SHADER)) || defined(GLSL_CPP_STUBS)
+   dist *= FrontFacing ? invert : -invert;
+
+   float3 dPdx = gpu_dfdx(sd.P) * derivative_scale_get(kg);
+diff --git a/source/blender/gpu/shaders/common/gpu_shader_tiled_image_lookup.bsl.hh b/source/blender/gpu/shaders/common/gpu_shader_tiled_image_lookup.bsl.hh
+--- a/source/blender/gpu/shaders/common/gpu_shader_tiled_image_lookup.bsl.hh
++++ b/source/blender/gpu/shaders/common/gpu_shader_tiled_image_lookup.bsl.hh
+@@ -6,7 +6,7 @@
+
+ #include "gpu_shader_compat.hh"
+
+-bool tiled_image_lookup(float3 &co, sampler2DArray /*ima*/, sampler1DArray map)
++bool tiled_image_lookup(float3 &co, sampler2DArray /*ima*/, sampler1DArray map, float2 &tile_scale)
+ {
+   float2 tile_pos = floor(co.xy);
+
+@@ -24,6 +24,7 @@
+   }
+   float4 tile_info = texelFetch(map, int2(tile, 1), 0);
+
+-  co = float3(((co.xy - tile_pos) * tile_info.zw) + tile_info.xy, tile_layer);
++  tile_scale = tile_info.zw;
++  co = float3(((co.xy - tile_pos) * tile_scale) + tile_info.xy, tile_layer);
+   return true;
+ }
+diff --git a/source/blender/gpu/shaders/material/gpu_shader_material_tex_image.bsl.hh b/source/blender/gpu/shaders/material/gpu_shader_material_tex_image.bsl.hh
+--- a/source/blender/gpu/shaders/material/gpu_shader_material_tex_image.bsl.hh
++++ b/source/blender/gpu/shaders/material/gpu_shader_material_tex_image.bsl.hh
+@@ -64,7 +64,7 @@
+ void node_tex_image_linear(
+     float3 co, sampler2D ima, KernelGlobals &kg, float4 &color, float &alpha)
+ {
+-#if defined(GPU_FRAGMENT_SHADER) || defined(GLSL_CPP_STUBS)
++#if (defined(GPU_FRAGMENT_SHADER) && !defined(GPU_VOLUME_FROXEL_SHADER)) || defined(GLSL_CPP_STUBS)
+   float2 dx = gpu_dfdx(co.xy) * texture_lod_bias_get(kg);
+   float2 dy = gpu_dfdy(co.xy) * texture_lod_bias_get(kg);
+
+@@ -206,8 +206,18 @@
+ void node_tex_tile_linear(
+     float3 co, sampler2DArray ima, sampler1DArray map, float4 &color, float &alpha)
+ {
+-  if (tiled_image_lookup(co, ima, map)) {
++#if defined(GPU_WEBGPU) && defined(GPU_FRAGMENT_SHADER) && !defined(GPU_VOLUME_FROXEL_SHADER)
++  /* Keep derivatives outside tile selection, then scale the footprint into the atlas. */
++  const float2 uv_dx = gpu_dfdx(co.xy);
++  const float2 uv_dy = gpu_dfdy(co.xy);
++#endif
++  float2 tile_scale;
++  if (tiled_image_lookup(co, ima, map, tile_scale)) {
++#if defined(GPU_WEBGPU) && defined(GPU_FRAGMENT_SHADER) && !defined(GPU_VOLUME_FROXEL_SHADER)
++    color = textureGrad(ima, co, uv_dx * tile_scale, uv_dy * tile_scale);
++#else
+     color = texture(ima, co);
++#endif
+   }
+   else {
+     color = float4(1.0f, 0.0f, 1.0f, 1.0f);
+@@ -220,7 +230,8 @@
+ void node_tex_tile_cubic(
+     float3 co, sampler2DArray ima, sampler1DArray map, float4 &color, float &alpha)
+ {
+-  if (tiled_image_lookup(co, ima, map)) {
++  float2 tile_scale;
++  if (tiled_image_lookup(co, ima, map, tile_scale)) {
+     float2 tex_size = float2(textureSize(ima, 0).xy);
+
+     co.xy *= tex_size;
+
+diff --git a/source/blender/gpu/shaders/material/gpu_shader_material_wireframe.bsl.hh b/source/blender/gpu/shaders/material/gpu_shader_material_wireframe.bsl.hh
+--- a/source/blender/gpu/shaders/material/gpu_shader_material_wireframe.bsl.hh
++++ b/source/blender/gpu/shaders/material/gpu_shader_material_wireframe.bsl.hh
+@@ -24,7 +24,7 @@
+   float3 barys = sd.barycentric_coords.xyy;
+   barys.z = 1.0f - barys.x - barys.y;
+
+-#if defined(GPU_FRAGMENT_SHADER) || defined(GLSL_CPP_STUBS)
++#if (defined(GPU_FRAGMENT_SHADER) && !defined(GPU_VOLUME_FROXEL_SHADER)) || defined(GLSL_CPP_STUBS)
+   size *= (1.0f / 3.0f);
+   float3 dx = gpu_dfdx(barys) * derivative_scale_get(kg);
+   float3 dy = gpu_dfdy(barys) * derivative_scale_get(kg);
+
+diff --git a/source/blender/draw/engines/eevee/eevee_volume.cc b/source/blender/draw/engines/eevee/eevee_volume.cc
+--- a/source/blender/draw/engines/eevee/eevee_volume.cc
++++ b/source/blender/draw/engines/eevee/eevee_volume.cc
+@@ -11,6 +11,7 @@
+  */
+
+ #include "GPU_capabilities.hh"
++#include "GPU_context.hh"
+
+ #include "GPU_debug.hh"
+
+@@ -219,6 +220,10 @@
+   prop_phase_weight_tx_.ensure_3d(gpu::TextureFormat::SFLOAT_16, data_.tex_size, usage);
+
+   int occupancy_layers = divide_ceil_u(data_.tex_size.z, 32u);
++  if (GPU_backend_get_type() == GPU_BACKEND_WEBGPU) {
++    /* One word per column for the material pass to claim before writing froxels. */
++    occupancy_layers++;
++  }
+   eGPUTextureUsage occupancy_usage = GPU_TEXTURE_USAGE_SHADER_READ |
+                                      GPU_TEXTURE_USAGE_SHADER_WRITE | GPU_TEXTURE_USAGE_ATOMIC;
+   occupancy_tx_.ensure_3d(
+
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_surf_occupancy.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_surf_occupancy.bsl.hh
+--- a/source/blender/draw/engines/eevee/shaders/eevee_surf_occupancy.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_surf_occupancy.bsl.hh
+@@ -71,7 +71,8 @@
+   if (srt.use_fast_method) {
+     occupancy::Bits occupancy_bits = occupancy::bits_from_depth(
+         volume_z, uni.uniform_buf.volumes.tex_size.z);
+-    for (int i = 0; i < imageSize(srt.occupancy_img).z; i++) {
++    const int occupancy_layers = (uni.uniform_buf.volumes.tex_size.z + 31) / 32;
++    for (int i = 0; i < occupancy_layers; i++) {
+       /* Negate occupancy bits before XORing so that meshes clipped by the near plane fill the
+        * space between the inner part of the mesh and the near plane.
+        * It doesn't change anything for closed meshes. */
+
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_surf_volume.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_surf_volume.bsl.hh
+--- a/source/blender/draw/engines/eevee/shaders/eevee_surf_volume.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_surf_volume.bsl.hh
+@@ -34,7 +34,7 @@
+
+   [[resource_table]] draw::Volume volume;
+
+-  [[image(VOLUME_OCCUPANCY_SLOT, read, UINT_32)]] uimage3DAtomic occupancy_img;
++  [[image(VOLUME_OCCUPANCY_SLOT, read_write, UINT_32)]] uimage3DAtomic occupancy_img;
+
+   [[image(
+       VOLUME_PROP_SCATTERING_IMG_SLOT, read_write, UFLOAT_11_11_10)]] image3D out_scattering_img;
+@@ -170,5 +170,14 @@
+   if (!srt.is_world) [[static_branch]] {
++#ifdef GPU_VOLUME_FROXEL_SHADER
++    /* WebGPU cannot require early stencil tests. Claim the extra occupancy word
++     * to run the storage writes once per froxel column. */
++    int visit_layer = imageSize(srt.occupancy_img).z - 1;
++    if (imageAtomicOr(srt.occupancy_img, int3(froxel.xy, visit_layer), 1u) != 0u) {
++      return;
++    }
++#endif
++
+     for (int j = 0; j < 8; j++) {
+       occupancy.bits[j] = imageLoad(srt.occupancy_img, int3(froxel.xy, j)).r;
+     }
+   }

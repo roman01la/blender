@@ -31,11 +31,14 @@ using KernelGlobals = const SvmGlobals *;
 using Float4 = float __attribute__((ext_vector_type(4)));
 
 __attribute__((pure)) unsigned int cycles_svm_word(unsigned int index);
+__attribute__((pure)) ccl::WebGPUSvmContextWords cycles_svm_context(unsigned int lane,
+                                                                  unsigned int field);
 
 void cycles_svm_material(unsigned int shader,
                          unsigned int primitive,
                          float u,
                          float v,
+                         unsigned int lane,
                          Float4 &base,
                          Float4 &specular,
                          Float4 &layers,
@@ -54,15 +57,16 @@ void cycles_svm_material(unsigned int shader,
   const auto uv = ccl::webgpu_svm_triangle_uv(cycles_svm_word, texture, primitive, u, v);
   const auto generated = ccl::webgpu_svm_triangle_generated(cycles_svm_word, texture, primitive, u, v);
   const auto rgb_to_y = ccl::webgpu_svm_read_rgb(cycles_svm_word, texture + 3);
-  const auto image = [texture](int id, ccl::float2 co, ccl::float3 &color) {
-    return ccl::webgpu_svm_image(cycles_svm_word, texture, id, co, color);
+  const auto image = [texture](int id, ccl::float2 co, bool alpha, ccl::float4 &color) {
+    return ccl::webgpu_svm_image(cycles_svm_word, texture, id, co, alpha, color);
   };
   ccl::WebGPUSvmMaterial material;
   bool uses_uv = false;
   bool uses_generated = false;
+  const auto surface = [lane](const unsigned int field) { return cycles_svm_context(lane, field); };
   if (!ccl::webgpu_svm_eval_material(
           fetch, image, uv, generated, rgb_to_y, uses_uv, uses_generated, word_count,
-          cycles_svm_word(1), shader, material))
+          cycles_svm_word(1) & CYCLES_WEBGPU_SVM_SHADER_COUNT, shader, material, surface))
   {
     base = {0, 0, 0, 2};
     return;
@@ -80,7 +84,7 @@ void cycles_svm_material(unsigned int shader,
     transmission = {material.transmission,
                     material.glass_ior,
                     material.subsurface > 0.0f ? float(material.subsurface_method) :
-                                                material.standalone_glass ? 1.0f : 0.0f,
+                                                material.standalone_transmission,
                     material.subsurface};
     if (material.subsurface > 0.0f) {
       subsurface = {material.subsurface_radius.x,

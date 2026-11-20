@@ -3,6 +3,7 @@
 #pragma once
 
 #include "device/kernel.h"
+#include "device/webgpu/material_layout.h"
 #include "util/unique_ptr.h"
 
 #include <cstddef>
@@ -21,7 +22,7 @@ struct IntegratorQueueCounter;
 struct KernelWorkTile;
 
 struct WebGPURenderShaders {
-  std::string_view camera, bvh2, surface, film, state_init, svm, wavefront_queue;
+  std::string_view camera, bvh2, surface, film, state_init, wavefront_queue;
   std::string (*load_shader)(const char *name) = nullptr;
 };
 
@@ -50,7 +51,7 @@ class WebGPURenderPipeline {
                     std::span<const uint32_t> sampling,
                     bool has_subsurface);
   /** Reset the GPU film and return the allocated capacity for the stock path scheduler. */
-  bool reset(std::span<const float, 32> camera,
+  bool reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WORDS> camera,
              std::span<const uint32_t, 16> denoising_config,
              const BufferParams &params,
              size_t film_words,

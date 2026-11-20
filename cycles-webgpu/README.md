@@ -259,6 +259,7 @@ python3 web/cycles-webgpu/build.py --stock-camera TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --bvh2-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --surface-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-compact TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --svm-compact --svm-core TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --subsurface-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --shade-background TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --shade-background --light-tree TOOLCHAIN_ARGUMENTS
@@ -267,6 +268,8 @@ python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow TOOLCHAIN_AR
 python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --reflection-only TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --reflection-only --point-distribution TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --reflection-only --light-tree TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --point-distribution TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --light-tree TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --path-update TOOLCHAIN_ARGUMENTS
@@ -296,7 +299,7 @@ supported tracing subset.
 The optional point-distribution shader uses the light distribution synchronized
 by Blender's Light Manager and compiles Cycles' CDF and point-light samplers.
 It supports multiple normalized, zero-radius point lights with constant
-emission, opaque materials, and Light Tree and World sampling disabled.
+emission and Light Tree and World sampling disabled.
 A black world meets the point-light path's visibility requirements. The
 single rectangular area light path can use an unsampled equirectangular HDRI.
 
@@ -412,6 +415,11 @@ scene and compiles the full pair when a scene uses transmission. Both pairs
 share the same kernels for SVM, traversal, compaction, and film. Packages
 with only the full wavefront pair still support both scene types.
 
+Build the optional core SVM shader alongside the full shader to reduce pipeline
+compilation time for scenes using the existing material subset. The scene encoder
+selects the full shader when a used material needs one of the extended texture or
+color operations.
+
 Blender's synchronized SVM bytecode supplies the closure inputs for Diffuse
 BSDF and Principled BSDF. For opaque matte Principled, set Specular IOR Level
 to zero and leave Diffuse Roughness and the layer weights at zero.
@@ -442,17 +450,18 @@ Sampling Method to None. The HDRI contributes when camera and bounced rays
 miss, and Cycles’ area-light sampling and emitter hits contribute direct
 light with multiple importance sampling.
 
-Rough refraction supports a nonmetallic Principled material with a constant
-Transmission Weight, or a standalone Glass BSDF. Both accept GGX and
-Multiscatter GGX. Use isotropic, non-delta roughness and a constant IOR that
-differs from one. Principled transmission uses Alpha of one with Thin Wall
-and dispersion turned off. The renderer reuses Cycles' glass Fresnel and GGX
-refraction code and uploads the regular and inverse-IOR energy tables.
+Principled transmission supports GGX and Multiscatter GGX with isotropic roughness,
+a nonmetallic base, constant Transmission Weight, Alpha of one, and Thin Wall and
+dispersion turned off. Standalone Glass supports GGX, Multiscatter GGX, and Beckmann.
+Standalone Refraction supports GGX and Beckmann. Both standalone nodes accept zero
+roughness and linked roughness. IOR is constant and differs from one. The renderer
+reuses Cycles' microfacet closures and regular and inverse-IOR energy tables.
 
-For a transmissive scene, enable refractive caustics and transmission lighting
-on the point light. Use a black world or disable its transmission ray visibility.
-Shadow caustics, transparent shadow casters, and volume absorption use CPU
-Cycles.
+Transmission works with a single rectangular area light, the point-light
+distribution, and the supported Light Tree lights and world. Enable refractive
+caustics and transmission lighting on the lights. A black world satisfies the
+point distribution's world restrictions. Shadow caustics, transparent shadow
+casters, and volume absorption use CPU Cycles.
 
 Each camera path occupies a free GPU slot until it retires into the film.
 A compute pass compacts slots for the kernel chosen by the stock scheduler. BVH traversal, surface
@@ -467,15 +476,22 @@ Diffuse continuations use Cycles' concentric disk mapping and compute the
 hemisphere height from the disk radius before trigonometric rounding.
 Film accumulation uses the raster coordinates stored with each completed path.
 
-For an image-textured material, connect the active mesh UV output to one flat
-Image Texture and use its Color output for Diffuse or Glass Color, or for
-Principled Base Color. Choose Closest or Linear interpolation and Repeat or
-Extend addressing.
-The host packs RGB texels from the synchronized CPU scene's four-channel float
-or byte images, plus per-corner UVs, within the scene upload budget. The SVM
-stage interpolates UVs from the triangle hit and applies Cycles' sRGB conversion
-after filtering when the compiled texture node requests it. Image alpha
-outputs, tiled images, and texture-driven roughness use CPU Cycles.
+Image Texture supports Color and Alpha, Flat, Sphere and Tube projection,
+Closest, Linear, Cubic and Smart filtering, and all four address modes.
+Environment Texture supports equirectangular and mirror ball projection in
+surface materials. The host packs RGB texels from four-channel float or byte
+images and adds an alpha plane when an output or color unassociation needs it.
+The SVM stage applies stock color unassociation and sRGB conversion after
+filtering. The extended shader handles projected images and cubic filtering.
+Box projection, tiled images and texture-driven Principled roughness use
+CPU Cycles.
+
+For surface materials, Light Path and Light Falloff evaluate the stock SVM
+instructions against the live ray and path. Geometry provides Position, Normal,
+True Normal, Incoming, Parametric, and Backfacing. Camera Data, Fresnel,
+Layer Weight, Object Info and Texture Coordinate read the synchronized
+camera, object and path data. Mix Shader and Add Shader support diffuse
+Lambert closures sharing the surface normal.
 
 The Wasm64 queue probe ran the static BVH2 shader in a Chrome worker and
 matched the native fixture on all 1,138 rays. It also exercised named

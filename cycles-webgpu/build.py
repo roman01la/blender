@@ -48,6 +48,8 @@ def retarget(source: Path, wrapper: Path, output: Path) -> None:
     )
     # Direct lighting also calls the C++ traversal kernel defined in a separate module.
     shader_ir = re.sub(r"\b(call|declare) (?=void @_Z17cycles_bvh2_trace)", r"\1 spir_func ", shader_ir)
+    shader_ir = re.sub(r"\b(call|declare) (?=<4 x i32> @_Z18cycles_svm_contextjj)",
+                       r"\1 spir_func ", shader_ir)
     # GGX closures and their lookup accessor link across the BSDF and dispatch modules.
     shader_ir = re.sub(
         r"\b(call|declare) (?=(?:noundef )?(?:float @_Z17cycles_ggx_lookupj\b|"
@@ -129,6 +131,13 @@ def normalize_spirv(code: bytes) -> bytes:
     if byte_types:
         uint_type = ints[(32, 0)]
 
+    def truncate_byte(result, value):
+        nonlocal byte_mask
+        if byte_mask is None:
+            byte_mask = new_id()
+            added_types.append((43, (uint_type, byte_mask, 255)))  # OpConstant
+        return 199, (uint_type, result, value, byte_mask)  # OpBitwiseAnd
+
     normalized = []
     first_function = None
     for opcode, operands in instructions:
@@ -138,18 +147,20 @@ def normalize_spirv(code: bytes) -> bytes:
             if opcode == 113:  # OpUConvert
                 result_type, result, value = operands
                 if result_type in byte_types and integer_value_types[value] == uint_type:
-                    if byte_mask is None:
-                        byte_mask = new_id()
-                        added_types.append((43, (uint_type, byte_mask, 255)))  # OpConstant
-                    opcode, operands = 199, (uint_type, result, value, byte_mask)  # OpBitwiseAnd
+                    opcode, operands = truncate_byte(result, value)
                 elif result_type == uint_type and integer_value_types[value] in byte_types:
                     opcode = 83  # OpCopyObject
-            elif opcode in {1, 43, 46, 83, 169, 245} and operands[0] in byte_types:
-                # Undef, constant, null, copy, select, and phi.
+            elif opcode == 128 and operands[0] in byte_types:  # OpIAdd
+                # Keep byte overflow for packed SVM stack offset comparisons.
+                _, result, *arguments = operands
+                widened = new_id()
+                normalized.append((opcode, (uint_type, widened, *arguments)))
+                opcode, operands = truncate_byte(result, widened)
+            elif opcode in {1, 43, 46, 83, 169, 197, 198, 199, 245} and operands[0] in byte_types:
+                # Undef, constant, null, copy, select, bitwise or/xor/and, and phi.
                 operands = (uint_type, *operands[1:])
-        # SPIR-V permits unsigned integer types in signed conversion
-        # instructions. Naga uses the type's signedness to emit WGSL casts,
-        # so make the signed interpretation explicit in both directions.
+        # SPIR-V permits unsigned integer types in signed instructions. Naga
+        # uses the type's signedness to emit WGSL, so make it explicit.
         if opcode == 110:  # OpConvertFToS
             result_type, result, value = operands
             signed_type = signed_integer_type(result_type)
@@ -165,19 +176,25 @@ def normalize_spirv(code: bytes) -> bytes:
                 signed_value = new_id()
                 normalized.append((124, (signed_type, signed_value, value)))  # OpBitcast
                 operands = (result_type, result, signed_value)
-        elif opcode == 195:  # OpShiftRightArithmetic
-            result_type, result, value, shift = operands
+        elif opcode in {135, 138, 139, 195}:  # OpSDiv, OpSRem, OpSMod, OpShiftRightArithmetic
+            result_type, result, left, right = operands
             signed_type = signed_integer_type(result_type)
-            if integer_value_types[value] != signed_type:
-                signed_value = new_id()
-                normalized.append((124, (signed_type, signed_value, value)))
-                value = signed_value
+            def signed_operand(value):
+                if integer_value_types[value] == signed_type:
+                    return value
+                identifier = new_id()
+                normalized.append((124, (signed_type, identifier, value)))  # OpBitcast
+                return identifier
+
+            left = signed_operand(left)
+            if opcode != 195:
+                right = signed_operand(right)
             if result_type != signed_type:
                 signed_result = new_id()
-                normalized.append((opcode, (signed_type, signed_result, value, shift)))
+                normalized.append((opcode, (signed_type, signed_result, left, right)))
                 opcode, operands = 124, (result_type, result, signed_result)
             else:
-                operands = (signed_type, result, value, shift)
+                operands = (signed_type, result, left, right)
         if opcode == 54 and first_function is None:  # OpFunction
             first_function = len(normalized)
 
@@ -216,10 +233,14 @@ def build_lowering_plugin(llvm: Path, work: Path) -> Path:
 
 
 def lower_spirv(llvm: Path, work: Path, optimized: Path, plugin: Path,
-                structured_cfg: bool = False) -> Path:
+                structured_cfg: bool = False, canonicalize_loops: bool = False) -> Path:
     lowered = work / "lowered.bc"
     control_flow = ("structurizecfg" if structured_cfg else
                     "reg2mem,cycles-webgpu-dispatch-cfg,mem2reg")
+    if canonicalize_loops:
+        # Give the fractal loops dedicated exits before structurizing them.
+        # A shared exit can turn the 3D Hybrid octave back edge into an exit.
+        control_flow = f"loop-simplify,lcssa,{control_flow}"
     passes = (
         "function(cycles-webgpu-hoist-resources,cycles-webgpu-legalize-values,lower-switch,"
         f"{control_flow},cycles-webgpu-legalize-values,adce),verify"
@@ -232,7 +253,8 @@ def build(options) -> None:
     options.output.mkdir(parents=True, exist_ok=True)
     headers = options.emscripten_sysroot / "include"
     cxx_flags = ("-std=c++20", "-DNDEBUG", "-O2", "-fno-math-errno", "-I", CYCLES)
-    if options.svm or options.svm_compact:
+    svm = options.svm or options.svm_compact
+    if svm:
         # The stock procedural texture hash uses wrapping signed arithmetic.
         cxx_flags += ("-fwrapv",)
     light = options.direct_light or options.wavefront_light
@@ -270,6 +292,8 @@ def build(options) -> None:
     adaptive_camera = ("slots" if options.adaptive_camera_slots else
                        "rays" if options.adaptive_camera_rays else None)
     shader_name = f"{dispatch.replace('_', '-')}{'-compact' if compact else ''}.wgsl"
+    if options.svm_core:
+        shader_name = "svm-compact-core.wgsl"
     if adaptive:
         shader_name = f"adaptive-{adaptive}.wgsl"
     elif adaptive_camera:
@@ -296,6 +320,8 @@ def build(options) -> None:
         shader_name = shader_name.removesuffix(".wgsl") + "-guides.wgsl"
 
     shader_flags = []
+    if options.svm_core:
+        shader_flags.append("-DCYCLES_WEBGPU_SVM_CORE=1")
     if options.denoise_background:
         shader_flags.append("-DCYCLES_WEBGPU_DENOISE_BACKGROUND=1")
     if options.denoise_surface:
@@ -417,7 +443,6 @@ def build(options) -> None:
             )
         else:
             # Private C++ aggregates cannot cross function calls in WGSL.
-            svm = options.svm or options.svm_compact
             opt_plugin = (f"-load-pass-plugin={plugin}",) if svm else ()
             inline_helpers = "cycles-webgpu-inline-helpers,always-inline," if svm else ""
             run(
@@ -436,10 +461,11 @@ def build(options) -> None:
             shader = lower_spirv(options.llvm_bin, work, optimized, plugin,
                                  structured_cfg=(options.shade_background or options.adaptive_film or
                                                  options.bvh2_compact or options.intersect_shadow or
-                                                 options.surface_compact or options.svm_compact or
+                                                 options.surface_compact or svm or
                                                  options.path_update or options.wavefront_light or
                                                  options.denoise_surface or options.subsurface or
-                                                 options.subsurface_compact))
+                                                 options.subsurface_compact),
+                                 canonicalize_loops=svm)
         run(
             options.llvm_bin / "llc",
             "-O0" if structured_dispatch else "-O2", "-filetype=obj",
@@ -531,6 +557,8 @@ if __name__ == "__main__":
                         help="build a smaller wavefront light or path-update shader for opaque scenes")
     parser.add_argument("--defer-shadow", action="store_true",
                         help="emit shadow rays for a separate wavefront intersection stage")
+    parser.add_argument("--svm-core", action="store_true",
+                        help="build the smaller SVM shader for materials without extended nodes")
     parser.add_argument("--light-tree", action="store_true",
                         help="use stock Cycles Light Tree and world importance sampling")
     parser.add_argument("--point-distribution", action="store_true",
@@ -581,15 +609,17 @@ if __name__ == "__main__":
     modes.add_argument("--adaptive-film", action="store_true",
                        help="compile Cycles' adaptive film pass writers")
     options = parser.parse_args()
+    if options.svm_core and not options.svm_compact:
+        parser.error("--svm-core requires --svm-compact")
     if options.reflection_only and not (options.wavefront_light or options.path_update):
         parser.error("--reflection-only requires --wavefront-light or --path-update")
     if options.defer_shadow and not options.wavefront_light:
         parser.error("--defer-shadow requires --wavefront-light")
-    if options.point_distribution and not (options.defer_shadow and options.reflection_only):
-        parser.error("--point-distribution requires --wavefront-light --defer-shadow --reflection-only")
+    if options.point_distribution and not options.defer_shadow:
+        parser.error("--point-distribution requires --wavefront-light --defer-shadow")
     if options.light_tree and (options.point_distribution or not (
-            options.shade_background or (options.defer_shadow and options.reflection_only))):
-        parser.error("--light-tree requires --shade-background or deferred reflection-only lighting")
+            options.shade_background or options.defer_shadow)):
+        parser.error("--light-tree requires --shade-background or deferred wavefront lighting")
     if options.denoise_background and not options.shade_background:
         parser.error("--denoise-background requires --shade-background")
     build(options)

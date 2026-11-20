@@ -6,9 +6,11 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 using namespace llvm;
 
@@ -435,8 +437,88 @@ const ConstantFP *infinity_compare_literal(const FCmpInst &compare)
   return infinity && infinity->getValueAPF().isInfinity() ? infinity : nullptr;
 }
 
+/* Clang folds the two scalar lanes of float2 into a packed i64 loop phi.
+ * SPIR-V can keep these bits packed, but WebGPU only supports 32-bit integers. */
+bool split_packed_words(PHINode &packed)
+{
+  using namespace llvm::PatternMatch;
+  SmallVector<std::pair<Value *, Value *>, 4> incoming;
+  for (Value *value : packed.incoming_values()) {
+    Value *low, *high;
+    if (!match(value,
+               m_c_Or(m_Shl(m_ZExt(m_Value(high)), m_SpecificInt(32)), m_ZExt(m_Value(low)))) ||
+        !low->getType()->isIntegerTy(32) || !high->getType()->isIntegerTy(32))
+    {
+      return false;
+    }
+    incoming.emplace_back(low, high);
+  }
+
+  SmallVector<TruncInst *, 4> low_uses, high_uses;
+  SmallVector<Instruction *, 4> shifts;
+  auto collect_word = [](User *use, SmallVectorImpl<TruncInst *> &truncations) {
+    auto *truncation = dyn_cast<TruncInst>(use);
+    if (!truncation || !truncation->getDestTy()->isIntegerTy(32)) {
+      return false;
+    }
+    truncations.push_back(truncation);
+    return true;
+  };
+  for (User *use : packed.users()) {
+    if (collect_word(use, low_uses)) {
+      continue;
+    }
+    auto *shift = dyn_cast<Instruction>(use);
+    if (!shift || !match(shift, m_LShr(m_Specific(&packed), m_SpecificInt(32)))) {
+      return false;
+    }
+    for (User *high_use : shift->users()) {
+      if (!collect_word(high_use, high_uses)) {
+        return false;
+      }
+    }
+    shifts.push_back(shift);
+  }
+
+  IRBuilder<> builder(&packed);
+  const unsigned count = packed.getNumIncomingValues();
+  auto *low = builder.CreatePHI(builder.getInt32Ty(), count);
+  auto *high = builder.CreatePHI(builder.getInt32Ty(), count);
+  for (unsigned i = 0; i < count; i++) {
+    BasicBlock *predecessor = packed.getIncomingBlock(i);
+    low->addIncoming(incoming[i].first, predecessor);
+    high->addIncoming(incoming[i].second, predecessor);
+  }
+  for (auto *word : low_uses) {
+    word->replaceAllUsesWith(low);
+    word->eraseFromParent();
+  }
+  for (auto *word : high_uses) {
+    word->replaceAllUsesWith(high);
+    word->eraseFromParent();
+  }
+  for (auto *shift : shifts) {
+    shift->eraseFromParent();
+  }
+  RecursivelyDeleteTriviallyDeadInstructions(&packed);
+  return true;
+}
+
 bool lower_spirv_values(Function &function)
 {
+  SmallVector<PHINode *, 4> packed_words;
+  for (BasicBlock &block : function) {
+    for (PHINode &phi : block.phis()) {
+      if (phi.getType()->isIntegerTy(64)) {
+        packed_words.push_back(&phi);
+      }
+    }
+  }
+  bool unpacked = false;
+  for (auto *packed : packed_words) {
+    unpacked |= split_packed_words(*packed);
+  }
+
   SmallVector<Instruction *, 32> replacements;
   for (BasicBlock &block : function) {
     for (Instruction &instruction : block) {
@@ -453,7 +535,8 @@ bool lower_spirv_values(Function &function)
       }
       if (auto *call = dyn_cast<IntrinsicInst>(&instruction);
           call && ((call->getIntrinsicID() == Intrinsic::copysign && call->getType()->isFloatTy()) ||
-                   (call->getIntrinsicID() == Intrinsic::ctlz && call->getType()->isIntegerTy(32))))
+                   ((call->getIntrinsicID() == Intrinsic::ctlz ||
+                     call->getIntrinsicID() == Intrinsic::fshl) && call->getType()->isIntegerTy(32))))
       {
         replacements.push_back(call);
       }
@@ -534,6 +617,20 @@ bool lower_spirv_values(Function &function)
       Value *count = builder.CreateUnaryIntrinsic(Intrinsic::ctpop, bits);
       ctlz->replaceAllUsesWith(builder.CreateSub(builder.getInt32(32), count));
     }
+    else if (auto *funnel = dyn_cast<IntrinsicInst>(instruction);
+             funnel && funnel->getIntrinsicID() == Intrinsic::fshl)
+    {
+      /* LLVM recognizes stock texture hash rotations as funnel shifts. Emit
+       * ordinary word operations instead of the backend's linked helper. */
+      Value *shift = builder.CreateAnd(funnel->getArgOperand(2), builder.getInt32(31));
+      Value *back = builder.CreateAnd(builder.CreateNeg(shift), builder.getInt32(31));
+      Value *high = funnel->getArgOperand(0);
+      Value *left = builder.CreateShl(high, shift);
+      Value *right = builder.CreateLShr(funnel->getArgOperand(1), back);
+      funnel->replaceAllUsesWith(builder.CreateSelect(builder.CreateICmpEQ(shift, builder.getInt32(0)),
+                                                      high,
+                                                      builder.CreateOr(left, right)));
+    }
     else {
       auto *call = cast<IntrinsicInst>(instruction);
       auto *magnitude = builder.CreateBitCast(call->getArgOperand(0), builder.getInt32Ty());
@@ -544,7 +641,7 @@ bool lower_spirv_values(Function &function)
     }
     instruction->eraseFromParent();
   }
-  return !replacements.empty();
+  return unpacked || !replacements.empty();
 }
 
 struct LegalizeSpirv : PassInfoMixin<LegalizeSpirv> {
