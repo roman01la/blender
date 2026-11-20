@@ -25,6 +25,11 @@ struct WebGPUSvmNoSurface {
       row[field - first] = __float_as_uint(1.0f);
       return row;
     }
+    if (field >= CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD && field < CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD_END) {
+      WebGPUSvmContextWords row{};
+      row[field - CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD] = __float_as_uint(1.0f);
+      return row;
+    }
     if (field >= CYCLES_WEBGPU_SVM_OBJECT_TRANSFORM && field < CYCLES_WEBGPU_SVM_OBJECT_COLOR) {
       const uint first = field < CYCLES_WEBGPU_SVM_OBJECT_INVERSE ?
                              CYCLES_WEBGPU_SVM_OBJECT_TRANSFORM :
@@ -34,6 +39,10 @@ struct WebGPUSvmNoSurface {
       return row;
     }
     if (field == CYCLES_WEBGPU_SVM_POSITION) {
+      return {0, 0, __float_as_uint(1.0f), 0};
+    }
+    if (field == CYCLES_WEBGPU_SVM_NORMAL) {
+      /* A unit normal keeps normal-dependent host evaluations finite. */
       return {0, 0, __float_as_uint(1.0f), 0};
     }
     return {};

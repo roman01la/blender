@@ -63,7 +63,9 @@ void GHOST_WebGPUCanvas::request(const char *selector, RequestCallback callback)
                                                   wgpu::FeatureName::TextureFormatsTier2,
                                                   wgpu::FeatureName::TextureComponentSwizzle,
                                                   wgpu::FeatureName::Float32Filterable,
-                                                  wgpu::FeatureName::Float32Blendable};
+                                                  wgpu::FeatureName::Float32Blendable,
+                                                  /* Clipping region shaders. */
+                                                  wgpu::FeatureName::ClipDistances};
         std::array<wgpu::FeatureName, optional_features.size()> features;
         wgpu::DeviceDescriptor descriptor{};
         wgpu::Limits available{};

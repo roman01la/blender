@@ -93,6 +93,24 @@ void main(uint3 id : SV_DispatchThreadID)
   const bool transparent_background = active && trace_past_area && hit_words[surface] == 0u &&
                                       cycles_write_transparent_background(
                                           path, counts.w, throughput);
+  /* integrate_surface_holdout(): camera paths keep Cycles' transparent background
+   * flag whatever the film setting, so they write the holdout transparency. */
+  if (active && trace_past_area && hit_words[surface] != 0u &&
+      material.w == CYCLES_WEBGPU_MATERIAL_HOLDOUT &&
+      (counts.w & CYCLES_WEBGPU_PATH_TRANSPARENT_BACKGROUND) != 0u) {
+    const float3 weighted = throughput * material.xyz;
+    const float transparent = (weighted.x + weighted.y + weighted.z) * (1.0f / 3.0f);
+    path_words[sum + 3] = __builtin_bit_cast(uint, 1.0f - transparent);
+  }
+  /* integrate_surface_emission() for emissive surfaces outside light sampling,
+   * so the MIS weight is one. It precedes Russian roulette, and
+   * film_clamp_light() uses bounce - 1: unclamped through the first bounce
+   * (the scene requires an unlimited direct clamp), then the indirect clamp. */
+  const float4 emission = materials[material_base + 5];
+  if (active && trace_past_area && hit_words[surface] != 0u &&
+      (emission.x != 0.0f || emission.y != 0.0f || emission.z != 0.0f)) {
+    rgb += clamp_light(throughput * emission.xyz, bounce <= 1u ? 3.40282347e+38f : emission.w);
+  }
   if (active && trace_past_area && !transparent_background && incoming.w < 0.0f) {
     rgb += clamp_light(throughput * incoming.xyz, -incoming.w);
   }

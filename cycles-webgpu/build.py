@@ -442,9 +442,13 @@ def build(options) -> None:
                 "-o", optimized,
             )
         else:
-            # Private C++ aggregates cannot cross function calls in WGSL.
-            opt_plugin = (f"-load-pass-plugin={plugin}",) if svm else ()
-            inline_helpers = "cycles-webgpu-inline-helpers,always-inline," if svm else ""
+            # Private C++ aggregates cannot cross function calls in WGSL. The
+            # lighting kernels share the SVM image sampler; an outlined copy
+            # would read a storage buffer handle from a private global, which
+            # the SPIR-V backend cannot store.
+            inline_all = svm or light or options.shade_background
+            opt_plugin = (f"-load-pass-plugin={plugin}",) if inline_all else ()
+            inline_helpers = "cycles-webgpu-inline-helpers,always-inline," if inline_all else ""
             run(
                 options.llvm_bin / "opt",
                 *opt_plugin,

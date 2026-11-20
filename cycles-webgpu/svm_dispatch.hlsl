@@ -24,7 +24,7 @@ uint cycles_svm_word(uint index)
 extern void cycles_svm_material(uint shader, uint primitive, float u, float v,
                                 uint lane,
                                 out float4 base, out float4 specular, out float4 layers,
-                                out float4 glass, out float4 subsurface);
+                                out float4 glass, out float4 subsurface, out float4 emission);
 
 uint4 cycles_svm_context(uint lane, uint field)
 {
@@ -52,6 +52,10 @@ uint4 cycles_svm_context(uint lane, uint field)
   }
   if (field >= CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA && field < CYCLES_WEBGPU_SVM_WORLD_TO_NDC_END) {
     const uint row = CYCLES_WEBGPU_CAMERA_SVM_OFFSET + 4 * (field - CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA);
+    return uint4(camera_words[row], camera_words[row + 1], camera_words[row + 2], camera_words[row + 3]);
+  }
+  if (field >= CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD && field < CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD_END) {
+    const uint row = CYCLES_WEBGPU_CAMERA_TO_WORLD_OFFSET + 4 * (field - CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD);
     return uint4(camera_words[row], camera_words[row + 1], camera_words[row + 2], camera_words[row + 3]);
   }
   if (field >= CYCLES_WEBGPU_SVM_OBJECT_TRANSFORM) {
@@ -103,6 +107,7 @@ void main(uint3 id : SV_DispatchThreadID)
   float4 layers = float4(0, 0, 0, 0);
   float4 glass = float4(0, 0, 0, 0);
   float4 subsurface = float4(0, 0, 0, 0);
+  float4 emission = float4(0, 0, 0, 0);
   if (hit_words[base + 7] != 0) {
     // Cycles replaces the entry material with white diffuse scattering at the exit.
     result = float4(1, 1, 1, 1);
@@ -111,7 +116,7 @@ void main(uint3 id : SV_DispatchThreadID)
     cycles_svm_material(surface_words[base + 7], hit_words[base + 1],
                         __builtin_bit_cast(float, hit_words[base + 5]),
                         __builtin_bit_cast(float, hit_words[base + 6]), lane,
-                        result, specular, layers, glass, subsurface);
+                        result, specular, layers, glass, subsurface, emission);
   }
   else if (surface_status != 0) {
     result.w = 2;
@@ -122,4 +127,5 @@ void main(uint3 id : SV_DispatchThreadID)
   materials[material + 2] = layers;
   materials[material + 3] = glass;
   materials[material + 4] = subsurface;
+  materials[material + 5] = emission;
 }

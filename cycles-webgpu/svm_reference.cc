@@ -7,6 +7,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <span>
@@ -28,13 +29,11 @@ namespace ccl {
  * The reference calls ImageInterpolator directly without accessing these arrays. */
 struct SvmReferenceGlobals {
   KernelData data;
-  const KernelImageUDIM *image_texture_udims;
-  const KernelImageTexture *image_textures;
-  const KernelTileDescriptor *image_texture_tile_descriptors;
-  uchar *image_texture_tile_access_state;
-  const KernelImageInfo *image_info;
-  const uint *svm_nodes;
-  const float *lookup_table;
+#define KERNEL_DATA_ARRAY(type, name) const type *name;
+#define KERNEL_DATA_ARRAY_WRITABLE(type, name) type *name;
+#include "kernel/data_arrays.h"
+#undef KERNEL_DATA_ARRAY_WRITABLE
+#undef KERNEL_DATA_ARRAY
 };
 using KernelGlobals = const SvmReferenceGlobals *;
 }  // namespace ccl
@@ -69,6 +68,18 @@ using KernelGlobals = const SvmReferenceGlobals *;
 #include "kernel/svm/voronoi.h"
 #include "kernel/svm/wave.h"
 #include "kernel/svm/white_noise.h"
+#include "kernel/svm/vector_transform.h"
+#include "kernel/svm/wavelength.h"
+#include "kernel/svm/ies.h"
+namespace ccl {
+/* GPU builds supply kernel_image_interp(). The reference mirrors Nishita's LUT
+ * lookup with ImageInterpolator and only calls the analytic sky models. */
+template<typename... Args> float4 kernel_image_interp(Args...)
+{
+  std::abort();
+}
+}  // namespace ccl
+#include "kernel/svm/sky.h"
 #include "kernel/util/image.h"
 #undef kernel_data_array
 #undef kernel_data_fetch
@@ -87,7 +98,8 @@ void cycles_svm_material(unsigned int shader,
                          Float4 &specular,
                          Float4 &layers,
                          Float4 &transmission,
-                         Float4 &subsurface);
+                         Float4 &subsurface,
+                         Float4 &emission);
 
 namespace {
 
@@ -153,7 +165,154 @@ constexpr std::array view_coordinates{NODE_TEXCO_CAMERA, NODE_TEXCO_WINDOW,
                                       NODE_TEXCO_REFLECTION, NODE_TEXCO_OBJECT_WITH_TRANSFORM,
                                       NODE_TEXCO_OBJECT, NODE_TEXCO_NORMAL};
 constexpr unsigned int first_object_info_shader = first_view_coordinate + view_coordinates.size();
-constexpr unsigned int shader_count = first_object_info_shader + NODE_INFO_OB_RANDOM + 1;
+constexpr unsigned int first_attribute_shader = first_object_info_shader + NODE_INFO_OB_RANDOM + 1;
+constexpr std::array attribute_outputs{NODE_ATTR_OUTPUT_FLOAT3, NODE_ATTR_OUTPUT_FLOAT,
+                                       NODE_ATTR_OUTPUT_FLOAT_ALPHA};
+constexpr unsigned int first_hair_info_shader = first_attribute_shader + attribute_outputs.size();
+constexpr std::array hair_outputs{NODE_INFO_CURVE_IS_STRAND, NODE_INFO_CURVE_THICKNESS,
+                                  NODE_INFO_CURVE_TANGENT_NORMAL};
+constexpr unsigned int first_point_info_shader = first_hair_info_shader + hair_outputs.size();
+constexpr std::array point_outputs{NODE_INFO_POINT_POSITION, NODE_INFO_POINT_RADIUS};
+constexpr unsigned int first_particle_info_shader = first_point_info_shader + point_outputs.size();
+constexpr unsigned int particle_outputs = NODE_INFO_PAR_ANGULAR_VELOCITY + 1;
+constexpr unsigned int first_wavelength_shader = first_particle_info_shader + particle_outputs;
+constexpr std::array wavelengths{380.0f, 452.5f, 555.0f, 610.25f, 779.0f};
+constexpr unsigned int first_vector_transform_shader = first_wavelength_shader + wavelengths.size();
+/* Every vector type for every pair of World, Object and Camera spaces. */
+constexpr unsigned int vector_transform_fixtures = 3 * 3 * 3;
+constexpr unsigned int first_found_attribute_shader = first_vector_transform_shader +
+                                                      vector_transform_fixtures;
+/* Packed attribute slots on the two UV triangles: a mode and NodeAttributeType
+ * word followed by three float4 corners, as the host converts them. */
+struct AttributeRecord {
+  unsigned int mode;
+  NodeAttributeType type;
+  std::array<float4, 3> corners;
+  unsigned int flags = 0;
+};
+const std::array<std::array<AttributeRecord, 2>, 3> attribute_records{{
+    {{{1, NODE_ATTR_RGBA, {make_float4(0.1f, 0.2f, 0.3f, 0.4f), make_float4(0.5f, 0.6f, 0.7f, 0.8f),
+                           make_float4(0.9f, 0.25f, 0.125f, 0.0625f)}},
+      {0, NODE_ATTR_FLOAT, {}}}},
+    {{{2, NODE_ATTR_FLOAT, {make_float4(0.625f, 0, 0, 0)}},
+      {1, NODE_ATTR_FLOAT2, {make_float4(0.1f, 0.2f, 0, 0), make_float4(0.3f, 0.4f, 0, 0),
+                             make_float4(0.5f, 0.75f, 0, 0)}}}},
+    {{{1, NODE_ATTR_FLOAT3, {make_float4(0.2f, 0.4f, 0.6f, 0), make_float4(0.8f, 0.1f, 0.3f, 0),
+                             make_float4(0.5f, 0.5f, 0.5f, 0)}},
+      {2, NODE_ATTR_FLOAT4, {make_float4(0.3f, 0.6f, 0.9f, 0.45f)}}}},
+}};
+/* Slots 3-6 hold a UV tangent, its sign, smooth object-space normals and
+ * triangle positions, with the object transform pending on the first triangle. */
+const std::array<std::array<AttributeRecord, 2>, 4> surface_records{{
+    {{{1, NODE_ATTR_FLOAT3, {make_float4(0.8f, 0.6f, 0.1f, 0), make_float4(0.7f, 0.7f, 0.2f, 0),
+                             make_float4(0.9f, 0.3f, 0.3f, 0)}},
+      {1, NODE_ATTR_FLOAT3, {make_float4(0.1f, 0.9f, 0.2f, 0), make_float4(0.3f, 0.8f, 0.1f, 0),
+                             make_float4(0.2f, 0.7f, 0.4f, 0)}}}},
+    {{{2, NODE_ATTR_FLOAT, {make_float4(1, 0, 0, 0)}},
+      {1, NODE_ATTR_FLOAT, {make_float4(-1, 0, 0, 0), make_float4(-1, 0, 0, 0),
+                            make_float4(-1, 0, 0, 0)}}}},
+    {{{1, NODE_ATTR_FLOAT3, {make_float4(0.1f, 0.2f, 0.9f, 0), make_float4(-0.2f, 0.1f, 0.95f, 0),
+                             make_float4(0.3f, -0.1f, 0.85f, 0)}},
+      {1, NODE_ATTR_FLOAT3, {make_float4(0.6f, 0, 0.8f, 0), make_float4(0, 0.6f, 0.8f, 0),
+                             make_float4(0, 0, 1, 0)}}}},
+    {{{2, NODE_ATTR_FLOAT3, {make_float4(0, 0, 0, 0), make_float4(1, 0, 0, 0),
+                             make_float4(0, 1, 0, 0)}, 1},
+      {2, NODE_ATTR_FLOAT3, {make_float4(0.5f, 0.2f, 0.125f, 0), make_float4(0.9f, 0.3f, 0.125f, 0),
+                             make_float4(0.4f, 0.6f, 0.125f, 0)}}}},
+}};
+constexpr unsigned int tangent_slot = 3;
+struct NormalMapFixture {
+  NodeNormalMapSpace space;
+  bool smooth;
+  float strength;
+  bool invert_green = false;
+  unsigned int primitive = 0;
+  bool missing_tangent = false;
+  unsigned int surface = 1;
+};
+const std::array normal_map_fixtures{
+    NormalMapFixture{NODE_NORMAL_MAP_TANGENT, true, 1.0f},
+    NormalMapFixture{NODE_NORMAL_MAP_TANGENT, false, 0.5f},
+    NormalMapFixture{NODE_NORMAL_MAP_TANGENT, true, 2.0f, true, 1},
+    NormalMapFixture{NODE_NORMAL_MAP_TANGENT, false, 1.0f, false, 0, false, 2},
+    NormalMapFixture{NODE_NORMAL_MAP_TANGENT, true, 1.0f, false, 0, true},
+    NormalMapFixture{NODE_NORMAL_MAP_OBJECT, true, 1.0f},
+    NormalMapFixture{NODE_NORMAL_MAP_WORLD, true, 0.5f},
+    NormalMapFixture{NODE_NORMAL_MAP_BLENDER_OBJECT, false, 1.5f},
+    NormalMapFixture{NODE_NORMAL_MAP_BLENDER_WORLD, true, 1.0f, false, 0, false, 2},
+};
+const float3 normal_map_color = make_float3(0.7f, 0.4f, 0.9f);
+constexpr std::array wireframe_sizes{0.01f, 0.4f, 5.0f};
+constexpr unsigned int first_normal_map_shader = first_found_attribute_shader +
+                                                 3 * attribute_records.size();
+constexpr unsigned int first_wireframe_shader = first_normal_map_shader +
+                                                normal_map_fixtures.size();
+/* IES directions, including both poles, against slot 0 and the empty slot 1. */
+const std::array ies_directions{make_float3(0.3f, -0.5f, 0.2f), make_float3(-0.7f, 0.1f, -0.4f),
+                                make_float3(0, 0, 1), make_float3(0, 0, -1),
+                                make_float3(0.2f, 0.6f, -0.1f)};
+constexpr unsigned int first_ies_shader = first_wireframe_shader + wireframe_sizes.size();
+constexpr unsigned int first_sky_shader = first_ies_shader + ies_directions.size() + 1;
+/* Sky directions above and below the horizon. Nishita adds one at the Sun. */
+const std::array sky_directions{make_float3(0.3f, 0.4f, 0.6f), make_float3(0.5f, -0.2f, 0.1f),
+                                make_float3(-0.2f, 0.7f, -0.3f)};
+constexpr unsigned int sky_fixtures = 3 * 4;
+constexpr unsigned int first_tangent_shader = first_sky_shader + sky_fixtures;
+const SVMNodeTexSkyPreethamData sky_preetham{
+    0.7f, 0.9f, 1.2f, 0.3f, 0.32f,
+    {-1.0f, -0.3f, 2.0f, -2.5f, 0.4f, 0, 0, 0, 0},
+    {-1.1f, -0.25f, 1.5f, -2.0f, 0.3f, 0, 0, 0, 0},
+    {-0.9f, -0.35f, 2.5f, -3.0f, 0.5f, 0, 0, 0, 0}};
+const SVMNodeTexSkyPreethamData sky_hosek{
+    0.4f, 1.1f, 5.0f, 5.5f, 6.0f,
+    {-1.2f, -0.25f, 0.5f, 2.0f, -3.0f, 0.1f, 0.7f, 0.5f, 0.4f},
+    {-1.1f, -0.2f, 0.4f, 1.8f, -2.5f, 0.12f, 0.6f, 0.45f, 0.5f},
+    {-1.0f, -0.15f, 0.3f, 1.5f, -2.0f, 0.15f, 0.5f, 0.4f, 0.6f}};
+const SVMNodeTexSkyNishitaData sky_nishita{0.9f, 0.8f, 0.7f, 1.1f, 1.0f, 0.9f,
+                                           0.5f, 1.0f, 0.2f, 2.0f, -0.05f, 3};
+float3 sky_direction(const unsigned int i)
+{
+  if (i < sky_directions.size()) {
+    return sky_directions[i];
+  }
+  /* Slightly off the Sun's center, inside its disc. */
+  return spherical_to_direction(sky_nishita.sun_elevation - M_PI_2_F + 0.02f,
+                                sky_nishita.sun_rotation - M_PI_2_F);
+}
+/* LightManager's IES layout: slot offsets, then per slot the horizontal and
+ * vertical counts, their angles and intensities by horizontal angle. */
+std::vector<float> ies_table()
+{
+  std::vector<float> table{std::bit_cast<float>(2), std::bit_cast<float>(-1)};
+  table.insert(table.end(), {std::bit_cast<float>(5), std::bit_cast<float>(4)});
+  for (int h = 0; h < 5; h++) {
+    table.push_back(h * M_PI_2_F);
+  }
+  /* The last angle passes pi so the upward pole interpolates instead of
+   * depending on the last bit of acosf(-1) at the table's upper bound. */
+  for (int v = 0; v < 4; v++) {
+    table.push_back(v == 3 ? M_PI_F * 1.0001f : v * M_PI_F / 3.0f);
+  }
+  for (int h = 0; h < 5; h++) {
+    for (int v = 0; v < 4; v++) {
+      table.push_back(10.0f + 3.0f * float((h % 4) * 4 + v) - 0.5f * float(v * v));
+    }
+  }
+  return table;
+}
+/* Geometry Tangent, radial X, Y and Z, then UV tangents from slot 2 on the
+ * first triangle, slot 1 on the second, a missing attribute and slot 0's
+ * missing record on the second triangle. */
+constexpr unsigned int tangent_fixtures = 8;
+constexpr unsigned int first_holdout_shader = first_tangent_shader + tangent_fixtures;
+constexpr unsigned int first_emission_shader = first_holdout_shader + 3;
+constexpr unsigned int shader_count = first_emission_shader + 6;
+constexpr float indirect_clamp = 10.0f;
+/* XYZ to linear Rec. 709 rows, as synchronized in KernelFilm. */
+const std::array xyz_to_rgb_rows{make_float3(3.2404542f, -1.5371385f, -0.4985314f),
+                                 make_float3(-0.9692660f, 1.8760108f, 0.0415560f),
+                                 make_float3(0.0556434f, -0.2040259f, 1.0572252f)};
+const float3 vector_transform_input = make_float3(0.375f, 0.625f, 0.8125f);
 const Transform world_to_camera = make_transform(1, 0, 0, 0.25f,
                                                   0, 1, 0, 0.5f,
                                                   0, 0, 1, 1.25f);
@@ -164,6 +323,9 @@ const std::array world_to_ndc_rows{make_float4(2, 0, 0, 0),
                                     make_float4(0, 1, 0, 0.5f),
                                     make_float4(0, 0, 1, 0),
                                     make_float4(0, 0, 0.5f, 1)};
+const Transform camera_to_world = make_transform(1, 0, 0, -0.25f,
+                                                 0, 1, 0, -0.5f,
+                                                 0, 0, 1, -1.25f);
 const std::array camera_rows{world_to_camera.x, world_to_camera.y, world_to_camera.z,
                                world_to_ndc_rows[0], world_to_ndc_rows[1],
                                world_to_ndc_rows[2], world_to_ndc_rows[3]};
@@ -290,6 +452,8 @@ struct PrincipledMaterial {
   float transmission = 0.0f;
   float dispersion_scale = 0.0f;
   bool thin_wall = false;
+  std::array<float, 3> emission_color{};
+  float emission_strength = 0.0f;
 };
 
 void push_principled(const PrincipledMaterial &material)
@@ -323,6 +487,8 @@ void push_principled(const PrincipledMaterial &material)
       .anisotropic = {bits(material.anisotropic)},
       .transmission_dispersion_scale = {bits(material.dispersion_scale)},
       .thin_wall = {.value = material.thin_wall, .offset = SVM_STACK_INVALID},
+      .emission_color = color_bits(material.emission_color),
+      .emission_strength = {bits(material.emission_strength)},
   };
   const auto words = std::bit_cast<std::array<unsigned int, sizeof(data) / sizeof(unsigned int)>>(
       data);
@@ -381,6 +547,11 @@ ContextWords cycles_svm_context(unsigned int lane, unsigned int field)
 {
   if (field < CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA) {
     return fixture_surfaces.at(lane).at(field);
+  }
+  if (field >= CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD && field < CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD_END) {
+    const std::array rows{camera_to_world.x, camera_to_world.y, camera_to_world.z};
+    const float4 row = rows.at(field - CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD);
+    return std::bit_cast<ContextWords>(Float4{row.x, row.y, row.z, row.w});
   }
   if (field >= CYCLES_WEBGPU_SVM_OBJECT_INDEX) {
     const std::array values{object_pass, float(material_pass), object_random};
@@ -1157,6 +1328,219 @@ int main()
       }
     });
   }
+  const auto f3 = [](const float3 value) {
+    return SVMInputFloat3{{std::bit_cast<uint>(value.x)},
+                          {std::bit_cast<uint>(value.y)},
+                          {std::bit_cast<uint>(value.z)}};
+  };
+  const auto push_result = [&](const bool vector) {
+    if (vector) {
+      push_node(NODE_CLOSURE_WEIGHT, SVMNodeClosureWeight{.weight_offset = 0});
+      push_diffuse(0);
+    }
+    else {
+      push_scalar_result();
+    }
+  };
+  const auto attribute_node = [&](const int attr, const NodeAttributeOutputType type) {
+    return SVMNodeAttr{.attr = attr,
+                       .missing = f3(make_float3(0.25f, 0.5f, 0.875f)),
+                       .missing_alpha = {std::bit_cast<uint>(0.375f)},
+                       .out_offset = 0,
+                       .output_type = type};
+  };
+  for (unsigned int i = 0; i < attribute_outputs.size(); ++i) {
+    push_shader(first_attribute_shader + i, [&] {
+      /* The host marks attributes absent on every object as not found. */
+      push_node(NODE_ATTR, attribute_node(int(ATTR_STD_NOT_FOUND), attribute_outputs[i]));
+      push_result(attribute_outputs[i] == NODE_ATTR_OUTPUT_FLOAT3);
+    });
+  }
+  for (unsigned int i = 0; i < hair_outputs.size(); ++i) {
+    push_shader(first_hair_info_shader + i, [&] {
+      push_node(NODE_HAIR_INFO, SVMNodeHairInfo{.info_type = hair_outputs[i], .out_offset = 0});
+      push_result(hair_outputs[i] == NODE_INFO_CURVE_TANGENT_NORMAL);
+    });
+  }
+  for (unsigned int i = 0; i < point_outputs.size(); ++i) {
+    push_shader(first_point_info_shader + i, [&] {
+      push_node(NODE_POINT_INFO, SVMNodePointInfo{.info_type = point_outputs[i], .out_offset = 0});
+      push_result(point_outputs[i] == NODE_INFO_POINT_POSITION);
+    });
+  }
+  const auto particle_vector = [](const unsigned int i) {
+    return i == NODE_INFO_PAR_LOCATION || i == NODE_INFO_PAR_VELOCITY ||
+           i == NODE_INFO_PAR_ANGULAR_VELOCITY;
+  };
+  for (unsigned int i = 0; i < particle_outputs; ++i) {
+    push_shader(first_particle_info_shader + i, [&] {
+      push_node(NODE_PARTICLE_INFO,
+                SVMNodeParticleInfo{.info_type = NodeParticleInfo(i), .out_offset = 0});
+      push_result(particle_vector(i));
+    });
+  }
+  for (unsigned int i = 0; i < wavelengths.size(); ++i) {
+    push_shader(first_wavelength_shader + i, [&] {
+      push_node(NODE_WAVELENGTH,
+                SVMNodeWavelength{.wavelength = {std::bit_cast<uint>(wavelengths[i])},
+                                  .color_offset = 0});
+      push_result(true);
+    });
+  }
+  const auto vector_transform_node = [&](const unsigned int i) {
+    return SVMNodeVectorTransform{.transform_type = NodeVectorTransformType(i / 9),
+                                  .convert_from = NodeVectorTransformConvertSpace((i / 3) % 3),
+                                  .convert_to = NodeVectorTransformConvertSpace(i % 3),
+                                  .vector_in = f3(vector_transform_input),
+                                  .vector_out_offset = 0};
+  };
+  for (unsigned int i = 0; i < vector_transform_fixtures; ++i) {
+    push_shader(first_vector_transform_shader + i, [&] {
+      push_node(NODE_VECTOR_TRANSFORM, vector_transform_node(i));
+      push_result(true);
+    });
+  }
+  for (unsigned int slot = 0; slot < attribute_records.size(); ++slot) {
+    for (unsigned int i = 0; i < attribute_outputs.size(); ++i) {
+      push_shader(first_found_attribute_shader + 3 * slot + i, [&] {
+        push_node(NODE_ATTR, attribute_node(int(CYCLES_WEBGPU_SVM_ATTRIBUTE_SLOT | slot),
+                                            attribute_outputs[i]));
+        push_result(attribute_outputs[i] == NODE_ATTR_OUTPUT_FLOAT3);
+      });
+    }
+  }
+  for (unsigned int i = 0; i < normal_map_fixtures.size(); ++i) {
+    push_shader(first_normal_map_shader + i, [&] {
+      const NormalMapFixture &fixture = normal_map_fixtures[i];
+      const auto slot = [](const unsigned int index) {
+        return int(CYCLES_WEBGPU_SVM_ATTRIBUTE_SLOT | (tangent_slot + index));
+      };
+      push_node(NODE_NORMAL_MAP,
+                SVMNodeNormalMap{.space = fixture.space,
+                                 .invert_green = fixture.invert_green,
+                                 .use_original_base = slot(2),
+                                 .attr = fixture.missing_tangent ? int(ATTR_STD_NOT_FOUND) : slot(0),
+                                 .attr_sign = slot(1),
+                                 .color = f3(normal_map_color),
+                                 .strength = {std::bit_cast<uint>(fixture.strength)},
+                                 .normal_offset = 0});
+      push_result(true);
+    });
+  }
+  for (unsigned int i = 0; i < wireframe_sizes.size(); ++i) {
+    push_shader(first_wireframe_shader + i, [&] {
+      push_node(NODE_WIREFRAME,
+                SVMNodeWireframe{.in_size = {std::bit_cast<uint>(wireframe_sizes[i])},
+                                 .bump_filter_width = std::bit_cast<float>(
+                                     CYCLES_WEBGPU_SVM_ATTRIBUTE_SLOT | (tangent_slot + 3)),
+                                 .out_fac_offset = 0});
+      push_scalar_result();
+    });
+  }
+  for (unsigned int i = 0; i <= ies_directions.size(); ++i) {
+    push_shader(first_ies_shader + i, [&] {
+      const float3 direction = ies_directions[i % ies_directions.size()];
+      push_node(NODE_VALUE_V, SVMNodeValueV{.value = direction, .out_offset = 3});
+      push_node(NODE_IES, SVMNodeIES{.strength = {std::bit_cast<uint>(1.5f)},
+                                     .slot = i == ies_directions.size() ? 1u : 0u,
+                                     .vector_offset = 3,
+                                     .fac_offset = 0});
+      push_scalar_result();
+    });
+  }
+  for (unsigned int i = 0; i < sky_fixtures; ++i) {
+    push_shader(first_sky_shader + i, [&] {
+      const NodeSkyType type = NodeSkyType(i / 4 == 0 ? NODE_SKY_PREETHAM :
+                                           i / 4 == 1 ? NODE_SKY_HOSEK :
+                                                        NODE_SKY_MULTIPLE_SCATTERING);
+      push_node(NODE_VALUE_V, SVMNodeValueV{.value = sky_direction(i % 4), .out_offset = 3});
+      push_node(NODE_TEX_SKY, SVMNodeTexSky{.sky_type = type, .dir_offset = 3, .out_offset = 0});
+      const auto data = [&](const auto &value) {
+        const auto words = std::bit_cast<std::array<uint, sizeof(value) / sizeof(uint)>>(value);
+        bytecode.insert(bytecode.end(), words.begin(), words.end());
+      };
+      if (type == NODE_SKY_PREETHAM) {
+        data(sky_preetham);
+      }
+      else if (type == NODE_SKY_HOSEK) {
+        data(sky_hosek);
+      }
+      else {
+        data(sky_nishita);
+      }
+      push_result(true);
+    });
+  }
+  push_shader(first_tangent_shader, [&] {
+    push_node(NODE_GEOMETRY, SVMNodeGeometry{.geom_type = NODE_GEOM_T, .out_offset = 0});
+    push_result(true);
+  });
+  const std::array<int, 4> uv_tangents{int(CYCLES_WEBGPU_SVM_ATTRIBUTE_SLOT | 2),
+                                       int(CYCLES_WEBGPU_SVM_ATTRIBUTE_SLOT | 1),
+                                       int(ATTR_STD_NOT_FOUND),
+                                       int(CYCLES_WEBGPU_SVM_ATTRIBUTE_SLOT | 0)};
+  for (unsigned int i = 1; i < tangent_fixtures; ++i) {
+    push_shader(first_tangent_shader + i, [&] {
+      const bool radial = i <= 3;
+      push_node(NODE_TANGENT,
+                SVMNodeTangent{.direction_type = radial ? NODE_TANGENT_RADIAL : NODE_TANGENT_UVMAP,
+                               .axis = radial ? NodeTangentAxis(i - 1) : NODE_TANGENT_AXIS_X,
+                               .attr = radial ? int(ATTR_STD_GENERATED) : uv_tangents[i - 4],
+                               .tangent_offset = 0});
+      push_result(true);
+    });
+  }
+  /* A lone Holdout, one weighted by a mix input, and Holdout followed by a
+   * diffuse closure, which stays on CPU Cycles. */
+  for (unsigned int i = 0; i < 3; ++i) {
+    push_shader(first_holdout_shader + i, [&] {
+      if (i == 1) {
+        push_node(NODE_VALUE_F, SVMNodeValueF{.value = 0.5f, .out_offset = 0});
+      }
+      push_node(NODE_CLOSURE_SET_WEIGHT, SVMNodeClosureSetWeight{.rgb = make_float3(1, 1, 1)});
+      push_node(NODE_CLOSURE_HOLDOUT,
+                SVMNodeClosureHoldout{.mix_weight_offset = i == 1 ? SVMStackOffset(0) :
+                                                                    SVM_STACK_INVALID});
+      if (i == 2) {
+        push_weighted_diffuse(make_float3(0.5f, 0.5f, 0.5f));
+      }
+    });
+  }
+  /* Emission alone, Emission Strength with a mix weight next to a diffuse
+   * closure, a zero mix weight, and Emission next to Holdout, which stays on
+   * CPU Cycles. */
+  const auto emission_weight = [&] {
+    push_node(NODE_EMISSION_WEIGHT,
+              SVMNodeEmissionWeight{.color = f3(make_float3(1.0f, 0.5f, 0.25f)),
+                                    .strength = {std::bit_cast<uint>(3.0f)}});
+  };
+  push_shader(first_emission_shader, [&] {
+    push_node(NODE_CLOSURE_SET_WEIGHT, SVMNodeClosureSetWeight{.rgb = make_float3(0.5f, 0.25f, 2.0f)});
+    push_node(NODE_CLOSURE_EMISSION, SVMNodeClosureEmission{.mix_weight_offset = SVM_STACK_INVALID});
+  });
+  push_shader(first_emission_shader + 1, [&] {
+    push_node(NODE_VALUE_F, SVMNodeValueF{.value = 0.25f, .out_offset = 0});
+    emission_weight();
+    push_node(NODE_CLOSURE_EMISSION, SVMNodeClosureEmission{.mix_weight_offset = 0});
+    push_weighted_diffuse(make_float3(0.8f, 0.6f, 0.4f));
+  });
+  push_shader(first_emission_shader + 2, [&] {
+    push_node(NODE_VALUE_F, SVMNodeValueF{.value = 0.0f, .out_offset = 0});
+    emission_weight();
+    push_node(NODE_CLOSURE_EMISSION, SVMNodeClosureEmission{.mix_weight_offset = 0});
+  });
+  push_shader(first_emission_shader + 4, [] {
+    push_principled({.specular = 0.0f, .metallic = 0.0f, .emission_color = {1.0f, 0.5f, 0.25f},
+                     .emission_strength = 2.0f});
+  });
+  /* Black or zero-strength emission compiles to no closure nodes. */
+  push_shader(first_emission_shader + 5, [] {});
+  push_shader(first_emission_shader + 3, [&] {
+    emission_weight();
+    push_node(NODE_CLOSURE_EMISSION, SVMNodeClosureEmission{.mix_weight_offset = SVM_STACK_INVALID});
+    push_node(NODE_CLOSURE_SET_WEIGHT, SVMNodeClosureSetWeight{.rgb = make_float3(1, 1, 1)});
+    push_node(NODE_CLOSURE_HOLDOUT, SVMNodeClosureHoldout{.mix_weight_offset = SVM_STACK_INVALID});
+  });
   bytecode[0] = bytecode.size() - header_words;
   bytecode[1] = shader_count;
   const std::array triangle_uv{0.0f, 0.0f, 2.0f, 0.0f, 0.0f, 2.0f,
@@ -1195,7 +1579,19 @@ int main()
   };
   constexpr unsigned int image_slots = 23;
   constexpr unsigned int image_words = 5;
-  bytecode.insert(bytecode.end(), {2, image_slots, 1, 0, 0, 0});
+  const size_t texture_header = bytecode.size();
+  bytecode.insert(bytecode.end(), {2, image_slots, 1,
+                                   unsigned(attribute_records.size() + surface_records.size()), 2,
+                                   0, 0, 0, 0});
+  for (const float3 row : xyz_to_rgb_rows) {
+    bytecode.insert(bytecode.end(), {std::bit_cast<uint>(row.x),
+                                     std::bit_cast<uint>(row.y),
+                                     std::bit_cast<uint>(row.z)});
+  }
+  for (unsigned int i = 0; i < (WAVELENGTH_RESOLUTION + 1) * 3; ++i) {
+    bytecode.push_back(std::bit_cast<uint>(cie_color_match[i / 3][i % 3]));
+  }
+  bytecode.push_back(std::bit_cast<uint>(indirect_clamp));
   for (float uv : triangle_uv) {
     bytecode.push_back(std::bit_cast<unsigned>(uv));
   }
@@ -1203,6 +1599,18 @@ int main()
     bytecode.insert(bytecode.end(), {std::bit_cast<uint>(value.x),
                                      std::bit_cast<uint>(value.y),
                                      std::bit_cast<uint>(value.z)});
+  }
+  std::vector<std::array<AttributeRecord, 2>> packed_records(attribute_records.begin(),
+                                                             attribute_records.end());
+  packed_records.insert(packed_records.end(), surface_records.begin(), surface_records.end());
+  for (const auto &slot : packed_records) {
+    for (const AttributeRecord &record : slot) {
+      bytecode.push_back(record.mode | (unsigned(record.type) << 8) | (record.flags << 16));
+      for (const float4 corner : record.corners) {
+        bytecode.insert(bytecode.end(), {std::bit_cast<uint>(corner.x), std::bit_cast<uint>(corner.y),
+                                         std::bit_cast<uint>(corner.z), std::bit_cast<uint>(corner.w)});
+      }
+    }
   }
   const size_t image_table = bytecode.size();
   bytecode.resize(image_table + image_words * image_slots);
@@ -1237,6 +1645,11 @@ int main()
   for (const uchar4 rgba : byte_pixels) {
     bytecode.push_back(std::bit_cast<unsigned int>(color_uchar4_to_float4(rgba).w));
   }
+  const std::vector<float> ies = ies_table();
+  bytecode[texture_header + 5] = unsigned(bytecode.size() - texture_header);
+  for (const float value : ies) {
+    bytecode.push_back(std::bit_cast<unsigned int>(value));
+  }
 
   constexpr std::array expected{
       std::array{0.8f, 0.4f, 0.0f, 1.0f},
@@ -1269,6 +1682,11 @@ int main()
                      0.125f, 0.125f, 0.375f, 0.125f, 0.0f, 0.0f, 0.0f, 1.0f, 0.125f};
   std::vector<unsigned int> surface_words, geometric_words, hit_words, ray_slots, path_words;
   std::vector<float> reference;
+  /* Relative GPU tolerance per lane. Transcendental-heavy models widen it. */
+  std::vector<float> gpu_tolerances;
+  float gpu_tolerance = 3e-6f;
+  /* Emission expected on evaluated lanes, which also carry the indirect clamp. */
+  float3 expected_emission = zero_float3();
   FixtureSurface fixture{};
   using MaterialVector = std::array<float, 4>;
   const auto check = [&](unsigned int surface, unsigned int shader, unsigned int primitive,
@@ -1304,25 +1722,37 @@ int main()
     std::array<Float4, CYCLES_WEBGPU_MATERIAL_VECTORS> result{};
     if (surface == 1 || surface == 2) {
       cycles_svm_material(
-          shader, primitive, u, v, lane, result[0], result[1], result[2], result[3], result[4]);
+          shader, primitive, u, v, lane, result[0], result[1], result[2], result[3], result[4],
+          result[5]);
     }
     else if (surface != 0) {
       result[0].w = 2;
     }
-    const std::array expected_material{expected, specular, layers, transmission, MaterialVector{}};
+    const bool evaluated = (surface == 1 || surface == 2) && expected[3] != 2.0f;
+    const MaterialVector emission = evaluated ? MaterialVector{expected_emission.x,
+                                                               expected_emission.y,
+                                                               expected_emission.z,
+                                                               indirect_clamp} :
+                                                MaterialVector{};
+    const std::array expected_material{expected, specular, layers, transmission, MaterialVector{},
+                                       emission};
     for (int entry = 0; entry < CYCLES_WEBGPU_MATERIAL_VECTORS; ++entry) {
       for (int channel = 0; channel < 4; ++channel) {
         const float value = expected_material[entry][channel];
         if (!(std::abs(result[entry][channel] - value) <= tolerance)) {
           std::cerr << "Unexpected material sample " << surface_words.size() / 8 - 1
+                    << " (shader " << (shader & SHADER_MASK) << ")"
                     << " vector " << entry << " channel " << channel
-                    << ": " << result[entry][channel] << " expected " << value << '\n';
+                    << ": " << result[entry][channel] << " expected " << value
+                    << " (result " << result[entry][0] << ' ' << result[entry][1] << ' '
+                    << result[entry][2] << ' ' << result[entry][3] << ")\n";
           return false;
         }
       }
       reference.insert(reference.end(), expected_material[entry].begin(),
                        expected_material[entry].end());
     }
+    gpu_tolerances.push_back(gpu_tolerance);
     return true;
   };
   for (unsigned int i = 0; i < surfaces.size(); ++i) {
@@ -1622,7 +2052,382 @@ int main()
       return 1;
     }
   }
+  /* Stock SVM nodes on a static triangle of a fixture object. */
+  std::array<KernelObject, 1> stock_objects{};
+  stock_objects[0].tfm = fixture_object;
+  stock_objects[0].itfm = fixture_object_inverse;
+  globals.objects = stock_objects.data();
+  globals.data.cam.cameratoworld = camera_to_world;
+  globals.data.film.xyz_to_r = make_float4(xyz_to_rgb_rows[0]);
+  globals.data.film.xyz_to_g = make_float4(xyz_to_rgb_rows[1]);
+  globals.data.film.xyz_to_b = make_float4(xyz_to_rgb_rows[2]);
+  ShaderData stock_sd = sd;
+  stock_sd.object = 0;
+  stock_sd.prim = 0;
+  stock_sd.type = PRIMITIVE_TRIANGLE;
+  stock_sd.object_flag = 0;
+  /* The fixtures weight a diffuse closure, which closure_sample_weight()
+   * clamps to non-negative values and drops below CLOSURE_WEIGHT_CUTOFF. */
+  const auto closure_color = [](float3 color) {
+    color = max(color, zero_float3());
+    return fabsf(average(color)) >= CLOSURE_WEIGHT_CUTOFF ? color : zero_float3();
+  };
+  const auto check_stock = [&](const unsigned int shader, const bool vector) {
+    if (vector) {
+      return check_view_vector(shader, closure_color(stack_load_float3(view_stack, 0)));
+    }
+    return check_view_scalar(shader);
+  };
+  /* Missing attributes follow svm_node_attr_surface_eval(): the Missing input
+   * for vectors, its average for Fac, and Missing Alpha for Alpha. */
+  const float3 missing = make_float3(0.25f, 0.5f, 0.875f);
+  if (!check_view_vector(first_attribute_shader, missing)) {
+    return 1;
+  }
+  view_stack[0] = average(missing);
+  if (!check_stock(first_attribute_shader + 1, false)) {
+    return 1;
+  }
+  view_stack[0] = 0.375f;
+  if (!check_stock(first_attribute_shader + 2, false)) {
+    return 1;
+  }
+  /* Curve and point info outputs on a triangle are zero. */
+  view_stack[0] = 0.0f;
+  if (!check_stock(first_hair_info_shader, false) || !check_stock(first_hair_info_shader + 1, false) ||
+      !check_view_vector(first_hair_info_shader + 2, zero_float3()) ||
+      !check_view_vector(first_point_info_shader, zero_float3()) ||
+      !check_stock(first_point_info_shader + 1, false))
+  {
+    return 1;
+  }
+  /* svm_node_particle_info() reading Cycles' zeroed dummy particle. */
+  for (unsigned int i = 0; i < particle_outputs; ++i) {
+    view_stack[0] = i == NODE_INFO_PAR_RANDOM ? hash_uint2_to_float(0, 0) : 0.0f;
+    const bool passed = particle_vector(i) ?
+                            check_view_vector(first_particle_info_shader + i, zero_float3()) :
+                            check_stock(first_particle_info_shader + i, false);
+    if (!passed) {
+      return 1;
+    }
+  }
+  for (unsigned int i = 0; i < wavelengths.size(); ++i) {
+    svm_node_wavelength(&globals, view_stack,
+                        SVMNodeWavelength{.wavelength = {std::bit_cast<uint>(wavelengths[i])},
+                                          .color_offset = 0});
+    if (!check_stock(first_wavelength_shader + i, true)) {
+      return 1;
+    }
+  }
+  for (unsigned int i = 0; i < vector_transform_fixtures; ++i) {
+    svm_node_vector_transform(&globals, &stock_sd, view_stack, vector_transform_node(i));
+    if (!check_stock(first_vector_transform_shader + i, true)) {
+      return 1;
+    }
+  }
+  /* svm_node_attr_surface_eval() and svm_node_attr_store() for the packed
+   * slots, interpolated like triangle_interpolate(). */
+  const float attribute_u = 0.25f;
+  const float attribute_v = 0.375f;
+  for (unsigned int slot = 0; slot < attribute_records.size(); ++slot) {
+    for (unsigned int primitive = 0; primitive < 2; ++primitive) {
+      const AttributeRecord &record = attribute_records[slot][primitive];
+      const auto &c = record.corners;
+      const float4 f = record.mode == 1 ? (1.0f - attribute_u - attribute_v) * c[0] +
+                                              attribute_u * c[1] + attribute_v * c[2] :
+                                          c[0];
+      for (unsigned int i = 0; i < attribute_outputs.size(); ++i) {
+        const NodeAttributeOutputType type = attribute_outputs[i];
+        float3 value;
+        if (record.mode == 0) {
+          value = type == NODE_ATTR_OUTPUT_FLOAT_ALPHA ? make_float3(0.375f) : missing;
+        }
+        else if (record.type == NODE_ATTR_FLOAT) {
+          value = type == NODE_ATTR_OUTPUT_FLOAT_ALPHA ? make_float3(1.0f) : make_float3(f.x, f.x, f.x);
+        }
+        else if (record.type == NODE_ATTR_FLOAT2) {
+          value = type == NODE_ATTR_OUTPUT_FLOAT       ? make_float3(f.x) :
+                  type == NODE_ATTR_OUTPUT_FLOAT_ALPHA ? make_float3(1.0f) :
+                                                         make_float3(make_float2(f.x, f.y));
+        }
+        else if (record.type == NODE_ATTR_FLOAT3) {
+          value = type == NODE_ATTR_OUTPUT_FLOAT       ? make_float3(average(make_float3(f))) :
+                  type == NODE_ATTR_OUTPUT_FLOAT_ALPHA ? make_float3(1.0f) :
+                                                         make_float3(f);
+        }
+        else {
+          value = type == NODE_ATTR_OUTPUT_FLOAT       ? make_float3(average(make_float3(f))) :
+                  type == NODE_ATTR_OUTPUT_FLOAT_ALPHA ? make_float3(f.w) :
+                                                         make_float3(f);
+        }
+        const unsigned int shader = first_found_attribute_shader + 3 * slot + i;
+        const float3 expected = type == NODE_ATTR_OUTPUT_FLOAT3 ? closure_color(value) :
+                                                                  make_float3(average(value));
+        if (!check(1, shader, primitive, attribute_u, attribute_v,
+                   {expected.x, expected.y, expected.z, 1}, 1e-6f))
+        {
+          return 1;
+        }
+      }
+    }
+  }
+  /* svm_node_normal_map() */
+  {
+    const float u = 0.25f;
+    const float v = 0.375f;
+    const float3 Ng = make_float3(0.25f, 0, 0.75f);
+    const auto record_value = [&](const AttributeRecord &record) {
+      const auto &c = record.corners;
+      return record.mode == 1 ? (1.0f - u - v) * c[0] + u * c[1] + v * c[2] : c[0];
+    };
+    for (unsigned int i = 0; i < normal_map_fixtures.size(); ++i) {
+      const NormalMapFixture &fixture = normal_map_fixtures[i];
+      const bool is_backfacing = fixture.surface == 2;
+      float3 color = 2.0f * make_float3(normal_map_color.x - 0.5f, normal_map_color.y - 0.5f,
+                                        normal_map_color.z - 0.5f);
+      if (fixture.invert_green) {
+        color.y = -color.y;
+      }
+      float strength = fixture.strength;
+      bool linear = false;
+      float3 N;
+      if (fixture.space == NODE_NORMAL_MAP_TANGENT) {
+        if (fixture.missing_tangent) {
+          N = sd.N;
+        }
+        else {
+          const float3 tangent = make_float3(record_value(surface_records[0][fixture.primitive]));
+          const float sign = record_value(surface_records[1][fixture.primitive]).x;
+          float3 normal;
+          if (fixture.smooth) {
+            normal = safe_normalize(make_float3(record_value(surface_records[2][fixture.primitive])));
+          }
+          else {
+            normal = is_backfacing ? -Ng : Ng;
+            normal = safe_normalize(transform_direction_transposed(&fixture_object, normal));
+          }
+          color.x *= strength;
+          color.y *= strength;
+          color.z = mix(1.0f, color.z, saturatef(strength));
+          const float3 B = sign * cross(normal, tangent);
+          N = safe_normalize(to_global(color, tangent, B, normal));
+          N = normalize(transform_direction_transposed(&fixture_object_inverse, N));
+          if (is_backfacing) {
+            N = -N;
+          }
+        }
+      }
+      else {
+        linear = true;
+        if (fixture.space == NODE_NORMAL_MAP_BLENDER_OBJECT ||
+            fixture.space == NODE_NORMAL_MAP_BLENDER_WORLD)
+        {
+          color.y = -color.y;
+          color.z = -color.z;
+        }
+        N = color;
+        if (fixture.space == NODE_NORMAL_MAP_OBJECT ||
+            fixture.space == NODE_NORMAL_MAP_BLENDER_OBJECT)
+        {
+          N = normalize(transform_direction_transposed(&fixture_object_inverse, N));
+        }
+        else {
+          N = safe_normalize(N);
+        }
+        if (is_backfacing) {
+          N = -N;
+        }
+      }
+      if (!(fixture.space == NODE_NORMAL_MAP_TANGENT && fixture.missing_tangent)) {
+        if (linear && strength != 1.0f) {
+          strength = max(strength, 0.0f);
+          N = safe_normalize(sd.N + (N - sd.N) * strength);
+        }
+        if (is_zero(N) || !isfinite_safe(N)) {
+          N = sd.N;
+        }
+      }
+      const float3 expected = closure_color(N);
+      const unsigned int shader = (first_normal_map_shader + i) |
+                                  (fixture.smooth ? SHADER_SMOOTH_NORMAL : 0);
+      if (!check(fixture.surface, shader, fixture.primitive, u, v,
+                 {expected.x, expected.y, expected.z, 1}, 1e-6f))
+      {
+        return 1;
+      }
+    }
+    /* svm_node_ies() with the stock interpolation. */
+    globals.ies = ies.data();
+    for (unsigned int i = 0; i <= ies_directions.size(); ++i) {
+      const float3 direction = ies_directions[i % ies_directions.size()];
+      float stack[SVM_STACK_SIZE];
+      stack_store_float3(stack, 3, direction);
+      svm_node_ies(&globals, nullptr, stack,
+                   SVMNodeIES{.strength = {std::bit_cast<uint>(1.5f)},
+                              .slot = i == ies_directions.size() ? 1u : 0u,
+                              .vector_offset = 3,
+                              .fac_offset = 0});
+      const float fac = stack[0];
+      if (!check(1, first_ies_shader + i, 0, u, v, {fac, fac, fac, 1}, 2e-6f)) {
+        return 1;
+      }
+    }
+    /* Stock Preetham and Hosek radiance, and sky_radiance_nishita() with its
+     * Linear, Extend LUT sampled by ImageInterpolator. */
+    /* Chained expf() and powf() in the sky models differ by a few ulps on GPUs. */
+    gpu_tolerance = 2e-5f;
+    for (unsigned int i = 0; i < sky_fixtures; ++i) {
+      const float3 dir = sky_direction(i % 4);
+      float3 rgb;
+      if (i / 4 < 2) {
+        SVMNodeTexSkyPreethamData data = i / 4 == 0 ? sky_preetham : sky_hosek;
+        rgb = i / 4 == 0 ? sky_radiance_preetham(&globals, dir, data.phi, data.theta,
+                                                 data.radiance_x, data.radiance_y,
+                                                 data.radiance_z, data.config_x, data.config_y,
+                                                 data.config_z) :
+                           sky_radiance_hosek(&globals, dir, data.phi, data.theta, data.radiance_x,
+                                              data.radiance_y, data.radiance_z, data.config_x,
+                                              data.config_y, data.config_z);
+      }
+      else {
+        const SVMNodeTexSkyNishitaData &data = sky_nishita;
+        float3 xyz = zero_float3();
+        const float2 direction = direction_to_spherical(dir);
+        const float3 sun_dir = spherical_to_direction(data.sun_elevation - M_PI_2_F,
+                                                      data.sun_rotation - M_PI_2_F);
+        const float sun_dir_angle = precise_angle(dir, sun_dir);
+        const float half_angular = data.angular_diameter * 0.5f;
+        const float dir_elevation = M_PI_2_F - direction.x;
+        if (sun_dir_angle < half_angular && dir_elevation > data.earth_intersection_angle) {
+          const float y = ((dir_elevation - data.sun_elevation) / data.angular_diameter) + 0.5f;
+          const float limb = 1.0f - 0.6f * (1.0f - sqrtf(1.0f - sqr(sun_dir_angle / half_angular)));
+          xyz = mix(make_float3(0.9f, 0.8f, 0.7f), make_float3(1.1f, 1.0f, 0.9f), y) *
+                data.sun_intensity * limb;
+        }
+        const float x = fractf((-direction.y - M_PI_2_F + data.sun_rotation) * M_1_2PI_F);
+        const float y = copysignf(sqrtf(fabsf(dir_elevation) * M_2_PI_F), dir_elevation) * 0.5f +
+                        0.5f;
+        KernelImageInfo info{};
+        info.data = uintptr_t(float_pixels.data());
+        info.width = info.height = 2;
+        info.interpolation = INTERPOLATION_LINEAR;
+        info.extension = EXTENSION_EXTEND;
+        xyz += make_float3(ImageInterpolator<float4>::interp(info, 2.0f * x, 2.0f * y));
+        rgb = xyz_to_rgb_clamped(&globals, xyz);
+      }
+      const float3 expected = closure_color(rgb);
+      const float tolerance = 2e-6f * std::max(1.0f, reduce_max(expected));
+      if (!check(1, first_sky_shader + i, 0, u, v, {expected.x, expected.y, expected.z, 1},
+                 tolerance))
+      {
+        return 1;
+      }
+    }
+    gpu_tolerance = 3e-6f;
+    /* svm_node_wireframe() without pixel size. */
+    for (unsigned int primitive = 0; primitive < 2; ++primitive) {
+      const AttributeRecord &record = surface_records[3][primitive];
+      float3 Co[3];
+      for (int i = 0; i < 3; i++) {
+        Co[i] = make_float3(record.corners[i]);
+        if (record.flags) {
+          Co[i] = transform_point(&fixture_object, Co[i]);
+        }
+      }
+      for (unsigned int size = 0; size < wireframe_sizes.size(); ++size) {
+        float pixelwidth = 0.5f * wireframe_sizes[size];
+        pixelwidth *= pixelwidth;
+        float f = 0.0f;
+        for (int i = 0; i < 3; i++) {
+          const int i2 = i ? i - 1 : 2;
+          const float3 crs = cross(Co[i] - Co[i2], sd.P - Co[i]);
+          if (dot(crs, crs) < dot(Co[i] - Co[i2], Co[i] - Co[i2]) * pixelwidth) {
+            f = 1.0f;
+            break;
+          }
+        }
+        if (!check(1, first_wireframe_shader + size, primitive, u, v, {f, f, f, 1}, 0.0f)) {
+          return 1;
+        }
+      }
+    }
+  }
+  /* object_normal_transform() and the projection in primitive_tangent() and
+   * svm_node_tangent(). */
+  const auto surface_tangent = [&](float3 tangent) {
+    tangent = normalize(transform_direction_transposed(&fixture_object_inverse, tangent));
+    return cross(sd.N, normalize(cross(tangent, sd.N)));
+  };
+  {
+    const float u = 0.25f;
+    const float v = 0.375f;
+    const float3 g = (1.0f - u - v) * generated[0] + u * generated[1] + v * generated[2];
+    const std::array radial{make_float3(-(g.y - 0.5f), (g.x - 0.5f), 0.0f),
+                            make_float3(0.0f, -(g.z - 0.5f), (g.y - 0.5f)),
+                            make_float3(-(g.z - 0.5f), 0.0f, (g.x - 0.5f)),
+                            make_float3(-(g.y - 0.5f), (g.x - 0.5f), 0.0f)};
+    for (unsigned int i = 0; i < radial.size(); ++i) {
+      const float3 expected = closure_color(surface_tangent(radial[i]));
+      if (!check(1, first_tangent_shader + i, 0, u, v, {expected.x, expected.y, expected.z, 1}, 1e-6f)) {
+        return 1;
+      }
+    }
+    const auto interpolated = [&](const AttributeRecord &record) {
+      const auto &c = record.corners;
+      return record.mode == 1 ? (1.0f - u - v) * c[0] + u * c[1] + v * c[2] : c[0];
+    };
+    const float4 slot2 = interpolated(attribute_records[2][0]);
+    const float4 slot1 = interpolated(attribute_records[1][1]);
+    const std::array<std::pair<unsigned int, float3>, 4> uv{{
+        {0, closure_color(surface_tangent(make_float3(slot2)))},
+        {1, closure_color(surface_tangent(make_float3(slot1.x, slot1.y, 0.0f)))},
+        {0, zero_float3()},
+        {1, zero_float3()},
+    }};
+    for (unsigned int i = 0; i < uv.size(); ++i) {
+      const float3 expected = uv[i].second;
+      if (!check(1, first_tangent_shader + 4 + i, uv[i].first, u, v,
+                 {expected.x, expected.y, expected.z, 1}, 1e-6f))
+      {
+        return 1;
+      }
+    }
+  }
+  for (unsigned int i = 0; i < 3; ++i) {
+    const float holdout = i == 1 ? 0.5f : 1.0f;
+    const MaterialVector expected = i == 2 ? MaterialVector{0, 0, 0, 2} :
+                                             MaterialVector{holdout, holdout, holdout,
+                                                            CYCLES_WEBGPU_MATERIAL_HOLDOUT};
+    if (!check(1, first_holdout_shader + i, 0, 0.25f, 0.25f, expected, 0.0f)) {
+      return 1;
+    }
+  }
+  /* emission_setup() accumulates closure weight times mix weight. */
+  {
+    const std::array<std::pair<float3, MaterialVector>, 6> emissions{{
+        {make_float3(0.5f, 0.25f, 2.0f), {0, 0, 0, 1}},
+        {make_float3(3.0f, 1.5f, 0.75f) * 0.25f, {0.8f, 0.6f, 0.4f, 1}},
+        {zero_float3(), {0, 0, 0, 1}},
+        {zero_float3(), {0, 0, 0, 2}},
+        /* principled_bsdf_emission() on the matte Principled fixture. */
+        {make_float3(2.0f, 1.0f, 0.5f), {0.33f, 0.0f, 1.2f, 1}},
+        {zero_float3(), {0, 0, 0, 1}},
+    }};
+    for (unsigned int i = 0; i < emissions.size(); ++i) {
+      expected_emission = emissions[i].first;
+      if (!check(1, first_emission_shader + i, 0, 0.25f, 0.25f, emissions[i].second, 1e-6f)) {
+        return 1;
+      }
+    }
+    expected_emission = zero_float3();
+  }
   std::array<uint, CYCLES_WEBGPU_CAMERA_WORDS> camera_words{};
+  for (uint i = 0; i < 3; ++i) {
+    const auto row = cycles_svm_context(0, CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD + i);
+    for (uint channel = 0; channel < 4; ++channel) {
+      camera_words[CYCLES_WEBGPU_CAMERA_TO_WORLD_OFFSET + 4 * i + channel] = row[channel];
+    }
+  }
   for (uint i = 0; i < camera_rows.size(); ++i) {
     const auto row = cycles_svm_context(0, CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA + i);
     for (uint channel = 0; channel < 4; ++channel) {
@@ -1665,5 +2470,7 @@ int main()
   print_array(metadata);
   std::cout << ",\"materials\":" << std::setprecision(9);
   print_array(reference);
+  std::cout << ",\"tolerances\":";
+  print_array(gpu_tolerances);
   std::cout << "}\n";
 }

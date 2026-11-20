@@ -2296,7 +2296,7 @@ index 5ae036b7..b9367370 100644
  #endif
    }
 diff --git a/intern/opensubdiv/internal/evaluator/evaluator_impl.cc b/intern/opensubdiv/internal/evaluator/evaluator_impl.cc
-index 4bb99f3c..466ee4e0 100644
+index 4bb99f3c..6b100c5e 100644
 --- a/intern/opensubdiv/internal/evaluator/evaluator_impl.cc
 +++ b/intern/opensubdiv/internal/evaluator/evaluator_impl.cc
 @@ -347,8 +347,7 @@ void EvalOutputAPI::evaluatePatchesFaceVarying(const int face_varying_channel,
@@ -2342,6 +2342,165 @@ index 4bb99f3c..466ee4e0 100644
  }
  
  gpu::StorageBuf *EvalOutputAPI::create_patch_arrays_buf()
+@@ -441,16 +446,44 @@ OpenSubdiv_Evaluator::~OpenSubdiv_Evaluator()
+   delete patch_table;
+ }
+ 
+-OpenSubdiv_Evaluator *openSubdiv_createEvaluatorFromTopologyRefiner(
+-    blender::opensubdiv::TopologyRefinerImpl *topology_refiner,
+-    eOpenSubdivEvaluator evaluator_type,
+-    OpenSubdiv_EvaluatorCache *evaluator_cache_descr)
++// Work around ASAN warnings, due to OpenSubdiv pretending to have an actual StencilTable
++// instance while it's really its base class.
++static void delete_stencil_table(const StencilTable *table)
++{
++  static_assert(std::is_base_of_v<StencilTableReal<float>, StencilTable>);
++  delete reinterpret_cast<const StencilTableReal<float> *>(table);
++}
++
++struct OpenSubdiv_EvaluatorPrecomputed {
++  const blender::opensubdiv::TopologyRefinerImpl *topology_refiner = nullptr;
++  // False when appending the local point stencils failed, creating the evaluator fails then.
++  bool valid = false;
++  const StencilTable *vertex_stencils = nullptr;
++  const StencilTable *varying_stencils = nullptr;
++  std::vector<const StencilTable *> all_face_varying_stencils;
++  const PatchTable *patch_table = nullptr;
++
++  ~OpenSubdiv_EvaluatorPrecomputed()
++  {
++    delete_stencil_table(vertex_stencils);
++    delete_stencil_table(varying_stencils);
++    for (const StencilTable *table : all_face_varying_stencils) {
++      delete_stencil_table(table);
++    }
++    delete patch_table;
++  }
++};
++
++OpenSubdiv_EvaluatorPrecomputed *openSubdiv_precomputeEvaluator(
++    blender::opensubdiv::TopologyRefinerImpl *topology_refiner)
+ {
+   TopologyRefiner *refiner = topology_refiner->topology_refiner;
+   if (refiner == nullptr) {
+     // Happens on bad topology.
+     return nullptr;
+   }
++  OpenSubdiv_EvaluatorPrecomputed *precomputed = new OpenSubdiv_EvaluatorPrecomputed();
++  precomputed->topology_refiner = topology_refiner;
+   // TODO(sergey): Base this on actual topology.
+   const bool has_varying_data = false;
+   const int num_face_varying_channels = refiner->GetNumFVarChannels();
+@@ -474,13 +507,6 @@ OpenSubdiv_Evaluator *openSubdiv_createEvaluatorFromTopologyRefiner(
+     refiner->RefineUniform(options);
+   }
+ 
+-  // Work around ASAN warnings, due to OpenSubdiv pretending to have an actual StencilTable
+-  // instance while it's really its base class.
+-  auto delete_stencil_table = [](const StencilTable *table) {
+-    static_assert(std::is_base_of_v<StencilTableReal<float>, StencilTable>);
+-    delete reinterpret_cast<const StencilTableReal<float> *>(table);
+-  };
+-
+   // Generate stencil table to update the bi-cubic patches control vertices
+   // after they have been re-posed (both for vertex & varying interpolation).
+   //
+@@ -503,7 +529,8 @@ OpenSubdiv_Evaluator *openSubdiv_createEvaluatorFromTopologyRefiner(
+     varying_stencils = StencilTableFactory::Create(*refiner, varying_stencil_options);
+   }
+   // Face warying stencil.
+-  std::vector<const StencilTable *> all_face_varying_stencils;
++  std::vector<const StencilTable *> &all_face_varying_stencils =
++      precomputed->all_face_varying_stencils;
+   all_face_varying_stencils.reserve(num_face_varying_channels);
+   for (int face_varying_channel = 0; face_varying_channel < num_face_varying_channels;
+        ++face_varying_channel)
+@@ -523,6 +550,7 @@ OpenSubdiv_Evaluator *openSubdiv_createEvaluatorFromTopologyRefiner(
+   patch_options.generateFVarTables = has_face_varying_data;
+   patch_options.generateFVarLegacyLinearPatches = false;
+   const PatchTable *patch_table = PatchTableFactory::Create(*refiner, patch_options);
++  precomputed->patch_table = patch_table;
+   // Append local points stencils.
+   // Point stencils.
+   const StencilTable *local_point_stencil_table = patch_table->GetLocalPointStencilTable();
+@@ -531,7 +559,8 @@ OpenSubdiv_Evaluator *openSubdiv_createEvaluatorFromTopologyRefiner(
+         *refiner, vertex_stencils, local_point_stencil_table);
+     delete_stencil_table(vertex_stencils);
+     if (table == nullptr) {
+-      return nullptr;
++      precomputed->varying_stencils = varying_stencils;
++      return precomputed;
+     }
+     vertex_stencils = table;
+   }
+@@ -559,6 +588,26 @@ OpenSubdiv_Evaluator *openSubdiv_createEvaluatorFromTopologyRefiner(
+       all_face_varying_stencils[face_varying_channel] = table;
+     }
+   }
++  precomputed->vertex_stencils = vertex_stencils;
++  precomputed->varying_stencils = varying_stencils;
++  precomputed->valid = true;
++  return precomputed;
++}
++
++OpenSubdiv_Evaluator *openSubdiv_createEvaluatorFromPrecomputed(
++    OpenSubdiv_EvaluatorPrecomputed *precomputed,
++    eOpenSubdivEvaluator evaluator_type,
++    OpenSubdiv_EvaluatorCache *evaluator_cache_descr)
++{
++  if (!precomputed->valid) {
++    delete precomputed;
++    return nullptr;
++  }
++  const StencilTable *vertex_stencils = precomputed->vertex_stencils;
++  const StencilTable *varying_stencils = precomputed->varying_stencils;
++  const std::vector<const StencilTable *> &all_face_varying_stencils =
++      precomputed->all_face_varying_stencils;
++  const PatchTable *patch_table = precomputed->patch_table;
+   // Create OpenSubdiv's CPU side evaluator.
+   blender::opensubdiv::EvalOutputAPI::EvalOutput *eval_output = nullptr;
+ 
+@@ -590,12 +639,35 @@ OpenSubdiv_Evaluator *openSubdiv_createEvaluatorFromTopologyRefiner(
+   evaluator->eval_output = new blender::opensubdiv::EvalOutputAPI(eval_output, patch_map);
+   evaluator->patch_map = patch_map;
+   evaluator->patch_table = patch_table;
++  // The evaluator owns the patch table, the stencil tables are freed with the precomputed data.
+   // TODO(sergey): Look into whether we've got duplicated stencils arrays.
+-  delete_stencil_table(vertex_stencils);
+-  delete_stencil_table(varying_stencils);
+-  for (const StencilTable *table : all_face_varying_stencils) {
+-    delete_stencil_table(table);
+-  }
++  precomputed->patch_table = nullptr;
++  delete precomputed;
+ 
+   return evaluator;
+ }
++
++bool openSubdiv_precomputedEvaluatorMatches(
++    const OpenSubdiv_EvaluatorPrecomputed *precomputed,
++    const blender::opensubdiv::TopologyRefinerImpl *topology_refiner)
++{
++  return precomputed->topology_refiner == topology_refiner;
++}
++
++void openSubdiv_deletePrecomputedEvaluator(OpenSubdiv_EvaluatorPrecomputed *precomputed)
++{
++  delete precomputed;
++}
++
++OpenSubdiv_Evaluator *openSubdiv_createEvaluatorFromTopologyRefiner(
++    blender::opensubdiv::TopologyRefinerImpl *topology_refiner,
++    eOpenSubdivEvaluator evaluator_type,
++    OpenSubdiv_EvaluatorCache *evaluator_cache_descr)
++{
++  OpenSubdiv_EvaluatorPrecomputed *precomputed = openSubdiv_precomputeEvaluator(topology_refiner);
++  if (precomputed == nullptr) {
++    return nullptr;
++  }
++  return openSubdiv_createEvaluatorFromPrecomputed(
++      precomputed, evaluator_type, evaluator_cache_descr);
++}
 diff --git a/intern/opensubdiv/internal/evaluator/gpu_compute_evaluator.cc b/intern/opensubdiv/internal/evaluator/gpu_compute_evaluator.cc
 index 57eb769b..e84bbdcd 100644
 --- a/intern/opensubdiv/internal/evaluator/gpu_compute_evaluator.cc
@@ -2579,7 +2738,7 @@ index 4353a000..850d60de 100644
  
  }  // namespace blender::opensubdiv
 diff --git a/intern/opensubdiv/opensubdiv_evaluator.hh b/intern/opensubdiv/opensubdiv_evaluator.hh
-index 83a460cc..b609d3ad 100644
+index 83a460cc..b3fe08d4 100644
 --- a/intern/opensubdiv/opensubdiv_evaluator.hh
 +++ b/intern/opensubdiv/opensubdiv_evaluator.hh
 @@ -145,9 +145,8 @@ class EvalOutputAPI {
@@ -2594,6 +2753,35 @@ index 83a460cc..b609d3ad 100644
                     int *min_patch_face,
                     int *max_patch_face,
                     int *max_depth,
+@@ -211,4 +210,28 @@ OpenSubdiv_Evaluator *openSubdiv_createEvaluatorFromTopologyRefiner(
+     eOpenSubdivEvaluator evaluator_type,
+     OpenSubdiv_EvaluatorCache *evaluator_cache_descr);
+ 
++/* CPU side data of an evaluator: the refined topology with its stencil and patch tables. */
++struct OpenSubdiv_EvaluatorPrecomputed;
++
++/* Refine the topology and build the stencil and patch tables of an evaluator, which is the
++ * expensive part of #openSubdiv_createEvaluatorFromTopologyRefiner. Only the given refiner is
++ * accessed and no GPU resources are created, so this can run concurrently for different
++ * refiners. Returns null when the topology is invalid. */
++OpenSubdiv_EvaluatorPrecomputed *openSubdiv_precomputeEvaluator(
++    blender::opensubdiv::TopologyRefinerImpl *topology_refiner);
++
++/* Whether the data was computed from the given topology refiner. */
++bool openSubdiv_precomputedEvaluatorMatches(
++    const OpenSubdiv_EvaluatorPrecomputed *precomputed,
++    const blender::opensubdiv::TopologyRefinerImpl *topology_refiner);
++
++/* Create an evaluator from precomputed data, taking its ownership. The result is the same as
++ * #openSubdiv_createEvaluatorFromTopologyRefiner for the refiner the data was computed from. */
++OpenSubdiv_Evaluator *openSubdiv_createEvaluatorFromPrecomputed(
++    OpenSubdiv_EvaluatorPrecomputed *precomputed,
++    eOpenSubdivEvaluator evaluator_type,
++    OpenSubdiv_EvaluatorCache *evaluator_cache_descr);
++
++void openSubdiv_deletePrecomputedEvaluator(OpenSubdiv_EvaluatorPrecomputed *precomputed);
++
+ #endif  // OPENSUBDIV_EVALUATOR_IMPL_H_
 diff --git a/intern/opensubdiv/opensubdiv_topology_refiner.hh b/intern/opensubdiv/opensubdiv_topology_refiner.hh
 index 85b04e74..c9f7610e 100644
 --- a/intern/opensubdiv/opensubdiv_topology_refiner.hh
@@ -2765,10 +2953,31 @@ index 336754b2..9d133d6a 100644
  
      keyconfig_init_from_data(kc, keyconfig_data)
 diff --git a/source/blender/blenkernel/BKE_subdiv.hh b/source/blender/blenkernel/BKE_subdiv.hh
-index 465265bc..767a9f6a 100644
+index 465265bc..6237bd33 100644
 --- a/source/blender/blenkernel/BKE_subdiv.hh
 +++ b/source/blender/blenkernel/BKE_subdiv.hh
-@@ -281,10 +281,18 @@ Subdiv *new_from_mesh(const Settings *settings, const Mesh *mesh);
+@@ -17,6 +17,7 @@
+ 
+ struct OpenSubdiv_Converter;
+ struct OpenSubdiv_Evaluator;
++struct OpenSubdiv_EvaluatorPrecomputed;
+ 
+ namespace blender {
+ 
+@@ -213,6 +214,12 @@ struct Subdiv {
+      */
+     Array<int> face_ptex_offset;
+   } cache_;
++
++  /**
++   * CPU side data of the #evaluator computed ahead of its creation by #eval_prepare, which can
++   * happen on another thread. It is consumed when #eval_begin creates the evaluator.
++   */
++  OpenSubdiv_EvaluatorPrecomputed *evaluator_precomputed = nullptr;
+ };
+ 
+ /* -------------------------------------------------------------------- */
+@@ -281,10 +288,18 @@ Subdiv *new_from_mesh(const Settings *settings, const Mesh *mesh);
   * \note It is allowed to pass NULL as an existing subdivision surface
   * descriptor. This will create a new descriptor without any extra checks.
   */
@@ -2789,6 +2998,25 @@ index 465265bc..767a9f6a 100644
  
  void free(Subdiv *subdiv);
  
+diff --git a/source/blender/blenkernel/BKE_subdiv_eval.hh b/source/blender/blenkernel/BKE_subdiv_eval.hh
+index b36cc95e..506b924d 100644
+--- a/source/blender/blenkernel/BKE_subdiv_eval.hh
++++ b/source/blender/blenkernel/BKE_subdiv_eval.hh
+@@ -31,6 +31,14 @@ enum eSubdivEvaluatorType {
+   SUBDIV_EVALUATOR_TYPE_GPU,
+ };
+ 
++/**
++ * Compute the expensive CPU side part of the evaluator creation (topology refinement, stencil and
++ * patch tables) ahead of #eval_begin, which then only creates the evaluator output from it. Does
++ * nothing if the evaluator already exists. Only the given subdivision is accessed and no GPU
++ * resources are created, so it can be called concurrently for different subdivisions.
++ */
++void eval_prepare(Subdiv *subdiv);
++
+ /** Returns true if evaluator is ready for use. */
+ bool eval_begin(Subdiv *subdiv,
+                 eSubdivEvaluatorType evaluator_type,
 diff --git a/source/blender/blenkernel/BKE_subdiv_modifier.hh b/source/blender/blenkernel/BKE_subdiv_modifier.hh
 index 83be7601..f3eae208 100644
 --- a/source/blender/blenkernel/BKE_subdiv_modifier.hh
@@ -2805,7 +3033,7 @@ index 83be7601..f3eae208 100644
    /**
     * Recent usage markers for UI diagnostics. To avoid UI flicker due to races
 diff --git a/source/blender/blenkernel/intern/subdiv.cc b/source/blender/blenkernel/intern/subdiv.cc
-index 2eb70cdb..caf540fb 100644
+index 2eb70cdb..f7a7ee36 100644
 --- a/source/blender/blenkernel/intern/subdiv.cc
 +++ b/source/blender/blenkernel/intern/subdiv.cc
 @@ -6,6 +6,8 @@
@@ -2912,6 +3140,75 @@ index 2eb70cdb..caf540fb 100644
    converter_free(&converter);
    return subdiv;
  }
+@@ -201,6 +232,9 @@ void free(Subdiv *subdiv)
+     }
+     delete subdiv->evaluator;
+   }
++  if (subdiv->evaluator_precomputed != nullptr) {
++    openSubdiv_deletePrecomputedEvaluator(subdiv->evaluator_precomputed);
++  }
+   delete subdiv->topology_refiner;
+   displacement_detach(subdiv);
+   MEM_delete(subdiv);
+diff --git a/source/blender/blenkernel/intern/subdiv_eval.cc b/source/blender/blenkernel/intern/subdiv_eval.cc
+index c8d5dc75..b1a780ee 100644
+--- a/source/blender/blenkernel/intern/subdiv_eval.cc
++++ b/source/blender/blenkernel/intern/subdiv_eval.cc
+@@ -6,6 +6,8 @@
+  * \ingroup bke
+  */
+ 
++#include <utility>
++
+ #include "BKE_attribute.hh"
+ #include "BKE_subdiv_eval.hh"
+ 
+@@ -55,6 +57,20 @@ static eOpenSubdivEvaluator opensubdiv_evaluator_from_subdiv_evaluator_type(
+  * Main subdivision evaluation.
+  */
+ 
++void eval_prepare(Subdiv *subdiv)
++{
++#ifdef WITH_OPENSUBDIV
++  if (subdiv->topology_refiner == nullptr || subdiv->evaluator != nullptr ||
++      subdiv->evaluator_precomputed != nullptr)
++  {
++    return;
++  }
++  subdiv->evaluator_precomputed = openSubdiv_precomputeEvaluator(subdiv->topology_refiner);
++#else
++  UNUSED_VARS(subdiv);
++#endif
++}
++
+ bool eval_begin(Subdiv *subdiv,
+                 eSubdivEvaluatorType evaluator_type,
+                 OpenSubdiv_EvaluatorCache *evaluator_cache,
+@@ -71,8 +87,22 @@ bool eval_begin(Subdiv *subdiv,
+     eOpenSubdivEvaluator opensubdiv_evaluator_type =
+         opensubdiv_evaluator_from_subdiv_evaluator_type(evaluator_type);
+     stats_begin(&subdiv->stats, SUBDIV_STATS_EVALUATOR_CREATE);
+-    subdiv->evaluator = openSubdiv_createEvaluatorFromTopologyRefiner(
+-        subdiv->topology_refiner, opensubdiv_evaluator_type, evaluator_cache);
++    OpenSubdiv_EvaluatorPrecomputed *precomputed = std::exchange(subdiv->evaluator_precomputed,
++                                                                 nullptr);
++    if (precomputed &&
++        !openSubdiv_precomputedEvaluatorMatches(precomputed, subdiv->topology_refiner))
++    {
++      openSubdiv_deletePrecomputedEvaluator(precomputed);
++      precomputed = nullptr;
++    }
++    if (precomputed) {
++      subdiv->evaluator = openSubdiv_createEvaluatorFromPrecomputed(
++          precomputed, opensubdiv_evaluator_type, evaluator_cache);
++    }
++    else {
++      subdiv->evaluator = openSubdiv_createEvaluatorFromTopologyRefiner(
++          subdiv->topology_refiner, opensubdiv_evaluator_type, evaluator_cache);
++    }
+     stats_end(&subdiv->stats, SUBDIV_STATS_EVALUATOR_CREATE);
+     if (subdiv->evaluator == nullptr) {
+       return false;
 diff --git a/source/blender/blenkernel/intern/subdiv_modifier.cc b/source/blender/blenkernel/intern/subdiv_modifier.cc
 index cb01add6..4a204bca 100644
 --- a/source/blender/blenkernel/intern/subdiv_modifier.cc
@@ -7447,7 +7744,7 @@ index c3129328..58ebde1e 100644
 +}
 +#endif
 diff --git a/source/blender/draw/engines/workbench/shaders/workbench_cavity.bsl.hh b/source/blender/draw/engines/workbench/shaders/workbench_cavity.bsl.hh
-index 13e2e5bc..a9501c52 100644
+index 13e2e5bc..4bc3ae48 100644
 --- a/source/blender/draw/engines/workbench/shaders/workbench_cavity.bsl.hh
 +++ b/source/blender/draw/engines/workbench/shaders/workbench_cavity.bsl.hh
 @@ -21,15 +21,15 @@ struct Cavity {
@@ -7469,26 +7766,32 @@ index 13e2e5bc..a9501c52 100644
  
    /* Early out if background and in front. */
    if (depth == 1.0f || depth == 0.0f) {
-@@ -39,7 +39,7 @@ void cavity_compute([[resource_table]] const workbench::Cavity &cavity,
+@@ -39,10 +39,12 @@ void cavity_compute([[resource_table]] const workbench::Cavity &cavity,
    const WorldData &world_data = world.world_data;
  
    float3 position = view.point_screen_to_view(float3(screenco, depth));
 -  float3 normal = workbench::normal_decode(texture(normal_tx, screenco));
-+  float3 normal = workbench::normal_decode(texture(normal_buffer, screenco));
++  /* The normal, jitter and depth textures have one level. Explicit levels keep
++   * the samples after the background early out valid in WGSL. */
++  float3 normal = workbench::normal_decode(textureLod(normal_buffer, screenco, 0.0f));
  
    float2 jitter_co = (screenco * world_data.viewport_size.xy) * world_data.cavity_jitter_scale;
-   float3 noise = texture(cavity.jitter_tx, jitter_co).rgb;
-@@ -73,7 +73,7 @@ void cavity_compute([[resource_table]] const workbench::Cavity &cavity,
+-  float3 noise = texture(cavity.jitter_tx, jitter_co).rgb;
++  float3 noise = textureLod(cavity.jitter_tx, jitter_co, 0.0f).rgb;
+ 
+   /* find the offset in screen space by multiplying a point
+    * in camera space at the depth of the point by the projection matrix. */
+@@ -73,7 +75,7 @@ void cavity_compute([[resource_table]] const workbench::Cavity &cavity,
        continue;
      }
      /* Sample depth. */
 -    float s_depth = texture(depth_tx, uvcoords).r;
-+    float s_depth = texture(depth_buffer, uvcoords).r;
++    float s_depth = textureLod(depth_buffer, uvcoords, 0.0f).r;
      /* Handle Background case */
      bool is_background = (s_depth == 1.0f);
      /* This trick provide good edge effect even if no neighbor is found. */
 diff --git a/source/blender/draw/engines/workbench/shaders/workbench_curvature.bsl.hh b/source/blender/draw/engines/workbench/shaders/workbench_curvature.bsl.hh
-index 1bcf65c8..4ed0ad9f 100644
+index 1bcf65c8..e11668be 100644
 --- a/source/blender/draw/engines/workbench/shaders/workbench_curvature.bsl.hh
 +++ b/source/blender/draw/engines/workbench/shaders/workbench_curvature.bsl.hh
 @@ -17,8 +17,8 @@ float curvature_soft_clamp(float curvature, float control)
@@ -7517,7 +7820,7 @@ index 1bcf65c8..4ed0ad9f 100644
  
    /* Remove object outlines. */
    if ((object_up != object_down) || (object_right != object_left)) {
-@@ -41,10 +41,10 @@ void curvature_compute([[resource_table]] const workbench::World &world,
+@@ -41,10 +41,12 @@ void curvature_compute([[resource_table]] const workbench::World &world,
      return;
    }
  
@@ -7525,10 +7828,12 @@ index 1bcf65c8..4ed0ad9f 100644
 -  float normal_down = workbench::normal_decode(texture(normal_tx, uv - offset.zy)).g;
 -  float normal_right = workbench::normal_decode(texture(normal_tx, uv + offset.xz)).r;
 -  float normal_left = workbench::normal_decode(texture(normal_tx, uv - offset.xz)).r;
-+  float normal_up = workbench::normal_decode(texture(normal_buffer, uv + offset.zy)).g;
-+  float normal_down = workbench::normal_decode(texture(normal_buffer, uv - offset.zy)).g;
-+  float normal_right = workbench::normal_decode(texture(normal_buffer, uv + offset.xz)).r;
-+  float normal_left = workbench::normal_decode(texture(normal_buffer, uv - offset.xz)).r;
++  /* The normal buffer has one level. An explicit level keeps these samples
++   * valid after the data-dependent early returns above (WGSL uniformity). */
++  float normal_up = workbench::normal_decode(textureLod(normal_buffer, uv + offset.zy, 0.0f)).g;
++  float normal_down = workbench::normal_decode(textureLod(normal_buffer, uv - offset.zy, 0.0f)).g;
++  float normal_right = workbench::normal_decode(textureLod(normal_buffer, uv + offset.xz, 0.0f)).r;
++  float normal_left = workbench::normal_decode(textureLod(normal_buffer, uv - offset.xz, 0.0f)).r;
  
    float normal_diff = (normal_up - normal_down) + (normal_right - normal_left);
  
@@ -7618,6 +7923,70 @@ index 719c0bf1..b7778c3e 100644
      return;
    }
  
+diff --git a/source/blender/draw/engines/workbench/shaders/workbench_volume.bsl.hh b/source/blender/draw/engines/workbench/shaders/workbench_volume.bsl.hh
+index 492f5894..0a1d7b22 100644
+--- a/source/blender/draw/engines/workbench/shaders/workbench_volume.bsl.hh
++++ b/source/blender/draw/engines/workbench/shaders/workbench_volume.bsl.hh
+@@ -46,15 +46,15 @@ float4 sample_tricubic(sampler3D ima, float3 co)
+   final_z /= tex_size.zz;
+ 
+   float4 color;
+-  color = texture(ima, float3(final_co.xy, final_z.x)) * s0.x * s0.y * s0.z;
+-  color += texture(ima, float3(final_co.zy, final_z.x)) * s1.x * s0.y * s0.z;
+-  color += texture(ima, float3(final_co.xw, final_z.x)) * s0.x * s1.y * s0.z;
+-  color += texture(ima, float3(final_co.zw, final_z.x)) * s1.x * s1.y * s0.z;
++  color = textureLod(ima, float3(final_co.xy, final_z.x), 0.0f) * s0.x * s0.y * s0.z;
++  color += textureLod(ima, float3(final_co.zy, final_z.x), 0.0f) * s1.x * s0.y * s0.z;
++  color += textureLod(ima, float3(final_co.xw, final_z.x), 0.0f) * s0.x * s1.y * s0.z;
++  color += textureLod(ima, float3(final_co.zw, final_z.x), 0.0f) * s1.x * s1.y * s0.z;
+ 
+-  color += texture(ima, float3(final_co.xy, final_z.y)) * s0.x * s0.y * s1.z;
+-  color += texture(ima, float3(final_co.zy, final_z.y)) * s1.x * s0.y * s1.z;
+-  color += texture(ima, float3(final_co.xw, final_z.y)) * s0.x * s1.y * s1.z;
+-  color += texture(ima, float3(final_co.zw, final_z.y)) * s1.x * s1.y * s1.z;
++  color += textureLod(ima, float3(final_co.xy, final_z.y), 0.0f) * s0.x * s0.y * s1.z;
++  color += textureLod(ima, float3(final_co.zy, final_z.y), 0.0f) * s1.x * s0.y * s1.z;
++  color += textureLod(ima, float3(final_co.xw, final_z.y), 0.0f) * s0.x * s1.y * s1.z;
++  color += textureLod(ima, float3(final_co.zw, final_z.y), 0.0f) * s1.x * s1.y * s1.z;
+ 
+   return color;
+ }
+@@ -130,6 +130,8 @@ struct Resources {
+   [[resource_table, condition(use_color_band)]] ColorBand color_band;
+   [[resource_table, condition(!use_color_band)]] ColorUniform color_uniform;
+ 
++  /* Volume grids and ramps have one level. Explicit levels keep the samples in
++   * the ray march, which ends early on transmittance, valid in WGSL. */
+   float4 sample_volume_texture(sampler3D ima, float3 co)
+   {
+     if (consts.interpolation == 0) [[static_branch]] {
+@@ -139,7 +141,7 @@ struct Resources {
+       return sample_tricubic(ima, co);
+     }
+     /* Use hardware interpolation. */
+-    return texture(ima, co);
++    return textureLod(ima, co, 0.0f);
+   }
+ };
+ 
+@@ -225,7 +227,7 @@ void volume_properties([[resource_table]] Resources &srt,
+     }
+     else {
+       float val = srt.sample_volume_texture(srt.density_tx, co).r * color_band.grid_scale;
+-      tval = texture(color_band.transfer_tx, val);
++      tval = textureLod(color_band.transfer_tx, val, 0.0f);
+     }
+     tval *= srt.density_fac;
+     tval.rgb = pow(tval.rgb, float3(2.2f));
+@@ -247,7 +249,7 @@ void volume_properties([[resource_table]] Resources &srt,
+     if (srt.consts.is_legacy_smoke) [[static_branch]] {
+       [[resource_table]] Smoke &smoke = srt.smoke;
+       float flame = srt.sample_volume_texture(smoke.flame_tx, co).r;
+-      float4 emission = texture(smoke.flame_color_tx, flame);
++      float4 emission = textureLod(smoke.flame_color_tx, flame, 0.0f);
+       /* 800 is arbitrary and here to mimic old viewport. TODO: make it a parameter. */
+       scattering += emission.rgb * emission.a * 800.0f;
+     }
 diff --git a/source/blender/draw/engines/workbench/workbench_effect_antialiasing.cc b/source/blender/draw/engines/workbench/workbench_effect_antialiasing.cc
 index 90f1fcea..6dfbc89d 100644
 --- a/source/blender/draw/engines/workbench/workbench_effect_antialiasing.cc
@@ -7848,17 +8217,42 @@ index ff464b0d..cb9099da 100644
    return cache.eval_cache.surface;
  }
 diff --git a/source/blender/draw/intern/draw_cache_impl_subdivision.cc b/source/blender/draw/intern/draw_cache_impl_subdivision.cc
-index 4b5f98b2..6f7405e9 100644
+index 4b5f98b2..4ba6fc24 100644
 --- a/source/blender/draw/intern/draw_cache_impl_subdivision.cc
 +++ b/source/blender/draw/intern/draw_cache_impl_subdivision.cc
-@@ -63,25 +63,11 @@ namespace blender::draw {
+@@ -6,6 +6,12 @@
+  * \ingroup draw
+  */
+ 
++#include <atomic>
++#include <condition_variable>
++#include <exception>
++#include <memory>
++#include <mutex>
++
+ #include "draw_context_private.hh"
+ #include "draw_subdivision.hh"
+ 
+@@ -25,8 +31,12 @@
+ #include "BKE_subdiv_modifier.hh"
+ 
+ #include "BLI_linklist.hh"
++#include "BLI_function_ref.hh"
++#include "BLI_map.hh"
+ #include "BLI_mutex.hh"
+ #include "BLI_task.hh"
++#include "BLI_task_c.hh"
++#include "BLI_vector.hh"
+ #include "BLI_virtual_array.hh"
+ 
+ #include "DRW_engine.hh"
+@@ -63,25 +73,11 @@ namespace blender::draw {
   * \{ */
  
  #ifdef WITH_OPENSUBDIV
 -/* Vertex format used for the `PatchTable::PatchHandle`. */
 -static const GPUVertFormat &get_patch_handle_format()
-+static const GPUVertFormat &get_patch_map_format()
- {
+-{
 -  static const GPUVertFormat format = [&]() {
 -    GPUVertFormat format{};
 -    GPU_vertformat_attr_add(&format, "vert_index", gpu::VertAttrType::SINT_32);
@@ -7871,7 +8265,8 @@ index 4b5f98b2..6f7405e9 100644
 -
 -/* Vertex format used for the quad-tree nodes of the PatchMap. */
 -static const GPUVertFormat &get_quadtree_format()
--{
++static const GPUVertFormat &get_patch_map_format()
+ {
 -  static const GPUVertFormat format = [&]() {
 +  static const GPUVertFormat format = []() {
      GPUVertFormat format{};
@@ -7880,7 +8275,7 @@ index 4b5f98b2..6f7405e9 100644
      return format;
    }();
    return format;
-@@ -183,11 +169,7 @@ gpu::VertBuf *draw_subdiv_build_origindex_buffer(Span<int> vert_origindex)
+@@ -183,11 +179,7 @@ gpu::VertBuf *draw_subdiv_build_origindex_buffer(Span<int> vert_origindex)
  
  static void draw_patch_map_build(DRWPatchMap *gpu_patch_map, bke::subdiv::Subdiv *subdiv)
  {
@@ -7893,7 +8288,7 @@ index 4b5f98b2..6f7405e9 100644
  
    int min_patch_face = 0;
    int max_patch_face = 0;
-@@ -195,15 +177,13 @@ static void draw_patch_map_build(DRWPatchMap *gpu_patch_map, bke::subdiv::Subdiv
+@@ -195,15 +187,13 @@ static void draw_patch_map_build(DRWPatchMap *gpu_patch_map, bke::subdiv::Subdiv
    int patches_are_triangular = 0;
  
    OpenSubdiv_Evaluator *evaluator = subdiv->evaluator;
@@ -7911,7 +8306,7 @@ index 4b5f98b2..6f7405e9 100644
    gpu_patch_map->min_patch_face = min_patch_face;
    gpu_patch_map->max_patch_face = max_patch_face;
    gpu_patch_map->max_depth = max_depth;
-@@ -214,8 +194,7 @@ static void draw_patch_map_build(DRWPatchMap *gpu_patch_map, bke::subdiv::Subdiv
+@@ -214,8 +204,7 @@ static void draw_patch_map_build(DRWPatchMap *gpu_patch_map, bke::subdiv::Subdiv
  
  static void draw_patch_map_free(DRWPatchMap *gpu_patch_map)
  {
@@ -7921,7 +8316,7 @@ index 4b5f98b2..6f7405e9 100644
    gpu_patch_map->min_patch_face = 0;
    gpu_patch_map->max_patch_face = 0;
    gpu_patch_map->max_depth = 0;
-@@ -926,10 +905,7 @@ void draw_subdiv_extract_pos(const DRWSubdivCache &cache, gpu::VertBuf *pos, gpu
+@@ -926,10 +915,7 @@ void draw_subdiv_extract_pos(const DRWSubdivCache &cache, gpu::VertBuf *pos, gpu
    GPU_shader_bind(shader);
  
    GPU_vertbuf_bind_as_ssbo(src_buffer, PATCH_EVALUATION_SOURCE_VERTEX_BUFFER_BUF_SLOT);
@@ -7933,7 +8328,7 @@ index 4b5f98b2..6f7405e9 100644
    GPU_vertbuf_bind_as_ssbo(cache.patch_coords, PATCH_EVALUATION_PATCH_COORDS_BUF_SLOT);
    GPU_storagebuf_bind(patch_arrays_buffer, PATCH_EVALUATION_PATCH_ARRAY_BUFFER_BUF_SLOT);
    GPU_storagebuf_bind(patch_index_buffer, PATCH_EVALUATION_PATCH_INDEX_BUFFER_BUF_SLOT);
-@@ -987,10 +963,7 @@ void draw_subdiv_extract_uvs(const DRWSubdivCache &cache,
+@@ -987,10 +973,7 @@ void draw_subdiv_extract_uvs(const DRWSubdivCache &cache,
    GPU_shader_bind(shader);
  
    GPU_vertbuf_bind_as_ssbo(src_buffer, PATCH_EVALUATION_SOURCE_VERTEX_BUFFER_BUF_SLOT);
@@ -7945,7 +8340,7 @@ index 4b5f98b2..6f7405e9 100644
    GPU_vertbuf_bind_as_ssbo(cache.corner_patch_coords, PATCH_EVALUATION_PATCH_COORDS_BUF_SLOT);
    GPU_storagebuf_bind(patch_arrays_buffer, PATCH_EVALUATION_PATCH_ARRAY_BUFFER_BUF_SLOT);
    GPU_storagebuf_bind(patch_index_buffer, PATCH_EVALUATION_PATCH_INDEX_BUFFER_BUF_SLOT);
-@@ -1195,10 +1168,7 @@ void draw_subdiv_build_fdots_buffers(const DRWSubdivCache &cache,
+@@ -1195,10 +1178,7 @@ void draw_subdiv_build_fdots_buffers(const DRWSubdivCache &cache,
    GPU_shader_bind(shader);
  
    GPU_vertbuf_bind_as_ssbo(src_buffer, PATCH_EVALUATION_SOURCE_VERTEX_BUFFER_BUF_SLOT);
@@ -7957,6 +8352,174 @@ index 4b5f98b2..6f7405e9 100644
    GPU_vertbuf_bind_as_ssbo(cache.fdots_patch_coords, PATCH_EVALUATION_PATCH_COORDS_BUF_SLOT);
    GPU_vertbuf_bind_as_ssbo(cache.verts_orig_index,
                             PATCH_EVALUATION_INPUT_VERTEX_ORIG_INDEX_BUF_SLOT);
+@@ -1685,6 +1665,167 @@ void DRW_subdivide_loose_geom(DRWSubdivCache &subdiv_cache, const MeshBufferCach
+   });
+ }
+ 
++/**
++ * Return the subdivision runtime data of the object's mesh if drawing it will create a new
++ * subdivision descriptor and GPU evaluator, see #draw_subdiv_create_requested_buffers. Edit mode
++ * and existing descriptors are left to the regular code path: their mesh or evaluator may need
++ * to be recreated, which requires an active GPU context.
++ */
++static SubsurfRuntimeData *draw_subdiv_runtime_data_for_new_evaluator(Object &ob, Mesh *&r_mesh)
++{
++  if (ob.type != OB_MESH) {
++    return nullptr;
++  }
++  Mesh &mesh = DRW_object_get_data_for_drawing<Mesh>(ob);
++  if (!BKE_subsurf_modifier_has_gpu_subdiv(&mesh)) {
++    return nullptr;
++  }
++  SubsurfRuntimeData *runtime_data = mesh.runtime->subsurf_runtime_data;
++  if (runtime_data->settings.level == 0 || runtime_data->subdiv_gpu != nullptr ||
++      mesh.runtime->edit_mesh != nullptr)
++  {
++    return nullptr;
++  }
++  r_mesh = &mesh;
++  return runtime_data;
++}
++
++bool DRW_subdivision_needs_new_evaluator(Object &ob)
++{
++#ifdef WITH_OPENSUBDIV
++  Mesh *mesh;
++  return draw_subdiv_runtime_data_for_new_evaluator(ob, mesh) != nullptr;
++#else
++  UNUSED_VARS(ob);
++  return false;
++#endif
++}
++
++#ifdef WITH_OPENSUBDIV
++
++namespace {
++
++struct SubdivPrepareItem {
++  SubsurfRuntimeData *runtime_data;
++  const Mesh *mesh;
++  /* Rethrown on the thread generating the batches, where it would have happened without the
++   * preparation. */
++  std::exception_ptr exception;
++  std::atomic<bool> done = false;
++};
++
++struct SubdivPrepareSync {
++  std::mutex mutex;
++  std::condition_variable condition;
++};
++
++}  // namespace
++
++static void draw_subdiv_prepare_task(TaskPool *__restrict pool, void *taskdata)
++{
++  SubdivPrepareItem &item = *static_cast<SubdivPrepareItem *>(taskdata);
++  try {
++    /* Create the descriptor exactly like #draw_subdiv_create_requested_buffers does, which then
++     * finds and reuses it. Only this item's mesh and subdivision data are accessed, and nothing
++     * here uses the GPU. */
++    bke::subdiv::Subdiv *subdiv = BKE_subsurf_modifier_subdiv_descriptor_ensure(
++        item.runtime_data, item.mesh, true);
++    if (subdiv != nullptr) {
++      bke::subdiv::eval_prepare(subdiv);
++    }
++  }
++  catch (...) {
++    item.exception = std::current_exception();
++  }
++  SubdivPrepareSync &sync = *static_cast<SubdivPrepareSync *>(BLI_task_pool_user_data(pool));
++  {
++    std::scoped_lock lock(sync.mutex);
++    item.done = true;
++  }
++  sync.condition.notify_all();
++}
++
++#endif
++
++void DRW_subdivision_generate_batches(const Span<Object *> objects,
++                                      const FunctionRef<void(Object &ob)> generate)
++{
++#ifdef WITH_OPENSUBDIV
++  Vector<std::unique_ptr<SubdivPrepareItem>> items;
++  Map<const SubsurfRuntimeData *, int> item_by_runtime_data;
++  Array<int> object_items(objects.size(), -1);
++  for (const int i : objects.index_range()) {
++    Mesh *mesh = nullptr;
++    SubsurfRuntimeData *runtime_data = draw_subdiv_runtime_data_for_new_evaluator(*objects[i],
++                                                                                  mesh);
++    if (runtime_data == nullptr) {
++      continue;
++    }
++    /* Skip meshes whose batches won't be created (see the early outs of
++     * #DRW_mesh_batch_cache_create_requested), the evaluator wouldn't be used. */
++    const MeshBatchCache *cache = static_cast<const MeshBatchCache *>(mesh->runtime->batch_cache);
++    if (cache == nullptr ||
++        ((cache->batch_requested & ~cache->batch_ready) == 0 && !cache->surface_blas_requested))
++    {
++      continue;
++    }
++    object_items[i] = item_by_runtime_data.lookup_or_add_cb(runtime_data, [&]() {
++      items.append(std::make_unique<SubdivPrepareItem>());
++      items.last()->runtime_data = runtime_data;
++      items.last()->mesh = mesh;
++      return int(items.size() - 1);
++    });
++  }
++
++  if (items.size() < 2 || BLI_task_scheduler_num_threads() < 2) {
++    for (Object *ob : objects) {
++      generate(*ob);
++    }
++    return;
++  }
++
++  /* Prepare the evaluators on worker threads in the order their objects are generated, while this
++   * thread creates the GPU data of the evaluators that are ready. Their CPU side data is only freed
++   * once the evaluator is created, so to bound the memory usage only about one item per thread is
++   * prepared ahead. */
++  const int max_ahead = BLI_task_scheduler_num_threads();
++  SubdivPrepareSync sync;
++  /* Always wait for the tasks before the data they use goes out of scope, also when an exception
++   * is thrown. */
++  struct PoolGuard {
++    TaskPool *pool;
++    ~PoolGuard()
++    {
++      BLI_task_pool_work_and_wait(pool);
++      BLI_task_pool_free(pool);
++    }
++  } guard{BLI_task_pool_create(&sync, TASK_PRIORITY_HIGH)};
++  int pushed = 0;
++  for (const int i : objects.index_range()) {
++    const int item_index = object_items[i];
++    if (item_index != -1) {
++      for (; pushed < std::min<int>(item_index + max_ahead, items.size()); pushed++) {
++        BLI_task_pool_push(
++            guard.pool, draw_subdiv_prepare_task, items[pushed].get(), false, nullptr);
++      }
++      const SubdivPrepareItem &item = *items[item_index];
++      {
++        std::unique_lock lock(sync.mutex);
++        sync.condition.wait(lock, [&]() { return item.done.load(); });
++      }
++      if (item.exception) {
++        std::rethrow_exception(item.exception);
++      }
++    }
++    generate(*objects[i]);
++  }
++#else
++  for (Object *ob : objects) {
++    generate(*ob);
++  }
++#endif
++}
++
+ /**
+  * The #bke::subdiv::Subdiv data is being owned the modifier.
+  * Since the modifier can be freed from any thread (e.g. from depsgraph multi-threaded update)
 diff --git a/source/blender/draw/intern/draw_color_management.cc b/source/blender/draw/intern/draw_color_management.cc
 index ee498fcf..8de83f09 100644
 --- a/source/blender/draw/intern/draw_color_management.cc
@@ -8035,6 +8598,52 @@ index ee498fcf..8de83f09 100644
 +
 +}  // namespace blender
 +#endif
+diff --git a/source/blender/draw/intern/draw_context.cc b/source/blender/draw/intern/draw_context.cc
+index 8c4206dd..d464be7f 100644
+--- a/source/blender/draw/intern/draw_context.cc
++++ b/source/blender/draw/intern/draw_context.cc
+@@ -251,6 +251,12 @@ static bool draw_show_annotation()
+ struct ExtractionGraph {
+  public:
+   TaskGraph *graph = BLI_task_graph_create();
++  /**
++   * Objects whose batch creation is delayed until after the scene iteration, so that the GPU
++   * subdivision evaluators they need can be prepared in parallel, see
++   * #DRW_subdivision_generate_batches.
++   */
++  Vector<Object *> subdivision_objects;
+ 
+   ~ExtractionGraph()
+   {
+@@ -1226,7 +1232,13 @@ static void drw_engines_cache_populate(draw::ObjectRef &ref,
+   /* TODO: in the future it would be nice to generate once for all viewports.
+    * But we need threaded DRW manager first. */
+   if (ref.is_dupli() == false) {
+-    draw::drw_batch_cache_generate_requested(ref.object, *extraction.graph);
++    if (draw::DRW_subdivision_needs_new_evaluator(*ref.object)) {
++      /* Delayed like duplis, see #DRW_subdivision_generate_batches. */
++      extraction.subdivision_objects.append(ref.object);
++    }
++    else {
++      draw::drw_batch_cache_generate_requested(ref.object, *extraction.graph);
++    }
+   }
+   /* Batch generation for duplis happens after iter_callback. */
+ }
+@@ -1242,6 +1254,13 @@ void DRWContext::sync(iter_callback_t iter_callback)
+   /* Custom callback defines the set of object to sync. */
+   iter_callback(dupli_handler, extraction);
+ 
++  if (!extraction.subdivision_objects.is_empty()) {
++    draw::DRW_subdivision_generate_batches(extraction.subdivision_objects, [&](Object &object) {
++      draw::drw_batch_cache_generate_requested(&object, *extraction.graph);
++    });
++    extraction.subdivision_objects.clear();
++  }
++
+   dupli_handler.extract_all(extraction);
+   for (Object *object : this->delayed_extraction) {
+     draw::drw_batch_cache_generate_requested_evaluated_mesh_or_curve(object, *extraction.graph);
 diff --git a/source/blender/draw/intern/draw_curves.cc b/source/blender/draw/intern/draw_curves.cc
 index 77124519..7dad5f59 100644
 --- a/source/blender/draw/intern/draw_curves.cc
@@ -8246,10 +8855,18 @@ index 91094f07..045e2e2e 100644
  #define PATCH_EVALUATION_INPUT_VERTEX_ORIG_INDEX_BUF_SLOT 4
  #define PATCH_EVALUATION_PATCH_ARRAY_BUFFER_BUF_SLOT 5
 diff --git a/source/blender/draw/intern/draw_subdivision.hh b/source/blender/draw/intern/draw_subdivision.hh
-index 618d6fc4..d0a3c4b7 100644
+index 618d6fc4..5bb76ba0 100644
 --- a/source/blender/draw/intern/draw_subdivision.hh
 +++ b/source/blender/draw/intern/draw_subdivision.hh
-@@ -46,8 +46,7 @@ struct MeshRenderData;
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "BLI_array.hh"
++#include "BLI_function_ref.hh"
+ #include "BLI_math_matrix_types.hh"
+ #include "BLI_math_vector_types.hh"
+ #include "BLI_span.hh"
+@@ -46,8 +47,7 @@ struct MeshRenderData;
   * \{ */
  
  struct DRWPatchMap {
@@ -8259,6 +8876,29 @@ index 618d6fc4..d0a3c4b7 100644
    int min_patch_face;
    int max_patch_face;
    int max_depth;
+@@ -174,6 +174,22 @@ void DRW_create_subdivision(Object &ob,
+ 
+ void DRW_subdivide_loose_geom(DRWSubdivCache &subdiv_cache, const MeshBufferCache &cache);
+ 
++/**
++ * Whether drawing the object will create a new GPU subdivision evaluator for its mesh. Most of
++ * the cost of that is CPU work, which #DRW_subdivision_generate_batches does for many objects in
++ * parallel.
++ */
++bool DRW_subdivision_needs_new_evaluator(Object &ob);
++
++/**
++ * Create the requested batches of the objects with \a generate, in order. For the objects that
++ * need a new GPU subdivision evaluator, the subdivision descriptor and the CPU side data of the
++ * evaluator (see #bke::subdiv::eval_prepare) are computed on worker threads ahead of the
++ * \a generate calls, which then only create the GPU data.
++ */
++void DRW_subdivision_generate_batches(Span<Object *> objects,
++                                      FunctionRef<void(Object &ob)> generate);
++
+ void DRW_subdiv_cache_free(bke::subdiv::Subdiv *subdiv);
+ 
+ gpu::VertBufPtr draw_subdiv_init_origindex_buffer(int32_t *vert_origindex,
 diff --git a/source/blender/draw/intern/shaders/draw_curves.bsl.hh b/source/blender/draw/intern/shaders/draw_curves.bsl.hh
 index 7e241aa7..484b9774 100644
 --- a/source/blender/draw/intern/shaders/draw_curves.bsl.hh
@@ -11393,26 +12033,35 @@ diff --git a/source/blender/gpu/shaders/material/gpu_shader_material_bump.bsl.hh
 
    float3 dPdx = gpu_dfdx(sd.P) * derivative_scale_get(kg);
 diff --git a/source/blender/gpu/shaders/common/gpu_shader_tiled_image_lookup.bsl.hh b/source/blender/gpu/shaders/common/gpu_shader_tiled_image_lookup.bsl.hh
+index 1de1a015..60068c75 100644
 --- a/source/blender/gpu/shaders/common/gpu_shader_tiled_image_lookup.bsl.hh
 +++ b/source/blender/gpu/shaders/common/gpu_shader_tiled_image_lookup.bsl.hh
 @@ -6,7 +6,7 @@
-
+ 
  #include "gpu_shader_compat.hh"
-
+ 
 -bool tiled_image_lookup(float3 &co, sampler2DArray /*ima*/, sampler1DArray map)
 +bool tiled_image_lookup(float3 &co, sampler2DArray /*ima*/, sampler1DArray map, float2 &tile_scale)
  {
    float2 tile_pos = floor(co.xy);
-
-@@ -24,6 +24,7 @@
+ 
+@@ -24,6 +24,15 @@ bool tiled_image_lookup(float3 &co, sampler2DArray /*ima*/, sampler1DArray map)
    }
    float4 tile_info = texelFetch(map, int2(tile, 1), 0);
-
+ 
 -  co = float3(((co.xy - tile_pos) * tile_info.zw) + tile_info.xy, tile_layer);
 +  tile_scale = tile_info.zw;
 +  co = float3(((co.xy - tile_pos) * tile_scale) + tile_info.xy, tile_layer);
    return true;
  }
++
++/* Stock signature for callers that do not need the tile scale, such as the image
++ * editor's tiled display. */
++bool tiled_image_lookup(float3 &co, sampler2DArray ima, sampler1DArray map)
++{
++  float2 tile_scale;
++  return tiled_image_lookup(co, ima, map, tile_scale);
++}
 diff --git a/source/blender/gpu/shaders/material/gpu_shader_material_tex_image.bsl.hh b/source/blender/gpu/shaders/material/gpu_shader_material_tex_image.bsl.hh
 --- a/source/blender/gpu/shaders/material/gpu_shader_material_tex_image.bsl.hh
 +++ b/source/blender/gpu/shaders/material/gpu_shader_material_tex_image.bsl.hh

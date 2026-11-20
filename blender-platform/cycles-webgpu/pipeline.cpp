@@ -31,7 +31,8 @@ namespace {
 constexpr uint32_t workgroup_size = 64;
 /* The stock scheduler takes one eighth of the path pool as its work tile limit. */
 constexpr uint32_t min_path_capacity = 8;
-constexpr size_t path_pool_budget_words = 32 * 1024 * 1024 / sizeof(uint32_t);
+/* 132 words for each of the 64K paths, including the emission material record. */
+constexpr size_t path_pool_budget_words = 33 * 1024 * 1024 / sizeof(uint32_t);
 
 constexpr uint32_t pixel_words_per_path = 4;
 constexpr uint32_t ray_header_words = 2;

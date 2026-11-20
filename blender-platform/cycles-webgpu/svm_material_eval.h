@@ -50,12 +50,42 @@ static_assert(SHADER_MASK == CYCLES_WEBGPU_SVM_SHADER_ID_MASK);
 constexpr uint webgpu_svm_header_words = 2;
 constexpr uint webgpu_svm_jump_words = 1 + sizeof(SVMNodeShaderJump) / sizeof(uint);
 /* After the bytecode: UV triangle count, image slots, Generated triangle
- * count, and the working space's luminance coefficients. Attribute records
- * precede the image records and their texels. */
-constexpr uint webgpu_svm_texture_header_words = 6;
+ * count, attribute slot and triangle counts, the IES table offset from this
+ * header or zero, the working space's luminance coefficients, its three XYZ to
+ * RGB rows and the stock CIE color matching table. UV, Generated and attribute
+ * records precede the image records and their texels. The IES table follows. */
+constexpr uint webgpu_svm_ies_offset = 5;
+constexpr uint webgpu_svm_color_space_offset = 6;
+constexpr uint webgpu_svm_cie_table_offset = 18;
+constexpr uint webgpu_svm_cie_table_words = (WAVELENGTH_RESOLUTION + 1) * 3;
+/* KernelIntegrator::sample_clamp_indirect, which surface emission uses after
+ * the first bounce. */
+constexpr uint webgpu_svm_indirect_clamp_offset = webgpu_svm_cie_table_offset +
+                                                  webgpu_svm_cie_table_words;
+constexpr uint webgpu_svm_texture_header_words = webgpu_svm_indirect_clamp_offset + 1;
 constexpr uint webgpu_svm_triangle_uv_words = 6;
 constexpr uint webgpu_svm_triangle_generated_words = 9;
 constexpr uint webgpu_svm_image_words = 5;
+/* Per attribute slot and triangle: mode and NodeAttributeType, then three
+ * float4 corner values converted as attribute_data_fetch() returns them. */
+constexpr uint webgpu_svm_attribute_words = CYCLES_WEBGPU_SVM_ATTRIBUTE_WORDS;
+constexpr uint webgpu_svm_attribute_slots = 16;
+/* Attribute IDs stay below the slot flag. */
+constexpr uint webgpu_svm_attribute_slot = CYCLES_WEBGPU_SVM_ATTRIBUTE_SLOT;
+enum WebGPUSvmAttributeMode : uint {
+  WEBGPU_SVM_ATTRIBUTE_MISSING = 0,
+  WEBGPU_SVM_ATTRIBUTE_INTERPOLATE = 1,
+  WEBGPU_SVM_ATTRIBUTE_CONSTANT = 2,
+};
+/* Host-built slots for kernel data other than attributes. Smooth normals hold
+ * the object-space corner normals triangle_smooth_normal_unnormalized_object_space()
+ * interpolates. Positions hold triangle_vertices() and flag objects whose
+ * transform is not applied. */
+enum WebGPUSvmSyntheticSlot : uint {
+  WEBGPU_SVM_SLOT_SMOOTH_NORMAL = 1,
+  WEBGPU_SVM_SLOT_POSITIONS = 2,
+};
+constexpr uint webgpu_svm_slot_object_transform = 1u << 16;
 /* The interpolation word also records an optional alpha plane after the RGB texels. */
 constexpr uint webgpu_svm_image_alpha = 0x80000000u;
 using WebGPUSvmUv = float __attribute__((ext_vector_type(2)));
@@ -83,6 +113,138 @@ ccl_device_inline float3 webgpu_svm_read_rgb(Fetch word, const uint offset)
   return make_float3(__uint_as_float(word(offset)),
                      __uint_as_float(word(offset + 1)),
                      __uint_as_float(word(offset + 2)));
+}
+
+/* KernelFilm's working-space conversions used by the stock color nodes. */
+struct WebGPUSvmColorSpace {
+  float3 rgb_to_y;
+  float3 xyz_to_r;
+  float3 xyz_to_g;
+  float3 xyz_to_b;
+};
+
+template<typename Fetch>
+ccl_device_inline WebGPUSvmColorSpace webgpu_svm_read_color_space(Fetch word, const uint texture)
+{
+  const uint offset = texture + webgpu_svm_color_space_offset;
+  return {webgpu_svm_read_rgb(word, offset),
+          webgpu_svm_read_rgb(word, offset + 3),
+          webgpu_svm_read_rgb(word, offset + 6),
+          webgpu_svm_read_rgb(word, offset + 9)};
+}
+
+struct WebGPUSvmAttributeSample {
+  uint mode;
+  uint type;
+  float4 value;
+};
+
+struct WebGPUSvmTriangleCorners {
+  uint flags;
+  float3 corners[3];
+};
+
+template<typename Fetch>
+ccl_device_inline uint webgpu_svm_attribute_table(Fetch word, const uint texture)
+{
+  return texture + webgpu_svm_texture_header_words + word(texture) * webgpu_svm_triangle_uv_words +
+         word(texture + 2) * webgpu_svm_triangle_generated_words;
+}
+
+template<typename Fetch>
+ccl_device_inline uint webgpu_svm_attribute_record(Fetch word,
+                                                   const uint texture,
+                                                   const uint slot,
+                                                   const uint primitive)
+{
+  const uint triangles = word(texture + 4);
+  if (slot >= word(texture + 3) || primitive >= triangles) {
+    return 0;
+  }
+  return webgpu_svm_attribute_table(word, texture) +
+         (slot * triangles + primitive) * webgpu_svm_attribute_words;
+}
+
+/* Raw corners of a host-built slot. */
+template<typename Fetch>
+ccl_device_inline WebGPUSvmTriangleCorners webgpu_svm_triangle_corners(Fetch word,
+                                                                       const uint texture,
+                                                                       const uint slot,
+                                                                       const uint primitive)
+{
+  const uint base = webgpu_svm_attribute_record(word, texture, slot, primitive);
+  if (base == 0) {
+    return {0, {zero_float3(), zero_float3(), zero_float3()}};
+  }
+  return {word(base) >> 16,
+          {webgpu_svm_read_rgb(word, base + 1),
+           webgpu_svm_read_rgb(word, base + 5),
+           webgpu_svm_read_rgb(word, base + 9)}};
+}
+
+/* Interpolate one packed attribute slot like triangle_attribute(). */
+template<typename Fetch>
+ccl_device_inline WebGPUSvmAttributeSample webgpu_svm_triangle_attribute(Fetch word,
+                                                                         const uint texture,
+                                                                         const uint slot,
+                                                                         const uint primitive,
+                                                                         const float u,
+                                                                         const float v)
+{
+  const uint triangles = word(texture + 4);
+  if (slot >= word(texture + 3) || primitive >= triangles) {
+    return {WEBGPU_SVM_ATTRIBUTE_MISSING, 0, zero_float4()};
+  }
+  const uint base = webgpu_svm_attribute_table(word, texture) +
+                    (slot * triangles + primitive) * webgpu_svm_attribute_words;
+  const uint header = word(base);
+  const auto corner = [&](const uint i) {
+    const uint offset = base + 1 + 4 * i;
+    return make_float4(__uint_as_float(word(offset)),
+                       __uint_as_float(word(offset + 1)),
+                       __uint_as_float(word(offset + 2)),
+                       __uint_as_float(word(offset + 3)));
+  };
+  const uint mode = header & 0xffu;
+  const uint type = (header >> 8) & 0xffu;
+  const float4 f0 = corner(0);
+  /* Same barycentric interpolation as triangle_interpolate(). */
+  const float4 value = mode == WEBGPU_SVM_ATTRIBUTE_INTERPOLATE ?
+                           (1.0f - u - v) * f0 + u * corner(1) + v * corner(2) :
+                           f0;
+  return {mode, type, value};
+}
+
+/* svm_node_attr_surface_eval() conversions for a found surface attribute. */
+ccl_device_inline bool webgpu_svm_attribute_value(const WebGPUSvmAttributeSample &sample,
+                                                  const NodeAttributeOutputType type,
+                                                  float3 &value)
+{
+  const float4 f = sample.value;
+  switch (sample.type) {
+    case NODE_ATTR_FLOAT:
+      value = type == NODE_ATTR_OUTPUT_FLOAT_ALPHA ? make_float3(1.0f) :
+                                                     make_float3(f.x, f.x, f.x);
+      return true;
+    case NODE_ATTR_FLOAT2:
+      value = type == NODE_ATTR_OUTPUT_FLOAT       ? make_float3(f.x) :
+              type == NODE_ATTR_OUTPUT_FLOAT_ALPHA ? make_float3(1.0f) :
+                                                     make_float3(f.x, f.y, 0.0f);
+      return true;
+    case NODE_ATTR_FLOAT4:
+    case NODE_ATTR_RGBA:
+      value = type == NODE_ATTR_OUTPUT_FLOAT       ? make_float3(average(make_float3(f))) :
+              type == NODE_ATTR_OUTPUT_FLOAT_ALPHA ? make_float3(f.w) :
+                                                     make_float3(f);
+      return true;
+    case NODE_ATTR_FLOAT3:
+      value = type == NODE_ATTR_OUTPUT_FLOAT       ? make_float3(average(make_float3(f))) :
+              type == NODE_ATTR_OUTPUT_FLOAT_ALPHA ? make_float3(1.0f) :
+                                                     make_float3(f);
+      return true;
+    default:
+      return false;
+  }
 }
 
 template<typename Fetch>
@@ -235,9 +397,8 @@ ccl_device_inline bool webgpu_svm_image(
   if (uint(image) >= word(texture + 1)) {
     return false;
   }
-  const uint table = texture + webgpu_svm_texture_header_words +
-                     word(texture) * webgpu_svm_triangle_uv_words +
-                     word(texture + 2) * webgpu_svm_triangle_generated_words;
+  const uint table = webgpu_svm_attribute_table(word, texture) +
+                     word(texture + 3) * word(texture + 4) * webgpu_svm_attribute_words;
   /* Index the synchronized image slot directly in the SVM loop. */
   const uint base = table + uint(image) * webgpu_svm_image_words;
   const uint width = word(base);
@@ -469,6 +630,55 @@ ccl_device_inline bool webgpu_svm_eval_image(Image image,
   return true;
 }
 
+/* Scene facts resolved by the host while packing. The packed bytecode marks an
+ * attribute that no object using the material provides as ATTR_STD_NOT_FOUND
+ * and other attributes with their packed slot. The host only accepts Particle
+ * Info on objects using the dummy particle. */
+struct WebGPUSvmPackedHost {
+  ccl_device_inline_method int attribute(const uint /*word*/, const int attr) const
+  {
+    return attr;
+  }
+  ccl_device_inline_method bool dummy_particle() const
+  {
+    return true;
+  }
+  /* Packed attribute slot values at the shaded point. */
+  ccl_device_inline_method bool attribute_sample(const uint /*slot*/,
+                                                 WebGPUSvmAttributeSample & /*sample*/) const
+  {
+    return false;
+  }
+  /* kernel_ies_interp() for an IES slot. */
+  ccl_device_inline_method bool ies(const uint /*slot*/,
+                                    const float /*h_angle*/,
+                                    const float /*v_angle*/,
+                                    float & /*value*/) const
+  {
+    return false;
+  }
+  /* Packed reference to a host-built slot stored in an otherwise unused field. */
+  ccl_device_inline_method int synthetic(const uint /*word*/,
+                                         const int packed,
+                                         const WebGPUSvmSyntheticSlot /*kind*/) const
+  {
+    return packed;
+  }
+  ccl_device_inline_method bool triangle_corners(const uint /*slot*/,
+                                                 WebGPUSvmTriangleCorners & /*corners*/) const
+  {
+    return false;
+  }
+  /* Called with each opcode so the host can report where evaluation stopped. */
+  ccl_device_inline_method void visit(const uint /*type*/, const uint /*word*/) const {}
+  /* Row of cie_color_match. WebGPU reads the packed copy because WGSL cannot
+   * index the constant table dynamically. */
+  ccl_device_inline_method float3 cie_color_match_row(const int row) const
+  {
+    return make_float3(cie_color_match[row][0], cie_color_match[row][1], cie_color_match[row][2]);
+  }
+};
+
 struct WebGPUSvmMaterial {
   float3 color;
   float3 specular_tint;
@@ -487,6 +697,11 @@ struct WebGPUSvmMaterial {
   bool multiscatter;
   float standalone_transmission;
   bool requires_extended_svm;
+  /* A lone Holdout closure, with its weight in color. Camera paths write the
+   * weighted transparency and end without scattering or emission. */
+  bool holdout;
+  /* Accumulated emission closure weight, as emission_setup() stores it. */
+  float3 emission;
 };
 
 ccl_device_inline bool webgpu_svm_surface_color(const SVMInputFloat3 input,
@@ -560,8 +775,7 @@ ccl_device_inline bool webgpu_svm_principled(const SVMNodePrincipledBsdfData &da
 {
   /* Pack the supported Principled layers with uniform layer controls. */
   const uint layer_bits = data.sheen_weight.bits | data.coat_weight.bits |
-                          data.thin_film_thickness.bits | data.emission_strength.bits |
-                          data.diffuse_roughness.bits;
+                          data.thin_film_thickness.bits | data.diffuse_roughness.bits;
   const float ior_input = __uint_as_float(data.ior.bits);
   const bool varying_metallic = webgpu_svm_input_on_stack(data.metallic);
   if (varying_metallic && !webgpu_svm_stack_has(written, data.metallic.bits & 0xffu)) {
@@ -575,10 +789,20 @@ ccl_device_inline bool webgpu_svm_principled(const SVMNodePrincipledBsdfData &da
       !webgpu_svm_finite(ior_input) || !webgpu_svm_finite(metallic) ||
       !webgpu_svm_finite(ior_level) || !webgpu_svm_finite(transmission_input) ||
       !webgpu_svm_finite(sss_input) || transmission_input < 0.0f || transmission_input > 1.0f ||
-      !webgpu_svm_finite(__uint_as_float(data.emission_color.x.bits)) ||
-      !webgpu_svm_finite(__uint_as_float(data.emission_color.y.bits)) ||
-      !webgpu_svm_finite(__uint_as_float(data.emission_color.z.bits)) ||
+      !webgpu_svm_inputs_valid(written, data.emission_color, data.emission_strength) ||
       !webgpu_svm_surface_normal(data.normal_offset, surface_normal))
+  {
+    return false;
+  }
+  /* principled_bsdf_emission(): without alpha, sheen or coat the emission
+   * weight is the mix weight. */
+  const float3 emission = stack_load(stack, data.emission_color) *
+                          stack_load(stack, data.emission_strength);
+  if (!is_zero(emission)) {
+    material.emission += emission * mix_weight;
+  }
+  if (!webgpu_svm_finite(material.emission.x) || !webgpu_svm_finite(material.emission.y) ||
+      !webgpu_svm_finite(material.emission.z))
   {
     return false;
   }
@@ -760,6 +984,188 @@ ccl_device_inline bool webgpu_svm_refraction(const SVMNodeRefractionBsdfData &da
   return true;
 }
 
+ccl_device_inline bool webgpu_svm_is_slot(const int resolved)
+{
+  return resolved != int(ATTR_STD_NOT_FOUND) && (uint(resolved) & webgpu_svm_attribute_slot) != 0;
+}
+
+/* Sample a resolved attribute, leaving a missing record for ATTR_STD_NOT_FOUND. */
+template<typename Host>
+ccl_device_inline bool webgpu_svm_sample_resolved(const Host &host,
+                                                  const int resolved,
+                                                  WebGPUSvmAttributeSample &sample)
+{
+  sample = {WEBGPU_SVM_ATTRIBUTE_MISSING, 0, zero_float4()};
+  if (resolved == int(ATTR_STD_NOT_FOUND)) {
+    return true;
+  }
+  return webgpu_svm_is_slot(resolved) &&
+         host.attribute_sample(uint(resolved) & ~webgpu_svm_attribute_slot, sample);
+}
+
+/* object_normal_transform() followed by the projection onto the shading normal
+ * shared by primitive_tangent() and svm_node_tangent(). */
+template<typename FetchSurface>
+ccl_device_inline float3 webgpu_svm_surface_tangent(FetchSurface surface, float3 tangent)
+{
+  const Transform inverse = webgpu_svm_context_transform(surface, CYCLES_WEBGPU_SVM_OBJECT_INVERSE);
+  tangent = normalize(transform_direction_transposed(&inverse, tangent));
+  const float3 N = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_NORMAL));
+  return cross(N, normalize(cross(tangent, N)));
+}
+
+/* Helpers from kernel/svm/sky.h, which also includes the kernel image lookup. */
+ccl_device_inline float webgpu_svm_sky_angle_between(const float thetav,
+                                                     const float phiv,
+                                                     const float theta,
+                                                     const float phi)
+{
+  const float cospsi = sinf(thetav) * sinf(theta) * cosf(phi - phiv) + cosf(thetav) * cosf(theta);
+  return safe_acosf(cospsi);
+}
+
+ccl_device_inline float webgpu_svm_sky_perez_function(const float *lam,
+                                                      const float theta,
+                                                      const float gamma)
+{
+  const float ctheta = cosf(theta);
+  const float cgamma = cosf(gamma);
+  return (1.0f + lam[0] * expf(lam[1] / ctheta)) *
+         (1.0f + lam[2] * expf(lam[3] * gamma) + lam[4] * cgamma * cgamma);
+}
+
+ccl_device_inline float webgpu_svm_sky_radiance_internal(const float *configuration,
+                                                         const float theta,
+                                                         const float gamma)
+{
+  const float ctheta = cosf(theta);
+  const float cgamma = cosf(gamma);
+  const float expM = expf(configuration[4] * gamma);
+  const float rayM = cgamma * cgamma;
+  const float mieM = (1.0f + rayM) / powf((1.0f + configuration[8] * configuration[8] -
+                                           2.0f * configuration[8] * cgamma),
+                                          1.5f);
+  const float zenith = sqrtf(ctheta);
+  return (1.0f + configuration[0] * expf(configuration[1] / (ctheta + 0.01f))) *
+         (configuration[2] + configuration[3] * expM + configuration[5] * rayM +
+          configuration[6] * mieM + configuration[7] * zenith);
+}
+
+/* xyz_to_rgb_clamped() with the packed film rows. */
+ccl_device_inline float3 webgpu_svm_xyz_to_rgb_clamped(const WebGPUSvmColorSpace &color_space,
+                                                       const float3 xyz)
+{
+  return max(make_float3(dot(color_space.xyz_to_r, xyz),
+                         dot(color_space.xyz_to_g, xyz),
+                         dot(color_space.xyz_to_b, xyz)),
+             zero_float3());
+}
+
+/* sky_radiance_preetham() and sky_radiance_hosek(). */
+ccl_device_inline float3 webgpu_svm_sky_analytic(const WebGPUSvmColorSpace &color_space,
+                                                 const NodeSkyType type,
+                                                 const float3 dir,
+                                                 const SVMNodeTexSkyPreethamData &data)
+{
+  const float2 spherical = direction_to_spherical(dir);
+  float theta = spherical.x;
+  const float phi = -spherical.y + M_PI_2_F;
+  const float gamma = webgpu_svm_sky_angle_between(theta, phi, data.theta, data.phi);
+  theta = min(theta, M_PI_2_F - 0.001f);
+  if (type == NODE_SKY_PREETHAM) {
+    const float x = data.radiance_y * webgpu_svm_sky_perez_function(data.config_y, theta, gamma);
+    const float y = data.radiance_z * webgpu_svm_sky_perez_function(data.config_z, theta, gamma);
+    const float Y = data.radiance_x * webgpu_svm_sky_perez_function(data.config_x, theta, gamma);
+    return webgpu_svm_xyz_to_rgb_clamped(color_space, xyY_to_xyz(x, y, Y));
+  }
+  const float x = webgpu_svm_sky_radiance_internal(data.config_x, theta, gamma) * data.radiance_x;
+  const float y = webgpu_svm_sky_radiance_internal(data.config_y, theta, gamma) * data.radiance_y;
+  const float z = webgpu_svm_sky_radiance_internal(data.config_z, theta, gamma) * data.radiance_z;
+  return webgpu_svm_xyz_to_rgb_clamped(color_space, make_float3(x, y, z)) * (M_2PI_F / 683);
+}
+
+/* svm_node_vector_transform() for a static triangle object, reading the
+ * synchronized object and camera transforms from the surface context. */
+template<typename FetchSurface>
+ccl_device_inline float3 webgpu_svm_vector_transform(FetchSurface surface,
+                                                     const SVMNodeVectorTransform &node,
+                                                     float3 in)
+{
+  const NodeVectorTransformType type = node.transform_type;
+  const NodeVectorTransformConvertSpace from = node.convert_from;
+  const NodeVectorTransformConvertSpace to = node.convert_to;
+  const bool is_normal = (type == NODE_VECTOR_TRANSFORM_TYPE_NORMAL);
+  const bool is_direction = (type == NODE_VECTOR_TRANSFORM_TYPE_VECTOR);
+
+  const auto world_to_camera = [&]() {
+    if (is_normal) {
+      const Transform tfm = webgpu_svm_context_transform(surface,
+                                                         CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD);
+      return normalize(transform_direction_transposed(&tfm, in));
+    }
+    const Transform tfm = webgpu_svm_context_transform(surface, CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA);
+    return is_direction ? transform_direction(&tfm, in) : transform_point(&tfm, in);
+  };
+  const auto camera_to_world = [&]() {
+    if (is_normal) {
+      const Transform tfm = webgpu_svm_context_transform(surface, CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA);
+      return normalize(transform_direction_transposed(&tfm, in));
+    }
+    const Transform tfm = webgpu_svm_context_transform(surface, CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD);
+    return is_direction ? transform_direction(&tfm, in) : transform_point(&tfm, in);
+  };
+  /* object_inverse_*_transform() */
+  const auto world_to_object = [&]() {
+    if (is_normal) {
+      const Transform tfm = webgpu_svm_context_transform(surface,
+                                                         CYCLES_WEBGPU_SVM_OBJECT_TRANSFORM);
+      return safe_normalize(transform_direction_transposed(&tfm, in));
+    }
+    const Transform tfm = webgpu_svm_context_transform(surface, CYCLES_WEBGPU_SVM_OBJECT_INVERSE);
+    return is_direction ? transform_direction(&tfm, in) : transform_point(&tfm, in);
+  };
+  /* object_*_transform() */
+  const auto object_to_world = [&]() {
+    if (is_normal) {
+      const Transform tfm = webgpu_svm_context_transform(surface, CYCLES_WEBGPU_SVM_OBJECT_INVERSE);
+      return normalize(transform_direction_transposed(&tfm, in));
+    }
+    const Transform tfm = webgpu_svm_context_transform(surface,
+                                                       CYCLES_WEBGPU_SVM_OBJECT_TRANSFORM);
+    return is_direction ? transform_direction(&tfm, in) : transform_point(&tfm, in);
+  };
+
+  if (from == NODE_VECTOR_TRANSFORM_CONVERT_SPACE_WORLD) {
+    if (to == NODE_VECTOR_TRANSFORM_CONVERT_SPACE_CAMERA) {
+      in = world_to_camera();
+    }
+    else if (to == NODE_VECTOR_TRANSFORM_CONVERT_SPACE_OBJECT) {
+      in = world_to_object();
+    }
+  }
+  else if (from == NODE_VECTOR_TRANSFORM_CONVERT_SPACE_CAMERA) {
+    if (to == NODE_VECTOR_TRANSFORM_CONVERT_SPACE_WORLD ||
+        to == NODE_VECTOR_TRANSFORM_CONVERT_SPACE_OBJECT)
+    {
+      in = camera_to_world();
+    }
+    if (to == NODE_VECTOR_TRANSFORM_CONVERT_SPACE_OBJECT) {
+      in = world_to_object();
+    }
+  }
+  else if (from == NODE_VECTOR_TRANSFORM_CONVERT_SPACE_OBJECT) {
+    if (to == NODE_VECTOR_TRANSFORM_CONVERT_SPACE_WORLD ||
+        to == NODE_VECTOR_TRANSFORM_CONVERT_SPACE_CAMERA)
+    {
+      in = object_to_world();
+    }
+    if (to == NODE_VECTOR_TRANSFORM_CONVERT_SPACE_CAMERA) {
+      in = world_to_camera();
+    }
+  }
+  return in;
+}
+
 /* Follow Cycles' ramp interpolation and extrapolation with word-based table
  * reads. The bytecode table stays in scene storage. */
 template<typename Sample>
@@ -791,21 +1197,28 @@ ccl_device_inline auto webgpu_svm_ramp_lookup(const Sample sample,
  * Read typed Blender records word by word because WebGPU storage bindings do not
  * expose the native pointer used by svm_node_get(). Host eligibility checks and
  * GPU evaluation share the same opcode support and operand validation. */
-template<typename Fetch, typename FetchImage, typename FetchSurface = WebGPUSvmNoSurface>
+template<typename Fetch,
+         typename FetchImage,
+         typename FetchSurface = WebGPUSvmNoSurface,
+         typename Host = WebGPUSvmPackedHost>
 ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
                                                FetchImage image,
                                                const WebGPUSvmUv uv,
                                                const float3 generated,
-                                               const float3 rgb_to_y,
+                                               const WebGPUSvmColorSpace &color_space,
                                                bool &uses_uv,
                                                bool &uses_generated,
                                                const uint word_count,
                                                const uint shader_count,
                                                const uint packed_shader,
                                                WebGPUSvmMaterial &material,
-                                               FetchSurface surface = {})
+                                               FetchSurface surface = {},
+                                               const Host host = {})
 {
   material.requires_extended_svm = false;
+  material.holdout = false;
+  material.emission = zero_float3();
+  bool has_emission = false;
   const uint shader = packed_shader & SHADER_MASK;
   if (shader >= shader_count || shader_count > word_count / webgpu_svm_jump_words) {
     return false;
@@ -834,9 +1247,20 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
 
   while (offset < end) {
     const uint type = fetch(offset++);
+    host.visit(type, offset - 1);
     switch (type) {
       case NODE_END:
-        return has_closure && offset == end;
+        if (!has_closure) {
+          /* Emission alone, or a shader the compiler reduced to no closures
+           * (for example black or zero-strength emission): no scattering,
+           * light sampling or bounce. */
+          material.color = zero_float3();
+          material.ggx = false;
+          material.transmission = 0.0f;
+          material.standalone_transmission = 0.0f;
+          material.subsurface = 0.0f;
+        }
+        return offset == end;
       case NODE_GEOMETRY: {
         SVMNodeGeometry node;
         if (!webgpu_svm_read(fetch, offset, end, node) ||
@@ -858,6 +1282,12 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
             break;
           case NODE_GEOM_I:
             value = -webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_DIRECTION));
+            break;
+          case NODE_GEOM_T:
+            /* primitive_tangent() from the synchronized Generated coordinates. */
+            uses_generated = true;
+            value = webgpu_svm_surface_tangent(
+                surface, make_float3(-(generated.y - 0.5f), (generated.x - 0.5f), 0.0f));
             break;
           case NODE_GEOM_uv: {
             const auto hit = surface(CYCLES_WEBGPU_SVM_INTERSECTION);
@@ -1114,10 +1544,55 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
         break;
       }
       case NODE_ATTR: {
+        const uint attribute_word = offset;
         SVMNodeAttr node;
-        if (!webgpu_svm_read(fetch, offset, end, node) ||
-            (node.attr != ATTR_STD_UV && node.attr != ATTR_STD_GENERATED) ||
-            node.output_type != NODE_ATTR_OUTPUT_FLOAT3 ||
+        if (!webgpu_svm_read(fetch, offset, end, node)) {
+          return false;
+        }
+        if (node.attr != ATTR_STD_UV && node.attr != ATTR_STD_GENERATED) {
+          /* Stock svm_node_attr_surface_eval() for a packed attribute slot, or
+           * for an attribute that find_attribute() does not locate. */
+          const bool vector = node.output_type == NODE_ATTR_OUTPUT_FLOAT3;
+          const int resolved = host.attribute(attribute_word, node.attr);
+          const bool slot = resolved != int(ATTR_STD_NOT_FOUND) &&
+                            (uint(resolved) & webgpu_svm_attribute_slot) != 0;
+          if ((resolved != int(ATTR_STD_NOT_FOUND) && !slot) ||
+              node.output_type > NODE_ATTR_OUTPUT_FLOAT_ALPHA ||
+              node.bump_offset != NODE_BUMP_OFFSET_CENTER || node.store_derivatives ||
+              !webgpu_svm_inputs_valid(written, node.missing, node.missing_alpha) ||
+              !webgpu_svm_outputs_valid(vector ? SVM_STACK_INVALID : uint(node.out_offset),
+                                        vector ? uint(node.out_offset) : SVM_STACK_INVALID))
+          {
+            return false;
+          }
+          WebGPUSvmAttributeSample sample{WEBGPU_SVM_ATTRIBUTE_MISSING, 0, zero_float4()};
+          if (slot && !host.attribute_sample(uint(resolved) & ~webgpu_svm_attribute_slot, sample)) {
+            return false;
+          }
+          float3 value;
+          if (sample.mode == WEBGPU_SVM_ATTRIBUTE_MISSING) {
+            value = node.output_type == NODE_ATTR_OUTPUT_FLOAT_ALPHA ?
+                        make_float3(stack_load(stack, node.missing_alpha)) :
+                        stack_load(stack, node.missing);
+          }
+          else if (!webgpu_svm_attribute_value(sample, node.output_type, value)) {
+            return false;
+          }
+          if (vector) {
+            stack_store_float3(stack, node.out_offset, value);
+          }
+          else {
+            /* svm_node_attr_store() averages the scalar outputs. */
+            stack_store_float(stack, node.out_offset, average(value));
+          }
+          webgpu_svm_mark_outputs(written,
+                                  varying,
+                                  surface_normal_offset,
+                                  vector ? SVM_STACK_INVALID : uint(node.out_offset),
+                                  vector ? uint(node.out_offset) : SVM_STACK_INVALID);
+          break;
+        }
+        if (node.output_type != NODE_ATTR_OUTPUT_FLOAT3 ||
             node.bump_offset != NODE_BUMP_OFFSET_CENTER || node.store_derivatives ||
             uint(node.out_offset) + 2 >= SVM_STACK_SIZE)
         {
@@ -1136,6 +1611,485 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
             uint(node.out_offset) + 2 >= surface_normal_offset)
         {
           surface_normal_offset = uint(SVM_STACK_INVALID);
+        }
+        break;
+      }
+      case NODE_NORMAL_MAP: {
+        /* svm_node_normal_map() with packed tangent, sign and smooth normal slots. */
+        constexpr uint words = sizeof(uint);
+        const uint attribute_word = offset + offsetof(SVMNodeNormalMap, attr) / words;
+        const uint sign_word = offset + offsetof(SVMNodeNormalMap, attr_sign) / words;
+        const uint base_word = offset + offsetof(SVMNodeNormalMap, use_original_base) / words;
+        SVMNodeNormalMap node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            node.space > NODE_NORMAL_MAP_BLENDER_WORLD ||
+            !webgpu_svm_inputs_valid(written, node.color, node.strength) ||
+            !stack_valid(node.normal_offset) ||
+            !webgpu_svm_outputs_valid(SVM_STACK_INVALID, node.normal_offset))
+        {
+          return false;
+        }
+        const float3 shading_N = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_NORMAL));
+        const bool is_backfacing = surface(CYCLES_WEBGPU_SVM_INTERSECTION).w == 2;
+        float3 color = stack_load(stack, node.color);
+        color = 2.0f * make_float3(color.x - 0.5f, color.y - 0.5f, color.z - 0.5f);
+        if (node.invert_green) {
+          color.y = -color.y;
+        }
+        float3 N;
+        float strength = stack_load(stack, node.strength);
+        bool linear_interpolate_strength = false;
+        bool unperturbed = false;
+        if (node.space == NODE_NORMAL_MAP_TANGENT) {
+          WebGPUSvmAttributeSample tangent_sample;
+          WebGPUSvmAttributeSample sign_sample;
+          if (!webgpu_svm_sample_resolved(
+                  host, host.attribute(attribute_word, node.attr), tangent_sample) ||
+              !webgpu_svm_sample_resolved(
+                  host, host.attribute(sign_word, node.attr_sign), sign_sample))
+          {
+            return false;
+          }
+          const int smooth_slot = host.synthetic(
+              base_word, node.use_original_base, WEBGPU_SVM_SLOT_SMOOTH_NORMAL);
+          if (!webgpu_svm_is_slot(smooth_slot)) {
+            return false;
+          }
+          unperturbed = tangent_sample.mode == WEBGPU_SVM_ATTRIBUTE_MISSING ||
+                        sign_sample.mode == WEBGPU_SVM_ATTRIBUTE_MISSING;
+          if (!unperturbed) {
+            if (tangent_sample.type != NODE_ATTR_FLOAT3 || sign_sample.type != NODE_ATTR_FLOAT) {
+              return false;
+            }
+            const float3 tangent = make_float3(tangent_sample.value);
+            const float sign = sign_sample.value.x;
+            float3 normal;
+            if (packed_shader & SHADER_SMOOTH_NORMAL) {
+              WebGPUSvmAttributeSample smooth;
+              if (!host.attribute_sample(uint(smooth_slot) & ~webgpu_svm_attribute_slot, smooth) ||
+                  smooth.mode == WEBGPU_SVM_ATTRIBUTE_MISSING)
+              {
+                return false;
+              }
+              normal = safe_normalize(make_float3(smooth.value));
+              if (is_zero(normal)) {
+                normal = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_GEOMETRIC));
+              }
+            }
+            else {
+              normal = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_GEOMETRIC));
+              /* The normal is already inverted, which is too soon for the math here. */
+              if (is_backfacing) {
+                normal = -normal;
+              }
+              /* object_inverse_normal_transform() */
+              const Transform tfm = webgpu_svm_context_transform(
+                  surface, CYCLES_WEBGPU_SVM_OBJECT_TRANSFORM);
+              normal = safe_normalize(transform_direction_transposed(&tfm, normal));
+            }
+            color.x *= strength;
+            color.y *= strength;
+            color.z = mix(1.0f, color.z, saturatef(strength));
+            const float3 B = sign * cross(normal, tangent);
+            N = safe_normalize(to_global(color, tangent, B, normal));
+            /* object_normal_transform() */
+            const Transform itfm = webgpu_svm_context_transform(surface,
+                                                                CYCLES_WEBGPU_SVM_OBJECT_INVERSE);
+            N = normalize(transform_direction_transposed(&itfm, N));
+            if (is_backfacing) {
+              N = -N;
+            }
+          }
+        }
+        else {
+          linear_interpolate_strength = true;
+          if (node.space == NODE_NORMAL_MAP_BLENDER_OBJECT ||
+              node.space == NODE_NORMAL_MAP_BLENDER_WORLD)
+          {
+            color.y = -color.y;
+            color.z = -color.z;
+          }
+          N = color;
+          if (node.space == NODE_NORMAL_MAP_OBJECT || node.space == NODE_NORMAL_MAP_BLENDER_OBJECT)
+          {
+            const Transform itfm = webgpu_svm_context_transform(surface,
+                                                                CYCLES_WEBGPU_SVM_OBJECT_INVERSE);
+            N = normalize(transform_direction_transposed(&itfm, N));
+          }
+          else {
+            N = safe_normalize(N);
+          }
+          if (is_backfacing) {
+            N = -N;
+          }
+        }
+        if (unperturbed) {
+          N = shading_N;
+        }
+        else {
+          if (linear_interpolate_strength && strength != 1.0f) {
+            strength = max(strength, 0.0f);
+            N = safe_normalize(shading_N + (N - shading_N) * strength);
+          }
+          if (is_zero(N) || !isfinite_safe(N)) {
+            N = shading_N;
+          }
+        }
+        stack_store_float3(stack, node.normal_offset, N);
+        webgpu_svm_mark_outputs(
+            written, varying, surface_normal_offset, SVM_STACK_INVALID, node.normal_offset);
+        break;
+      }
+      case NODE_TEX_SKY: {
+        /* svm_node_tex_sky() for a surface material. */
+        SVMNodeTexSky node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            node.sky_type > NODE_SKY_MULTIPLE_SCATTERING ||
+            !webgpu_svm_stack_has3(written, node.dir_offset) || !stack_valid(node.out_offset) ||
+            !webgpu_svm_outputs_valid(SVM_STACK_INVALID, node.out_offset))
+        {
+          return false;
+        }
+        const float3 dir = stack_load_float3(stack, node.dir_offset);
+        float3 rgb;
+        if (node.sky_type == NODE_SKY_PREETHAM || node.sky_type == NODE_SKY_HOSEK) {
+          SVMNodeTexSkyPreethamData data;
+          if (!webgpu_svm_read(fetch, offset, end, data)) {
+            return false;
+          }
+          rgb = webgpu_svm_sky_analytic(color_space, node.sky_type, dir, data);
+        }
+        else {
+          /* sky_radiance_nishita() without the Sun guiding bake. */
+          SVMNodeTexSkyNishitaData data;
+          if (!webgpu_svm_read(fetch, offset, end, data)) {
+            return false;
+          }
+          const float3 pixel_bottom = make_float3(
+              data.pixel_bottom_x, data.pixel_bottom_y, data.pixel_bottom_z);
+          const float3 pixel_top = make_float3(data.pixel_top_x, data.pixel_top_y, data.pixel_top_z);
+          const bool sun_disc = (data.angular_diameter >= 0.0f);
+          float3 xyz = zero_float3();
+          const float2 direction = direction_to_spherical(dir);
+          const float3 sun_dir = spherical_to_direction(data.sun_elevation - M_PI_2_F,
+                                                        data.sun_rotation - M_PI_2_F);
+          const float sun_dir_angle = precise_angle(dir, sun_dir);
+          const float half_angular = data.angular_diameter * 0.5f;
+          const float dir_elevation = M_PI_2_F - direction.x;
+          if (sun_disc && sun_dir_angle < half_angular &&
+              dir_elevation > data.earth_intersection_angle)
+          {
+            const float y = ((dir_elevation - data.sun_elevation) / data.angular_diameter) + 0.5f;
+            const float limb_darkening = (1.0f - 0.6f * (1.0f - sqrtf(1.0f - sqr(sun_dir_angle /
+                                                                                half_angular))));
+            xyz = mix(pixel_bottom, pixel_top, y) * data.sun_intensity * limb_darkening;
+          }
+          const float x = fractf((-direction.y - M_PI_2_F + data.sun_rotation) * M_1_2PI_F);
+          const float y = copysignf(sqrtf(fabsf(dir_elevation) * M_2_PI_F), dir_elevation) * 0.5f +
+                          0.5f;
+          float4 sky;
+          if (!image(int(data.texture_id), make_float2(x, y), false, sky)) {
+            return false;
+          }
+          xyz += make_float3(sky);
+          rgb = webgpu_svm_xyz_to_rgb_clamped(color_space, xyz);
+        }
+        stack_store_float3(stack, node.out_offset, rgb);
+        webgpu_svm_mark_outputs(
+            written, varying, surface_normal_offset, SVM_STACK_INVALID, node.out_offset);
+        break;
+      }
+      case NODE_IES: {
+        SVMNodeIES node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            !webgpu_svm_stack_has3(written, node.vector_offset) ||
+            !webgpu_svm_input_valid(written, node.strength) ||
+            !webgpu_svm_outputs_valid(node.fac_offset, SVM_STACK_INVALID))
+        {
+          return false;
+        }
+        /* svm_node_ies() */
+        float3 vector = stack_load_float3(stack, node.vector_offset);
+        const float strength = stack_load(stack, node.strength);
+        vector = normalize(vector);
+        const float v_angle = safe_acosf(-vector.z);
+        float h_angle;
+        if (vector.x == 0.0f && vector.y == 0.0f) {
+          /* C atan2f() of signed zeros. WGSL leaves atan2(0, 0) undefined. */
+          const bool negative_x = (__float_as_uint(vector.x) >> 31) != 0;
+          const bool negative_y = (__float_as_uint(vector.y) >> 31) != 0;
+          h_angle = (negative_y ? (negative_x ? -M_PI_F : M_PI_F) : 0.0f) + M_PI_F;
+        }
+        else {
+          h_angle = atan2f(vector.x, vector.y) + M_PI_F;
+        }
+        float ies;
+        if (!host.ies(node.slot, h_angle, v_angle, ies)) {
+          return false;
+        }
+        if (stack_valid(node.fac_offset)) {
+          stack_store_float(stack, node.fac_offset, strength * ies);
+          webgpu_svm_mark_outputs(
+              written, varying, surface_normal_offset, node.fac_offset, SVM_STACK_INVALID);
+        }
+        break;
+      }
+      case NODE_WIREFRAME: {
+        /* svm_node_wireframe() without pixel size, which needs ray differentials. */
+        const uint slot_word = offset + offsetof(SVMNodeWireframe, bump_filter_width) / sizeof(uint);
+        SVMNodeWireframe node;
+        if (!webgpu_svm_read(fetch, offset, end, node) || node.use_pixel_size ||
+            node.bump_offset != NODE_BUMP_OFFSET_CENTER ||
+            !webgpu_svm_input_valid(written, node.in_size) ||
+            !webgpu_svm_outputs_valid(node.out_fac_offset, SVM_STACK_INVALID))
+        {
+          return false;
+        }
+        const int slot = host.synthetic(
+            slot_word, __float_as_int(node.bump_filter_width), WEBGPU_SVM_SLOT_POSITIONS);
+        WebGPUSvmTriangleCorners triangle;
+        if (!webgpu_svm_is_slot(slot) ||
+            !host.triangle_corners(uint(slot) & ~webgpu_svm_attribute_slot, triangle))
+        {
+          return false;
+        }
+        float3 Co[3] = {triangle.corners[0], triangle.corners[1], triangle.corners[2]};
+        if (triangle.flags & (webgpu_svm_slot_object_transform >> 16)) {
+          /* object_position_transform() */
+          const Transform tfm = webgpu_svm_context_transform(surface,
+                                                             CYCLES_WEBGPU_SVM_OBJECT_TRANSFORM);
+          Co[0] = transform_point(&tfm, Co[0]);
+          Co[1] = transform_point(&tfm, Co[1]);
+          Co[2] = transform_point(&tfm, Co[2]);
+        }
+        const float3 P = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_POSITION));
+        float pixelwidth = 1.0f;
+        pixelwidth *= 0.5f * stack_load(stack, node.in_size);
+        pixelwidth *= pixelwidth;
+        float f = 0.0f;
+        for (int i = 0; i < 3; i++) {
+          const int i2 = i ? i - 1 : 2;
+          const float3 dir = P - Co[i];
+          const float3 edge = Co[i] - Co[i2];
+          const float3 crs = cross(edge, dir);
+          if (dot(crs, crs) < (dot(edge, edge) * pixelwidth)) {
+            f = 1.0f;
+            break;
+          }
+        }
+        if (stack_valid(node.out_fac_offset)) {
+          stack_store_float(stack, node.out_fac_offset, f);
+          webgpu_svm_mark_outputs(
+              written, varying, surface_normal_offset, node.out_fac_offset, SVM_STACK_INVALID);
+        }
+        break;
+      }
+      case NODE_TANGENT: {
+        /* svm_node_tangent() with a packed UV tangent slot or the synchronized
+         * Generated coordinates. */
+        const uint attribute_word = offset + offsetof(SVMNodeTangent, attr) / sizeof(uint);
+        SVMNodeTangent node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            node.direction_type > NODE_TANGENT_UVMAP || node.axis > NODE_TANGENT_AXIS_Z ||
+            !stack_valid(node.tangent_offset) ||
+            !webgpu_svm_outputs_valid(SVM_STACK_INVALID, node.tangent_offset))
+        {
+          return false;
+        }
+        float3 tangent = zero_float3();
+        bool found = true;
+        if (node.direction_type == NODE_TANGENT_UVMAP) {
+          const int resolved = host.attribute(attribute_word, node.attr);
+          WebGPUSvmAttributeSample sample{WEBGPU_SVM_ATTRIBUTE_MISSING, 0, zero_float4()};
+          if (resolved != int(ATTR_STD_NOT_FOUND) &&
+              ((uint(resolved) & webgpu_svm_attribute_slot) == 0 ||
+               !host.attribute_sample(uint(resolved) & ~webgpu_svm_attribute_slot, sample)))
+          {
+            return false;
+          }
+          found = sample.mode != WEBGPU_SVM_ATTRIBUTE_MISSING;
+          if (found) {
+            if (sample.type != NODE_ATTR_FLOAT2 && sample.type != NODE_ATTR_FLOAT3) {
+              return false;
+            }
+            tangent = sample.type == NODE_ATTR_FLOAT2 ?
+                          make_float3(sample.value.x, sample.value.y, 0.0f) :
+                          make_float3(sample.value);
+          }
+        }
+        else {
+          if (node.attr != ATTR_STD_GENERATED) {
+            return false;
+          }
+          uses_generated = true;
+          if (node.axis == NODE_TANGENT_AXIS_X) {
+            tangent = make_float3(0.0f, -(generated.z - 0.5f), (generated.y - 0.5f));
+          }
+          else if (node.axis == NODE_TANGENT_AXIS_Y) {
+            tangent = make_float3(-(generated.z - 0.5f), 0.0f, (generated.x - 0.5f));
+          }
+          else {
+            tangent = make_float3(-(generated.y - 0.5f), (generated.x - 0.5f), 0.0f);
+          }
+        }
+        /* A missing UV tangent stores zero without the normal projection. */
+        stack_store_float3(
+            stack, node.tangent_offset, found ? webgpu_svm_surface_tangent(surface, tangent) : tangent);
+        webgpu_svm_mark_outputs(
+            written, varying, surface_normal_offset, SVM_STACK_INVALID, node.tangent_offset);
+        break;
+      }
+      case NODE_HAIR_INFO: {
+        /* svm_node_hair_info() on a triangle. Intercept, Length and Random
+         * compile to attribute nodes. */
+        SVMNodeHairInfo node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            node.info_type > NODE_INFO_CURVE_RANDOM)
+        {
+          return false;
+        }
+        if (node.info_type == NODE_INFO_CURVE_IS_STRAND ||
+            node.info_type == NODE_INFO_CURVE_THICKNESS)
+        {
+          if (!webgpu_svm_outputs_valid(node.out_offset, SVM_STACK_INVALID)) {
+            return false;
+          }
+          stack_store_float(stack, node.out_offset, 0.0f);
+          webgpu_svm_mark_outputs(
+              written, varying, surface_normal_offset, node.out_offset, SVM_STACK_INVALID);
+        }
+        else if (node.info_type == NODE_INFO_CURVE_TANGENT_NORMAL) {
+          if (!webgpu_svm_outputs_valid(SVM_STACK_INVALID, node.out_offset)) {
+            return false;
+          }
+          stack_store_float3(stack, node.out_offset, zero_float3());
+          webgpu_svm_mark_outputs(
+              written, varying, surface_normal_offset, SVM_STACK_INVALID, node.out_offset);
+        }
+        break;
+      }
+      case NODE_POINT_INFO: {
+        /* svm_node_point_info() on a triangle. Random compiles to an attribute. */
+        SVMNodePointInfo node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            node.info_type > NODE_INFO_POINT_RANDOM)
+        {
+          return false;
+        }
+        if (node.info_type == NODE_INFO_POINT_POSITION) {
+          if (!webgpu_svm_outputs_valid(SVM_STACK_INVALID, node.out_offset)) {
+            return false;
+          }
+          stack_store_float3(stack, node.out_offset, zero_float3());
+          webgpu_svm_mark_outputs(
+              written, varying, surface_normal_offset, SVM_STACK_INVALID, node.out_offset);
+        }
+        else if (node.info_type == NODE_INFO_POINT_RADIUS) {
+          if (!webgpu_svm_outputs_valid(node.out_offset, SVM_STACK_INVALID)) {
+            return false;
+          }
+          stack_store_float(stack, node.out_offset, 0.0f);
+          webgpu_svm_mark_outputs(
+              written, varying, surface_normal_offset, node.out_offset, SVM_STACK_INVALID);
+        }
+        break;
+      }
+      case NODE_PARTICLE_INFO: {
+        /* svm_node_particle_info() reading the dummy particle Cycles stores
+         * first, as it does for objects without particle instancing. */
+        SVMNodeParticleInfo node;
+        if (!webgpu_svm_read(fetch, offset, end, node) || !host.dummy_particle() ||
+            node.info_type > NODE_INFO_PAR_ANGULAR_VELOCITY)
+        {
+          return false;
+        }
+        const KernelParticle particle{};
+        const bool vector = node.info_type == NODE_INFO_PAR_LOCATION ||
+                            node.info_type == NODE_INFO_PAR_VELOCITY ||
+                            node.info_type == NODE_INFO_PAR_ANGULAR_VELOCITY;
+        if (!webgpu_svm_outputs_valid(vector ? SVM_STACK_INVALID : uint(node.out_offset),
+                                      vector ? uint(node.out_offset) : SVM_STACK_INVALID))
+        {
+          return false;
+        }
+        switch (node.info_type) {
+          case NODE_INFO_PAR_INDEX:
+            stack_store_float(stack, node.out_offset, float(uint(particle.index)));
+            break;
+          case NODE_INFO_PAR_RANDOM:
+            stack_store_float(stack, node.out_offset, hash_uint2_to_float(uint(particle.index), 0));
+            break;
+          case NODE_INFO_PAR_AGE:
+            stack_store_float(stack, node.out_offset, particle.age);
+            break;
+          case NODE_INFO_PAR_LIFETIME:
+            stack_store_float(stack, node.out_offset, particle.lifetime);
+            break;
+          case NODE_INFO_PAR_LOCATION:
+            stack_store_float3(stack, node.out_offset, make_float3(particle.location));
+            break;
+          case NODE_INFO_PAR_SIZE:
+            stack_store_float(stack, node.out_offset, particle.size);
+            break;
+          case NODE_INFO_PAR_VELOCITY:
+            stack_store_float3(stack, node.out_offset, make_float3(particle.velocity));
+            break;
+          case NODE_INFO_PAR_ANGULAR_VELOCITY:
+            stack_store_float3(stack, node.out_offset, make_float3(particle.angular_velocity));
+            break;
+        }
+        webgpu_svm_mark_outputs(written,
+                                varying,
+                                surface_normal_offset,
+                                vector ? SVM_STACK_INVALID : uint(node.out_offset),
+                                vector ? uint(node.out_offset) : SVM_STACK_INVALID);
+        break;
+      }
+      case NODE_WAVELENGTH: {
+        SVMNodeWavelength node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            !webgpu_svm_input_valid(written, node.wavelength) ||
+            !stack_valid(node.color_offset) ||
+            !webgpu_svm_outputs_valid(SVM_STACK_INVALID, node.color_offset))
+        {
+          return false;
+        }
+        /* svm_node_wavelength() and svm_math_wavelength_color_xyz(), with
+         * xyz_to_rgb() reading the packed film rows. */
+        float ii = (stack_load(stack, node.wavelength) - 380.0f) * (1.0f / 5.0f);
+        const int i = float_to_int(ii);
+        float3 xyz = make_float3(0.0f, 0.0f, 0.0f);
+        if (!(i < 0 || i >= WAVELENGTH_RESOLUTION)) {
+          ii -= i;
+          xyz = interp(host.cie_color_match_row(i), host.cie_color_match_row(i + 1), ii);
+        }
+        float3 color = make_float3(dot(color_space.xyz_to_r, xyz),
+                                   dot(color_space.xyz_to_g, xyz),
+                                   dot(color_space.xyz_to_b, xyz));
+        color *= 1.0f / 2.52f;
+        color = max(color, make_float3(0.0f, 0.0f, 0.0f));
+        stack_store_float3(stack, node.color_offset, color);
+        webgpu_svm_mark_outputs(
+            written, varying, surface_normal_offset, SVM_STACK_INVALID, node.color_offset);
+        break;
+      }
+      case NODE_VECTOR_TRANSFORM: {
+        SVMNodeVectorTransform node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            node.transform_type > NODE_VECTOR_TRANSFORM_TYPE_NORMAL ||
+            node.convert_from > NODE_VECTOR_TRANSFORM_CONVERT_SPACE_CAMERA ||
+            node.convert_to > NODE_VECTOR_TRANSFORM_CONVERT_SPACE_CAMERA ||
+            !webgpu_svm_input_valid(written, node.vector_in) ||
+            !webgpu_svm_outputs_valid(SVM_STACK_INVALID, node.vector_out_offset))
+        {
+          return false;
+        }
+        if (stack_valid(node.vector_out_offset)) {
+          stack_store_float3(stack,
+                             node.vector_out_offset,
+                             webgpu_svm_vector_transform(surface, node, stack_load(stack, node.vector_in)));
+          webgpu_svm_mark_outputs(
+              written, varying, surface_normal_offset, SVM_STACK_INVALID, node.vector_out_offset);
         }
         break;
       }
@@ -1778,7 +2732,7 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
           }
           const float3 value = stack_load_float3(stack, node.from_offset);
           /* The working-space coefficients are serialized from kernel data. */
-          const float scalar = node.convert_type == NODE_CONVERT_CF ? dot(value, rgb_to_y) :
+          const float scalar = node.convert_type == NODE_CONVERT_CF ? dot(value, color_space.rgb_to_y) :
                                                                      average(value);
           stack_store_float(stack, node.to_offset, scalar);
           webgpu_svm_mark_outputs(
@@ -1921,6 +2875,70 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
         weight = rgb_to_spectrum(make_float3(stack_load_float(stack, node.weight_offset),
                                              stack_load_float(stack, uint(node.weight_offset) + 1),
                                              stack_load_float(stack, uint(node.weight_offset) + 2)));
+        break;
+      }
+      case NODE_EMISSION_WEIGHT: {
+        /* svm_node_emission_weight() */
+        SVMNodeEmissionWeight node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            !webgpu_svm_inputs_valid(written, node.color, node.strength))
+        {
+          return false;
+        }
+        weight = rgb_to_spectrum(stack_load(stack, node.color)) * stack_load(stack, node.strength);
+        break;
+      }
+      case NODE_CLOSURE_EMISSION: {
+        /* svm_node_closure_emission() and emission_setup() for a surface. */
+        SVMNodeClosureEmission node;
+        if (material.holdout || !webgpu_svm_read(fetch, offset, end, node) ||
+            (stack_valid(node.mix_weight_offset) &&
+             !webgpu_svm_stack_has(written, node.mix_weight_offset)))
+        {
+          return false;
+        }
+        /* A zero mix weight adds nothing, but the surface still has a valid
+         * (black) shader wherever the weight varies. */
+        has_emission = true;
+        Spectrum emission = weight;
+        if (stack_valid(node.mix_weight_offset)) {
+          const float mix_weight = stack_load_float(stack, node.mix_weight_offset);
+          if (mix_weight == 0.0f) {
+            break;
+          }
+          emission *= mix_weight;
+        }
+        material.emission += emission;
+        if (!webgpu_svm_finite(material.emission.x) || !webgpu_svm_finite(material.emission.y) ||
+            !webgpu_svm_finite(material.emission.z))
+        {
+          return false;
+        }
+        break;
+      }
+      case NODE_CLOSURE_HOLDOUT: {
+        SVMNodeClosureHoldout node;
+        if (has_closure || mixes_closures || has_emission ||
+            !webgpu_svm_read(fetch, offset, end, node) ||
+            (stack_valid(node.mix_weight_offset) &&
+             !webgpu_svm_stack_has(written, node.mix_weight_offset)))
+        {
+          return false;
+        }
+        /* svm_node_closure_holdout() drops a zero mix weight. */
+        const float mix_weight = stack_load_float_default(stack, node.mix_weight_offset, 1.0f);
+        material.color = mix_weight == 0.0f ? zero_float3() : weight * mix_weight;
+        if (!webgpu_svm_finite(material.color.x) || !webgpu_svm_finite(material.color.y) ||
+            !webgpu_svm_finite(material.color.z))
+        {
+          return false;
+        }
+        material.ggx = false;
+        material.transmission = 0.0f;
+        material.standalone_transmission = 0.0f;
+        material.subsurface = 0.0f;
+        material.holdout = true;
+        has_closure = true;
         break;
       }
       case NODE_MIX_CLOSURE: {

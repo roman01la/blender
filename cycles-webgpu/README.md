@@ -226,7 +226,7 @@ retired path. Both modes reuse the same film kernels. The scheduler admits
 paths across a whole sample batch and can refill the pool while earlier
 paths are active. New paths use free GPU slots, and multiple samples can
 accumulate into the same pixel using atomic updates. WebGPU uses up to
-65,536 concurrent paths, subject to its device limits and a 32 MiB path-pool
+65,536 concurrent paths, subject to its device limits and a 33 MiB path-pool
 budget. The stock scheduler refills this pool for larger render tiles.
 Each queue snapshot clears, counts, and copies the counters in one command
 buffer. The renderer waits for validation and mapping before using the
@@ -281,7 +281,16 @@ node web/cycles-webgpu/verify.mjs --svm \
 node web/cycles-webgpu/verify.mjs --svm-compact \
   /tmp/blender-cycles-webgpu/svm-compact.wgsl \
   /tmp/blender-cycles-webgpu/svm-reference.json
+node web/cycles-webgpu/verify.mjs --svm-core \
+  /tmp/blender-cycles-webgpu/svm-compact-core.wgsl \
+  /tmp/blender-cycles-webgpu/svm-reference.json
 ```
+
+The core shader leaves the extended operations to the full shader. The
+`--svm-core` check accepts those lanes as unsupported and compares every lane
+the core shader evaluates. The reference records a relative tolerance per lane.
+The sky models allow 2 × 10⁻⁵ for the GPU's transcendental functions, and the
+other lanes use 3 × 10⁻⁶.
 
 Use a perspective camera and the Combined pass with static flat or smooth
 triangles. The surface stage uses Cycles’ packed vertex and corner normals,
@@ -492,6 +501,30 @@ True Normal, Incoming, Parametric, and Backfacing. Camera Data, Fresnel,
 Layer Weight, Object Info and Texture Coordinate read the synchronized
 camera, object and path data. Mix Shader and Add Shader support diffuse
 Lambert closures sharing the surface normal.
+
+Geometry also provides Tangent, Pointiness and Random Per Island. Attribute,
+Color Attribute, Volume Info, Hair Info, Point Info and Particle Info follow
+the stock attribute lookup. The host mirrors `find_attribute()` for every
+object using a material. It marks an attribute that none of them provide as
+`ATTR_STD_NOT_FOUND` in the packed bytecode, so the shader uses the node's
+Missing inputs. Other attributes get one of up to 16 packed slots. Each slot
+stores a mode and type word and three float4 corners per triangle, converted
+as `attribute_data_fetch()` returns them. Byte colors are converted to the
+working color space. The shader interpolates the corners like
+`triangle_interpolate()` and applies the stock output conversions. Instanced
+triangles need matching per-object values. Particle Info reads Cycles' dummy
+particle and needs objects without particle instancing.
+
+Normal Map supports all spaces, the DirectX convention and both bases. Tangent
+space reads the UV tangent and sign slots and a host-built slot of smooth
+object-space corner normals. Original base needs geometry without undisplaced
+normals. Tangent supports Radial and UV Map. Wireframe supports world-space
+size from host-built triangle positions. Pixel size needs ray differentials
+and uses CPU Cycles. Vector Transform, Wavelength and IES Texture use the
+stock code. The packed header carries the film's XYZ to RGB rows, the CIE
+color matching table and the synchronized IES table. Sky Texture supports
+Preetham, Hosek / Wilkie and both Nishita models in surface materials. The
+Nishita lookup table uses the packed image slots.
 
 The Wasm64 queue probe ran the static BVH2 shader in a Chrome worker and
 matched the native fixture on all 1,138 rays. It also exercised named

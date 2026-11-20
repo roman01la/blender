@@ -9,10 +9,10 @@ import { promisify } from 'node:util';
 
 const args = process.argv.slice(2);
 const experimentModes = ['--bvh2', '--primary', '--surface', '--lit', '--film', '--svm',
-  '--svm-compact', '--subsurface', '--forward-lights'];
+  '--svm-compact', '--svm-core', '--subsurface', '--forward-lights'];
 const mode = experimentModes.includes(args[0]) ? args.shift().slice(2) : 'camera';
 const argCount = { camera: 2, bvh2: 4, primary: 5, surface: 7, lit: 10, film: 1, svm: 2,
-  'svm-compact': 2, subsurface: 2, 'forward-lights': 1 };
+  'svm-compact': 2, 'svm-core': 2, subsurface: 2, 'forward-lights': 1 };
 if (args.length !== argCount[mode] && !(mode === 'film' && args.length === 2)) {
   throw Error(
     'Usage: node verify.mjs camera.wgsl reference.json\n' +
@@ -23,6 +23,7 @@ if (args.length !== argCount[mode] && !(mode === 'film' && args.length === 2)) {
     '       node verify.mjs --film film.wgsl [adaptive-film.wgsl]\n' +
     '       node verify.mjs --svm svm.wgsl svm-reference.json\n' +
     '       node verify.mjs --svm-compact svm-compact.wgsl svm-reference.json\n' +
+    '       node verify.mjs --svm-core svm-compact-core.wgsl svm-reference.json\n' +
     '       node verify.mjs --subsurface subsurface.wgsl subsurface-reference.json\n' +
     '       node verify.mjs --forward-lights shade-background-tree.wgsl',
   );
@@ -109,7 +110,7 @@ if (mode === 'primary' || mode === 'surface' || mode === 'lit') {
   payload.scene = await readFile(args[1], 'base64');
   payload.rays = await readFile(args[2], 'base64');
   payload.expected = await readFile(args[3], 'base64');
-} else if (mode === 'svm' || mode === 'svm-compact') {
+} else if (mode === 'svm' || mode === 'svm-compact' || mode === 'svm-core') {
   payload.svm = JSON.parse(await readFile(args[1], 'utf8'));
 } else if (mode === 'subsurface') {
   payload.subsurface = JSON.parse(await readFile(args[1], 'utf8'));
@@ -306,9 +307,15 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
     return { walksChecked: count, hits, maxAbsoluteError };
   }
 
-  async function svmTest({ bytecode, surfaces, hits, raySlots, pathWords, cameraWords, surfaceMetadata, materials }, compact) {
+  // The core shader leaves extended operations to the full shader. It may
+  // report those lanes as unsupported but must match every lane it evaluates.
+  async function svmTest({ bytecode, surfaces, hits, raySlots, pathWords, cameraWords, surfaceMetadata, materials, tolerances }, compact, core = false) {
     const rayCount = hits.length / 8;
-    const materialWords = 20;
+    // Each lane stores CYCLES_WEBGPU_MATERIAL_VECTORS float4 records.
+    const materialWords = materials.length / Math.max(1, hits.length / 8);
+    if (materialWords !== 24) {
+      throw Error(`SVM fixture has ${materialWords} material words per lane, expected 24`);
+    }
     const withContext = /@binding\(5\)/.test(code);
     const withCamera = /@binding\(6\)/.test(code);
     const withMetadata = /@binding\(7\)/.test(code);
@@ -359,6 +366,7 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
     let roughGlass = 0;
     let unsupported = 0;
     let misses = 0;
+    let extendedOnly = 0;
     for (let i = 0; i < rayCount; ++i) {
       const offset = i * materialWords;
       if (i === omitted) {
@@ -367,9 +375,14 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
         }
         continue;
       }
+      if (core && floats[offset + 3] === 2 && materials[offset + 3] !== 2) {
+        ++extendedOnly;
+        continue;
+      }
       for (let word = 0; word < materialWords; ++word) {
         const error = checkFloat(floats[offset + word], materials[offset + word],
-                                 `SVM material ${i} word ${word}`);
+                                 `SVM material ${i} word ${word}`,
+                                 Math.max(3e-6, tolerances?.[i] ?? 0));
         maxAbsoluteError = Math.max(maxAbsoluteError, error);
       }
       const status = floats[offset + 3];
@@ -394,7 +407,7 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
     return {
       raysChecked: rayCount - (compact ? 1 : 0),
       supported, principledGGX, principledMultiscatterGGX, principledTransmission, roughGlass,
-      unsupported, misses, maxAbsoluteError,
+      unsupported, misses, maxAbsoluteError, ...(core ? { extendedOnly } : {}),
     };
   }
 
@@ -730,8 +743,8 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
   } else if (payload.mode === 'bvh2') {
     result = await bvhTest(decodeWords(payload.scene), decodeWords(payload.rays),
                            decodeWords(payload.expected));
-  } else if (payload.mode === 'svm' || payload.mode === 'svm-compact') {
-    result = await svmTest(payload.svm, payload.mode === 'svm-compact');
+  } else if (payload.mode === 'svm' || payload.mode === 'svm-compact' || payload.mode === 'svm-core') {
+    result = await svmTest(payload.svm, payload.mode !== 'svm', payload.mode === 'svm-core');
   } else if (payload.mode === 'subsurface') {
     result = await subsurfaceTest(payload.subsurface);
   } else if (payload.mode === 'forward-lights') {
@@ -791,6 +804,7 @@ try {
     film: 'CYCLES_WEBGPU_FILM_PASS',
     svm: 'CYCLES_WEBGPU_SVM_PASS',
     'svm-compact': 'CYCLES_WEBGPU_SVM_COMPACT_PASS',
+    'svm-core': 'CYCLES_WEBGPU_SVM_CORE_PASS',
     subsurface: 'CYCLES_WEBGPU_SUBSURFACE_PASS',
     'forward-lights': 'CYCLES_WEBGPU_FORWARD_LIGHTS_PASS',
   };

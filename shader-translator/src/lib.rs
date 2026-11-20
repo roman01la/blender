@@ -112,9 +112,13 @@ fn translate(
     lower_volume_sampling(&mut module);
     declare_builtin_result_types(&mut module);
     // WGSL's pack/unpack2x16float operate on u32 and f32 without the f16 extension.
+    // Clip-region shaders write gl_ClipDistance, which the WGSL writer emits with
+    // `enable clip_distances;` for devices created with the matching feature.
     let info = valid::Validator::new(
         valid::ValidationFlags::all(),
-        valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32 | valid::Capabilities::DUAL_SOURCE_BLENDING,
+        valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32
+            | valid::Capabilities::DUAL_SOURCE_BLENDING
+            | valid::Capabilities::CLIP_DISTANCES,
     )
     .validate(&module)
     .map_err(|error| format!("WebGPU validation failed: {error:?}"))?;
