@@ -81,6 +81,9 @@ EM_JS(void, set_canvas_cursor_grab, (bool enabled), {
 EM_JS(void, set_page_title, (const char *title), {
   Module.ghostBrowserWindow.send("title", UTF8ToString(Number(title)));
 });
+EM_JS(void, set_page_modified, (bool modified), {
+  Module.ghostBrowserWindow.send("projectModified", Boolean(modified));
+});
 EM_JS(int, get_screen_dimension, (bool height), {
   return Module.ghostBrowserWindow.display[height ? 1 : 0];
 });
@@ -258,6 +261,13 @@ class GHOST_WindowWeb final : public GHOST_Window {
   std::string getTitle() const override
   {
     return title_;
+  }
+  GHOST_TSuccess setModifiedState(bool modified) override
+  {
+    if (getModifiedState() != modified) {
+      set_page_modified(modified);
+    }
+    return GHOST_Window::setModifiedState(modified);
   }
   void getWindowBounds(GHOST_Rect &bounds) const override
   {

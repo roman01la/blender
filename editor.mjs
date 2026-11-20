@@ -30,6 +30,11 @@ export function startEditor(assets) {
   const listen = (target, type, handler) =>
     target.addEventListener(type, handler, { signal, passive: false });
 
+  function confirmLeave(event) {
+    event.preventDefault();
+    event.returnValue = true;
+  }
+
   let normalSize;
   let capturedPointer = null;
   let pointerX = 0;
@@ -266,13 +271,24 @@ export function startEditor(assets) {
           }
           break;
         }
-        case "requestBlendFileWrite":
-          requestFilePicker("Allow Blender to Write", "Allow Write Access", async () => (
-            await args[0].requestPermission({ mode: "readwrite" }) === "granted"
-          ));
+        case "requestBlendFileRead":
+        case "requestBlendFileWrite": {
+          const write = type === "requestBlendFileWrite";
+          requestFilePicker(write ? "Allow Blender to Write" : "Allow Blender to Read",
+            write ? "Allow Write Access" : "Allow Read Access", async () => (
+              await args[0].requestPermission({ mode: write ? "readwrite" : "read" }) === "granted"
+            ));
           break;
+        }
         case "title":
           document.title = args[0];
+          break;
+        case "projectModified":
+          if (args[0]) {
+            listen(window, "beforeunload", confirmLeave);
+          } else {
+            window.removeEventListener("beforeunload", confirmLeave);
+          }
           break;
         case "resize":
           canvas.style.width = args[0] + "px";

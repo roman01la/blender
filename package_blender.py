@@ -91,6 +91,9 @@ def package(installation: Path, output: Path, python_process: Path | None = None
         if any(shader.exists() for shader in adaptive_shaders):
             shaders.extend(adaptive_shaders)
             shaders.append(port / "cycles-webgpu" / "adaptive-active-count.wgsl")
+        subsurface = cycles_webgpu.resolve() / "subsurface-compact.wgsl"
+        if subsurface.is_file():
+            shaders.append(subsurface)
         denoise_surface = cycles_webgpu.resolve() / "denoise-surface.wgsl"
         if denoise_surface.exists():
             shaders.append(denoise_surface)
@@ -127,7 +130,8 @@ def package(installation: Path, output: Path, python_process: Path | None = None
         bundle.mkdir()
         for binary in binaries:
             shutil.copyfile(binary, bundle / binary.name)
-        for name in ("editor.mjs", "editor-worker.js", "editor-local-files.js", "favicon.png"):
+        for name in ("editor.mjs", "editor-worker.js", "editor-local-files.js",
+                     "editor-recent-files.js", "favicon.png"):
             shutil.copyfile(port / name, bundle / name)
         if python_process is not None:
             process_dir = bundle / "python-process"

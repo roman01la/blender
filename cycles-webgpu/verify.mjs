@@ -8,9 +8,11 @@ import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 const args = process.argv.slice(2);
-const experimentModes = ['--bvh2', '--primary', '--surface', '--lit', '--film', '--svm', '--svm-compact'];
+const experimentModes = ['--bvh2', '--primary', '--surface', '--lit', '--film', '--svm',
+  '--svm-compact', '--subsurface', '--forward-lights'];
 const mode = experimentModes.includes(args[0]) ? args.shift().slice(2) : 'camera';
-const argCount = { camera: 2, bvh2: 4, primary: 5, surface: 7, lit: 10, film: 1, svm: 2, 'svm-compact': 2 };
+const argCount = { camera: 2, bvh2: 4, primary: 5, surface: 7, lit: 10, film: 1, svm: 2,
+  'svm-compact': 2, subsurface: 2, 'forward-lights': 1 };
 if (args.length !== argCount[mode] && !(mode === 'film' && args.length === 2)) {
   throw Error(
     'Usage: node verify.mjs camera.wgsl reference.json\n' +
@@ -20,7 +22,9 @@ if (args.length !== argCount[mode] && !(mode === 'film' && args.length === 2)) {
     '       node verify.mjs --lit primary-camera.wgsl bvh2.wgsl scene.bin primary-reference.json bvh2-reference surface.wgsl surface.bin direct-light.wgsl direct-light-reference film.wgsl\n' +
     '       node verify.mjs --film film.wgsl [adaptive-film.wgsl]\n' +
     '       node verify.mjs --svm svm.wgsl svm-reference.json\n' +
-    '       node verify.mjs --svm-compact svm-compact.wgsl svm-reference.json',
+    '       node verify.mjs --svm-compact svm-compact.wgsl svm-reference.json\n' +
+    '       node verify.mjs --subsurface subsurface.wgsl subsurface-reference.json\n' +
+    '       node verify.mjs --forward-lights shade-background-tree.wgsl',
   );
 }
 const chromePath = process.env.CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -107,6 +111,8 @@ if (mode === 'primary' || mode === 'surface' || mode === 'lit') {
   payload.expected = await readFile(args[3], 'base64');
 } else if (mode === 'svm' || mode === 'svm-compact') {
   payload.svm = JSON.parse(await readFile(args[1], 'utf8'));
+} else if (mode === 'subsurface') {
+  payload.subsurface = JSON.parse(await readFile(args[1], 'utf8'));
 } else if (mode === 'camera') {
   payload.cases = JSON.parse(await readFile(args[1], 'utf8'));
 }
@@ -227,9 +233,82 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
     return error;
   }
 
+  async function forwardLightsTest() {
+    const descriptor = 12;
+    const lampBase = descriptor + 20;
+    const lights = new Uint32Array(lampBase + 2 * 24);
+    const lightFloats = new Float32Array(lights.buffer);
+    lights[1] = descriptor;
+    lights[descriptor] = 2;
+    lights[descriptor + 1] = lampBase;
+    lights[descriptor + 6] = 0xffffffff;
+    lights[descriptor + 7] = 0xffffffff;
+    lightFloats.set([5, 5, 5], 8);
+    // The farther blue lamp appears first in storage. A single allowed hit must still be red.
+    for (const [index, distance, color] of [[0, 2, [0, 0, 8 * Math.PI]],
+                                           [1, 1, [4 * Math.PI, 0, 0]]]) {
+      const offset = lampBase + index * 24;
+      lights[offset] = 3; // LIGHT_AREA
+      lightFloats.set([0, 0, -distance], offset + 4);
+      lightFloats.set(color, offset + 7);
+      lightFloats.set([1, 0, 0, 2, 0, 1, 0, 2, 0, 0, 1, 0.25], offset + 10);
+      lights[offset + 22] = 0x7f7fffff; // Full spread
+    }
+    const rays = new Uint32Array([1, 0, 0, 0, 0, 0, 0, 0xbf800000, 0x7f7fffff, 1, 0, 0, 0, 1, 0]);
+    const hits = new Uint32Array(8);
+    hits[4] = 0x7f7fffff;
+    const sampling = new Uint32Array(7 + 1024 + 10);
+    sampling[1040] = 1; // Film Transparent
+    const path = new Uint32Array(24);
+    const pathFloats = new Float32Array(path.buffer);
+    pathFloats.set([1, 1, 1, 0, 0, 0, 1]);
+    path[7] = 9; // SHADE_BACKGROUND
+    path[14] = 128 | 512; // MIS_SKIP | TRANSPARENT_BACKGROUND
+
+    for (const [limit, blue, alpha, expectedHits] of [[1, 0, 1, 1], [8, 2, 0, 2]]) {
+      sampling[1039] = lights[descriptor + 19] = limit;
+      const [output] = await dispatch([rays, hits, lights, sampling], [path], 1);
+      const rgba = new Float32Array(output.buffer, 3 * 4, 4);
+      [1, 0, blue, alpha].forEach((value, index) =>
+        checkFloat(rgba[index], value, `Forward lighting limit ${limit}, component ${index}`));
+      if (output[7] !== 0 || output[22] !== expectedHits) {
+        throw Error(`Forward lighting limit ${limit} retired the wrong number of hits`);
+      }
+    }
+    return { bounceLimitsChecked: [1, 8] };
+  }
+
+  async function subsurfaceTest({ scene, surface, sampling, entries, expected }) {
+    const count = entries[0];
+    if (!count || entries.length !== 4 + count * 32 || expected.length !== count * 16) {
+      throw Error('Subsurface fixture has inconsistent records');
+    }
+    const inputs = [scene, surface, sampling, entries].map(words => new Uint32Array(words));
+    const [result] = await dispatch(inputs, [new Uint32Array(expected.length)], Math.ceil(count / 32));
+    const actual = new Float32Array(result.buffer);
+    const reference = new Float32Array(new Uint32Array(expected).buffer);
+    let hits = 0;
+    let maxAbsoluteError = 0;
+    for (let index = 0; index < count; ++index) {
+      const offset = index * 16;
+      hits += result[offset];
+      for (let word = 0; word < 4; ++word) {
+        if (result[offset + word] !== expected[offset + word]) {
+          throw Error(`Subsurface walk ${index} exit word ${word} differs from CPU`);
+        }
+      }
+      for (let word = 4; word < 16; ++word) {
+        const i = offset + word;
+        maxAbsoluteError = Math.max(maxAbsoluteError,
+          checkFloat(actual[i], reference[i], `Subsurface walk ${index} word ${word}`, 3e-5));
+      }
+    }
+    return { walksChecked: count, hits, maxAbsoluteError };
+  }
+
   async function svmTest({ bytecode, surfaces, hits, materials }, compact) {
     const rayCount = surfaces.length / 8;
-    const materialWords = 16;
+    const materialWords = 20;
     if (!Number.isInteger(rayCount) || rayCount === 0 || materials.length !== rayCount * materialWords ||
         hits.length !== surfaces.length) {
       throw Error('SVM fixture has inconsistent surface and material records');
@@ -636,6 +715,10 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
                            decodeWords(payload.expected));
   } else if (payload.mode === 'svm' || payload.mode === 'svm-compact') {
     result = await svmTest(payload.svm, payload.mode === 'svm-compact');
+  } else if (payload.mode === 'subsurface') {
+    result = await subsurfaceTest(payload.subsurface);
+  } else if (payload.mode === 'forward-lights') {
+    result = await forwardLightsTest();
   } else {
     result = await cameraTest(payload.cases);
   }
@@ -691,6 +774,8 @@ try {
     film: 'CYCLES_WEBGPU_FILM_PASS',
     svm: 'CYCLES_WEBGPU_SVM_PASS',
     'svm-compact': 'CYCLES_WEBGPU_SVM_COMPACT_PASS',
+    subsurface: 'CYCLES_WEBGPU_SUBSURFACE_PASS',
+    'forward-lights': 'CYCLES_WEBGPU_FORWARD_LIGHTS_PASS',
   };
   console.log(resultTag[mode], JSON.stringify(result.value));
 } finally {

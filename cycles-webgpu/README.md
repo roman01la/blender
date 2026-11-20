@@ -259,6 +259,7 @@ python3 web/cycles-webgpu/build.py --stock-camera TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --bvh2-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --surface-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-compact TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --subsurface-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --shade-background TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --shade-background --light-tree TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --intersect-shadow TOOLCHAIN_ARGUMENTS
@@ -300,13 +301,22 @@ A black world meets the point-light path's visibility requirements. The
 single rectangular area light path can use an unsampled equirectangular HDRI.
 
 The optional Light Tree shaders use the stock synchronized tree to sample
-normalized zero-radius point lights, one full-spread rectangular area or
-finite-radius point light, and an untransformed equirectangular HDRI with
+normalized point lights, full-spread rectangular area lights, and an
+untransformed equirectangular HDRI with
 opaque surfaces. Enable Light Tree and choose Auto or Manual World sampling
 to use Cycles' world importance map. The shader uses the stock world-map CDF
 and applies the Light Tree selection PDF to direct lighting, forward light
-hits, and background misses. The supported world map uses no portals or
+hits, and background misses. Forward hits are evaluated nearest first up to
+the transparent bounce limit. The supported world map uses no portals or
 separate sun sampling.
+
+The `--subsurface-compact` shader adds Cycles' Random Walk, Skin, and Legacy
+methods to the editor's stock wavefront scheduler. It supports opaque
+Principled materials and the Subsurface Scattering node with uniform
+subsurface controls and three positive radii on static triangle meshes.
+The standalone `--subsurface` build can be compared with
+the native kernel using
+`verify.mjs --subsurface subsurface.wgsl subsurface-reference.json`.
 
 ### Cycles denoising
 
@@ -411,8 +421,8 @@ Specular and metallic Principled support both **GGX** and the default
 supported scene with its default socket values. For variations, use an opaque,
 isotropic material with non-delta roughness and a constant Metallic, IOR,
 Specular IOR Level, and Specular Tint. Base Color may be constant or
-image-textured. Leave Diffuse Roughness, transmission, subsurface, coat,
-sheen, emission strength, and thin-film thickness at zero for an opaque
+image-textured. Leave Diffuse Roughness, transmission, coat, sheen,
+emission strength, and thin-film thickness at zero for an opaque
 reflective material. Delta reflection and unsupported layers use CPU Cycles.
 Multiscatter calls Cycles'
 `microfacet_ggx_preserve_energy()` with its directional and average energy

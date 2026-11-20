@@ -3367,10 +3367,18 @@ index 4e8e2e38..883d2edd 100644
  void DRW_module_exit();
  
 diff --git a/source/blender/draw/engines/eevee/eevee_film.cc b/source/blender/draw/engines/eevee/eevee_film.cc
-index d164a1c7..77dba112 100644
+index d164a1c..ba05949 100644
 --- a/source/blender/draw/engines/eevee/eevee_film.cc
 +++ b/source/blender/draw/engines/eevee/eevee_film.cc
-@@ -687,12 +687,12 @@ void Film::init_pass(PassSimple &pass, gpu::Shader *sh)
+@@ -19,6 +19,7 @@
+ #include "BKE_compositor.hh"
+ #include "BKE_scene.hh"
+
++#include "GPU_context.hh"
+ #include "GPU_framebuffer.hh"
+ #include "GPU_texture.hh"
+
+@@ -687,12 +688,12 @@ void Film::init_pass(PassSimple &pass, gpu::Shader *sh)
    VelocityModule &velocity = inst_.velocity;
  
    pass.specialize_constant(sh, "enabled_categories", uint(enabled_categories_));
@@ -3388,6 +3396,22 @@ index d164a1c7..77dba112 100644
    pass.state_set(DRW_STATE_WRITE_COLOR | DRW_STATE_WRITE_DEPTH | DRW_STATE_DEPTH_ALWAYS);
    pass.shader_set(sh);
    /* For viewport, only previous motion is supported.
+@@ -729,6 +730,15 @@ void Film::end_sync()
+ {
+   use_reprojection_ = inst_.sampling.interactive_mode() && !inst_.camera.is_panoramic();
+
++  /* Skip temporal reuse on a changed WebGPU view. Old film samples can remain
++   * visible at the previous screen positions during viewport navigation. */
++  if (inst_.is_viewport() && GPU_backend_get_type() == GPU_BACKEND_WEBGPU &&
++      inst_.velocity.camera_has_motion())
++  {
++    use_reprojection_ = false;
++    data_.use_history = false;
++  }
++
+   /* Just bypass the reprojection and reset the accumulation. */
+   if (inst_.is_viewport() && !use_reprojection_ && inst_.sampling.is_reset()) {
+     use_reprojection_ = false;
 diff --git a/source/blender/draw/engines/eevee/eevee_instance.cc b/source/blender/draw/engines/eevee/eevee_instance.cc
 index bb009b7e..66285121 100644
 --- a/source/blender/draw/engines/eevee/eevee_instance.cc
@@ -9996,7 +10020,7 @@ index 82960da8..a4cc54b1 100644
  
          /* XXX check this carefully, `CTX_wm_manager(C) == wm` is a bit hackish. */
 diff --git a/source/blender/windowmanager/intern/wm_files.cc b/source/blender/windowmanager/intern/wm_files.cc
-index c8a43637..dc543707 100644
+index c8a4363..ff6807b 100644
 --- a/source/blender/windowmanager/intern/wm_files.cc
 +++ b/source/blender/windowmanager/intern/wm_files.cc
 @@ -15,6 +15,10 @@
@@ -10010,7 +10034,69 @@ index c8a43637..dc543707 100644
  #ifdef WIN32
  /* Need to include windows.h so _WIN32_IE is defined. */
  #  include <windows.h>
-@@ -1949,13 +1953,19 @@ static ImBuf *blend_file_thumb_from_screenshot(bContext *C, BlendThumbnail **r_t
+@@ -1633,9 +1637,41 @@ void wm_homefile_read_post(bContext *C, const wmFileReadPost_Params *params_file
+ /** \name Blend-File History API
+  * \{ */
+
++#ifdef __EMSCRIPTEN__
++// clang-format off
++EM_JS(void, wm_web_restore_recent_files, (const char *filepath), {
++  try {
++    Module.ghostBrowserWindow?.restoreRecentFiles(FS, UTF8ToString(Number(filepath)));
++  } catch (error) {
++    console.warn("Could not restore Blender's recent files:", error);
++  }
++});
++
++EM_ASYNC_JS(void, wm_web_save_recent_files, (const char *filepath), {
++  const bridge = Module.ghostBrowserWindow;
++  if (!bridge) return;
++  try {
++    const history = FS.readFile(UTF8ToString(Number(filepath)), { encoding: "utf8" });
++    await bridge.saveRecentFiles(history, Module.blenderOpeningFile);
++  } catch (error) {
++    console.warn("Could not save Blender's recent files:", error);
++  }
++});
++
++EM_JS(bool, wm_web_has_recent_file, (const char *filepath), {
++  return Boolean(Module.ghostBrowserWindow?.hasRecentFile(UTF8ToString(Number(filepath))));
++});
++// clang-format on
++#endif
++
+ void wm_history_file_read()
+ {
++#ifdef __EMSCRIPTEN__
++  const std::optional<std::string> cfgdir = BKE_appdir_folder_id_create(BLENDER_USER_CONFIG,
++                                                                       nullptr);
++#else
+   const std::optional<std::string> cfgdir = BKE_appdir_folder_id(BLENDER_USER_CONFIG, nullptr);
++#endif
+   if (!cfgdir.has_value()) {
+     return;
+   }
+@@ -1646,6 +1682,9 @@ void wm_history_file_read()
+
+   BLI_path_join(filepath, cfgdir->c_str(), BLENDER_HISTORY_FILE);
+
++#ifdef __EMSCRIPTEN__
++  wm_web_restore_recent_files(filepath);
++#endif
+   LinkNode *lines = BLI_file_read_as_lines(filepath);
+
+   wm_history_files_free();
+@@ -1716,6 +1755,9 @@ static void wm_history_file_write()
+       fprintf(fp, "%s\n", recent.filepath);
+     }
+     fclose(fp);
++#ifdef __EMSCRIPTEN__
++    wm_web_save_recent_files(filepath);
++#endif
+   }
+ }
+
+@@ -1949,13 +1991,19 @@ static ImBuf *blend_file_thumb_from_screenshot(bContext *C, BlendThumbnail **r_t
      win = win->parent;
    }
  
@@ -10032,7 +10118,7 @@ index c8a43637..dc543707 100644
      const int2 thumb_size_2x = blend_file_thumb_clamp_size(win_size, BLEN_THUMB_SIZE * 2);
      const int2 thumb_size = blend_file_thumb_clamp_size(win_size, BLEN_THUMB_SIZE);
  
-@@ -2178,6 +2188,69 @@ static bool wm_file_write_check_with_report_on_failure(Main *bmain,
+@@ -2178,6 +2226,69 @@ static bool wm_file_write_check_with_report_on_failure(Main *bmain,
    return true;
  }
  
@@ -10056,7 +10142,7 @@ index c8a43637..dc543707 100644
 +    } else {
 +      handle = await bridge.chooseBlendSaveFile(path.slice(path.lastIndexOf("/") + 1));
 +      if (!handle) return 0;
-+      path = bridge.createBlendPath(handle.name, capacity);
++      path = await bridge.createBlendPath(handle.name, capacity, handle);
 +      stringToUTF8(path, Number(filepath), capacity);
 +    }
 +    Module.blenderSavingFile = { path, handle };
@@ -10089,7 +10175,7 @@ index c8a43637..dc543707 100644
 +  }
 +  try {
 +    await bridge.writeBlendFile(handle, readChunks());
-+    if (!save_as_copy) bridge.setBlendFileHandle(path, handle);
++    if (!save_as_copy) bridge.rememberBlendFile(path, handle);
 +    return true;
 +  } catch (error) {
 +    console.error("Unable to write the local Blender project:", error);
@@ -10102,7 +10188,7 @@ index c8a43637..dc543707 100644
  /**
   * \see #wm_homefile_write_exec wraps #BLO_write_file in a similar way.
   */
-@@ -2304,7 +2377,16 @@ static bool wm_file_write(bContext *C,
+@@ -2304,7 +2415,16 @@ static bool wm_file_write(bContext *C,
    blend_write_params.use_save_as_copy = use_save_as_copy;
    blend_write_params.thumb = thumb;
  
@@ -10120,7 +10206,7 @@ index c8a43637..dc543707 100644
  
    if (success) {
      if (use_save_as_copy == false) {
-@@ -2313,6 +2395,7 @@ static bool wm_file_write(bContext *C,
+@@ -2313,6 +2433,7 @@ static bool wm_file_write(bContext *C,
  
      SET_FLAG_FROM_TEST(G.fileflags, fileflags & G_FILE_COMPRESS, G_FILE_COMPRESS);
  
@@ -10128,7 +10214,7 @@ index c8a43637..dc543707 100644
      /* Run this function after because the file can't be written before the blend is. */
      if (ibuf_thumb) {
        IMB_thumb_delete(filepath, THB_FAIL); /* Without this a failed thumb overrides. */
-@@ -2324,6 +2407,7 @@ static bool wm_file_write(bContext *C,
+@@ -2324,6 +2445,7 @@ static bool wm_file_write(bContext *C,
          ibuf_thumb = saved_ibuf_thumb;
        }
      }
@@ -10136,48 +10222,50 @@ index c8a43637..dc543707 100644
    }
  
    BKE_callback_exec_string(
-@@ -3342,13 +3426,53 @@ static wmOperatorStatus wm_open_mainfile__discard_changes_exec(bContext *C, wmOp
+@@ -3342,13 +3464,55 @@ static wmOperatorStatus wm_open_mainfile__discard_changes_exec(bContext *C, wmOp
    return wm_open_mainfile_dispatch(C, op);
  }
  
 +#ifdef __EMSCRIPTEN__
 +// clang-format off
 +EM_ASYNC_JS(int, wm_web_select_blend_file, (char *filepath, int capacity), {
-+  let directory;
 +  let path;
 +  try {
-+    const selection = await Module.ghostBrowserWindow.chooseBlendFile();
++    const bridge = Module.ghostBrowserWindow;
++    const selection = await bridge.chooseBlendFile();
 +    if (!selection) return 0;
 +    const { file, handle } = selection;
-+    path = Module.ghostBrowserWindow.createBlendPath(file.name, capacity);
-+    directory = path.slice(0, path.lastIndexOf("/"));
-+    const bytes = new Uint8Array(await file.arrayBuffer());
-+    const stream = FS.open(path, "w");
-+    try {
-+      FS.write(stream, bytes, 0, bytes.byteLength, 0, true);
-+    } finally {
-+      FS.close(stream);
-+    }
++    path = await bridge.createBlendPath(file.name, capacity, handle);
++    bridge.addBlendFile(FS, path, file);
 +    stringToUTF8(path, Number(filepath), capacity);
-+    Module.blenderOpeningFileHandle = handle;
++    Module.blenderOpeningFile = { path, handle, file };
 +    return 1;
 +  } catch (error) {
 +    if (path && FS.analyzePath(path).exists) FS.unlink(path);
-+    if (directory && FS.analyzePath(directory).exists) FS.rmdir(directory);
 +    console.error("Unable to read the selected Blender file:", error);
 +    return -1;
 +  }
 +});
 +
-+EM_JS(void, wm_web_finish_opening_blend_file, (const char *filepath, bool success), {
-+  const path = UTF8ToString(Number(filepath));
-+  const handle = Module.blenderOpeningFileHandle;
-+  Module.blenderOpeningFileHandle = null;
++EM_JS(void, wm_web_finish_opening_blend_file, (bool success), {
++  const { path, handle, file } = Module.blenderOpeningFile;
++  Module.blenderOpeningFile = null;
 +  if (success) {
-+    if (handle) Module.ghostBrowserWindow.setBlendFileHandle(path, handle);
++    Module.ghostBrowserWindow.rememberBlendFile(path, handle, file);
 +  } else {
 +    if (FS.analyzePath(path).exists) FS.unlink(path);
-+    FS.rmdir(path.slice(0, path.lastIndexOf("/")));
++  }
++});
++
++EM_ASYNC_JS(int, wm_web_prepare_recent_open, (const char *filepath), {
++  const path = UTF8ToString(Number(filepath));
++  const bridge = Module.ghostBrowserWindow;
++  if (!bridge || Module.blenderOpeningFile?.path === path || !bridge.hasRecentFile(path)) return 1;
++  try {
++    return await bridge.reopenRecentFile(FS, path) ? 1 : 0;
++  } catch (error) {
++    console.error("Unable to reopen the local Blender project:", error);
++    return -1;
 +  }
 +});
 +// clang-format on
@@ -10193,7 +10281,7 @@ index c8a43637..dc543707 100644
    if (CTX_wm_window(C) == nullptr) {
      /* In rare cases this could happen, when trying to invoke in background
       * mode on load for example. Don't use poll for this because exec()
-@@ -3357,6 +3481,27 @@ static wmOperatorStatus wm_open_mainfile__select_file_path_exec(bContext *C, wmO
+@@ -3357,6 +3521,27 @@ static wmOperatorStatus wm_open_mainfile__select_file_path_exec(bContext *C, wmO
      return OPERATOR_CANCELLED;
    }
  
@@ -10212,7 +10300,7 @@ index c8a43637..dc543707 100644
 +  const bool use_scripts_autoexec_check = wm_open_init_use_scripts(op, OpenTrust::FilePath);
 +  UNUSED_VARS(use_scripts_autoexec_check); /* The selected file uses the user's trust preferences. */
 +  const wmOperatorStatus result = wm_open_mainfile_dispatch(C, op);
-+  wm_web_finish_opening_blend_file(selected_filepath, result == OPERATOR_FINISHED);
++  wm_web_finish_opening_blend_file(result == OPERATOR_FINISHED);
 +  return result;
 +#else
 +  Main *bmain = CTX_data_main(C);
@@ -10221,7 +10309,7 @@ index c8a43637..dc543707 100644
    /* If possible, get the name of the most recently used `.blend` file. */
    const std::string recent_filepath = wm_recent_filepath_get(bmain);
    if (!recent_filepath.empty()) {
-@@ -3372,6 +3517,7 @@ static wmOperatorStatus wm_open_mainfile__select_file_path_exec(bContext *C, wmO
+@@ -3372,6 +3557,7 @@ static wmOperatorStatus wm_open_mainfile__select_file_path_exec(bContext *C, wmO
    WM_event_add_fileselect(C, op);
  
    return OPERATOR_RUNNING_MODAL;
@@ -10229,7 +10317,26 @@ index c8a43637..dc543707 100644
  }
  
  static wmOperatorStatus wm_open_mainfile__open(bContext *C, wmOperator *op)
-@@ -4067,6 +4213,8 @@ static void save_set_filepath(bContext *C, wmOperator *op)
+@@ -3382,6 +3568,18 @@ static wmOperatorStatus wm_open_mainfile__open(bContext *C, wmOperator *op)
+   RNA_string_get(op->ptr, "filepath", filepath);
+   BLI_path_canonicalize_native(filepath);
+
++#ifdef __EMSCRIPTEN__
++  if (wm_web_has_recent_file(filepath)) {
++    const int status = wm_web_prepare_recent_open(filepath);
++    if (status <= 0) {
++      if (status < 0) {
++        BKE_report(op->reports, RPT_ERROR, "Unable to reopen the local Blender project");
++      }
++      return OPERATOR_CANCELLED;
++    }
++  }
++#endif
++
+   /* For file opening, also print in console for warnings, not only errors. */
+   BKE_report_print_level_set(op->reports, RPT_WARNING);
+
+@@ -4067,6 +4265,8 @@ static void save_set_filepath(bContext *C, wmOperator *op)
    }
  }
  
@@ -10238,7 +10345,7 @@ index c8a43637..dc543707 100644
  static wmOperatorStatus wm_save_as_mainfile_invoke(bContext *C,
                                                     wmOperator *op,
                                                     const wmEvent * /*event*/)
-@@ -4090,9 +4238,12 @@ static wmOperatorStatus wm_save_as_mainfile_invoke(bContext *C,
+@@ -4090,9 +4290,12 @@ static wmOperatorStatus wm_save_as_mainfile_invoke(bContext *C,
      RNA_property_boolean_set(op->ptr, prop, (U.flag & USER_RELPATHS));
    }
  
@@ -10252,7 +10359,7 @@ index c8a43637..dc543707 100644
  }
  
  /* Function used for #WM_OT_save_mainfile too. */
-@@ -4175,6 +4326,20 @@ static wmOperatorStatus wm_save_as_mainfile_exec(bContext *C, wmOperator *op)
+@@ -4175,6 +4378,20 @@ static wmOperatorStatus wm_save_as_mainfile_exec(bContext *C, wmOperator *op)
      }
    }
  
@@ -10273,7 +10380,7 @@ index c8a43637..dc543707 100644
    const int fileflags_orig = G.fileflags;
    int fileflags = G.fileflags;
  
-@@ -4366,8 +4531,12 @@ static wmOperatorStatus wm_save_mainfile_invoke(bContext *C,
+@@ -4366,8 +4583,12 @@ static wmOperatorStatus wm_save_mainfile_invoke(bContext *C,
      }
    }
    else {
@@ -10286,6 +10393,19 @@ index c8a43637..dc543707 100644
    }
  
    return ret;
+@@ -4463,7 +4684,11 @@ static wmOperatorStatus wm_clear_recent_files_exec(bContext * /*C*/, wmOperator
+   }
+   else if (include == CLEAR_RECENT_MISSING) {
+     for (RecentFile &recent : G.recent_files.items_mutable()) {
+-      if (!BLI_exists(recent.filepath)) {
++      if (!BLI_exists(recent.filepath)
++#ifdef __EMSCRIPTEN__
++          && !wm_web_has_recent_file(recent.filepath)
++#endif
++      ) {
+         wm_history_file_free(&recent);
+       }
+     }
 diff --git a/source/blender/windowmanager/intern/wm_init_exit.cc b/source/blender/windowmanager/intern/wm_init_exit.cc
 index 7cc31bad..53a89d66 100644
 --- a/source/blender/windowmanager/intern/wm_init_exit.cc

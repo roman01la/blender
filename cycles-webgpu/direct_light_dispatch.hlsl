@@ -69,7 +69,8 @@ void main(uint3 id : SV_DispatchThreadID)
   const uint pixel_base = path_base + CYCLES_WEBGPU_PATH_PIXEL;
   const uint4 sampling = uint4(ray_words[ray_base + CYCLES_WEBGPU_RAY_RNG_PIXEL],
                                path_words[pixel_base + 2],
-                               path_words[path_base + CYCLES_WEBGPU_PATH_SURFACE_RR], 0);
+                               path_words[path_base + CYCLES_WEBGPU_PATH_SURFACE_RR],
+                               path_words[path_base + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE]);
   const uint normal_base = 8 * ray_words[0] + base;
   const uint4 geometric = uint4(surface_words[normal_base], surface_words[normal_base + 1],
                                  surface_words[normal_base + 2], surface_words[normal_base + 3]);
@@ -90,13 +91,17 @@ void main(uint3 id : SV_DispatchThreadID)
   const uint4 mis_origin_normal = uint4(path_words[mis_normal_word],
                                        path_words[mis_normal_word + 1],
                                        path_words[mis_normal_word + 2], 0);
+  const uint weight = path_base + CYCLES_WEBGPU_PATH_THROUGHPUT;
+  const float4 throughput = __builtin_bit_cast(
+      float4, uint4(path_words[weight], path_words[weight + 1], path_words[weight + 2], 0));
 #endif
   cycles_wavefront_light(position, normal, spec_normal, geometric, shadow_along, shadow_opposite,
                          closest, ray, origin, path, sampling,
+                         path_words[path_base + CYCLES_WEBGPU_PATH_SUBSURFACE_STEPS],
                          materials[material], materials[material + 1], materials[material + 2],
                          materials[material + 3], result, area_result
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
-                         , mis_origin_normal
+                         , mis_origin_normal, throughput
 #endif
 #ifdef CYCLES_WEBGPU_DEFER_SHADOW
                          , shadow_origin, shadow_direction, shadow_options

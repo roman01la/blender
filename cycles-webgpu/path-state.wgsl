@@ -19,7 +19,7 @@ struct RenderBuffer {
 @group(0) @binding(6) var<storage, read_write> denoising: array<vec4<f32>>;
 
 // Keep the slot layout in sync with path_state_layout.h.
-const path_words = 23u;
+const path_words = 24u;
 const path_throughput = 0u;
 const path_radiance = 3u;
 const path_queued_kernel = 7u;

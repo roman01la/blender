@@ -132,7 +132,8 @@ constexpr DeviceKernel reflection_update_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE
 constexpr DeviceKernel accumulate_kernel = DEVICE_KERNEL_FILM_CONVERT_COMBINED;
 constexpr DeviceKernel adaptive_accumulate_kernel = DEVICE_KERNEL_FILM_CONVERT_SAMPLE_COUNT;
 constexpr DeviceKernel adaptive_count_kernel = DEVICE_KERNEL_PREFIX_SUM;
-constexpr DeviceKernel guided_init_kernel = DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE;
+constexpr DeviceKernel guided_init_kernel = DEVICE_KERNEL_INTEGRATOR_SORT_BUCKET_PASS;
+constexpr DeviceKernel subsurface_kernel = DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE;
 constexpr DeviceKernel denoising_surface_kernel = DEVICE_KERNEL_FILM_CONVERT_FLOAT3;
 constexpr DeviceKernel guided_background_kernel = DEVICE_KERNEL_FILM_CONVERT_RGBE;
 constexpr DeviceKernel guided_tree_background_kernel = DEVICE_KERNEL_FILM_CONVERT_FLOAT4;
@@ -140,7 +141,11 @@ constexpr DeviceKernel guided_accumulate_kernel = DEVICE_KERNEL_FILM_CONVERT_MOT
 
 static_assert(DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST + 1 == 3);
 static_assert(DEVICE_KERNEL_INTEGRATOR_SHADE_BACKGROUND + 1 == 9);
-static_assert(DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE + 1 == 12);
+static_assert(DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE + 1 == CYCLES_WEBGPU_PATH_SHADE_SURFACE);
+static_assert(subsurface_kernel + 1 == CYCLES_WEBGPU_PATH_INTERSECT_SUBSURFACE);
+static_assert(PRNG_BOUNCE_NUM == CYCLES_WEBGPU_PRNG_BOUNCE_NUM);
+static_assert(PATH_RAY_VISIBILITY_CAMERA == CYCLES_WEBGPU_CAMERA_VISIBILITY);
+static_assert(PATH_RAY_SUBSURFACE_RANDOM_WALK == CYCLES_WEBGPU_PATH_SUBSURFACE_RANDOM_WALK);
 
 constexpr auto storage = WebGPUKernelBinding::Type::Storage;
 constexpr auto read_only = WebGPUKernelBinding::Type::ReadOnlyStorage;
@@ -199,6 +204,10 @@ constexpr WebGPUKernelBinding path_update_bindings[] = {
     {4, storage, 28},
     {5, storage, material_bytes},
     {6, storage, 16},
+    {7, storage, CYCLES_WEBGPU_PATH_WORDS * sizeof(uint32_t)}};
+constexpr WebGPUKernelBinding subsurface_bindings[] = {
+    {0, storage, 40}, {1, storage, 32}, {2, storage, 28}, {3, storage, 32},
+    {4, storage, material_bytes}, {5, storage, 32}, {6, storage, 52},
     {7, storage, CYCLES_WEBGPU_PATH_WORDS * sizeof(uint32_t)}};
 constexpr WebGPUKernelBinding accumulate_bindings[] = {
     {3, storage, 16},
@@ -263,10 +272,10 @@ bool valid_light_tree(const std::span<const uint32_t> light, const size_t prefix
   const uint64_t tex_h = tree[CYCLES_WEBGPU_TREE_WORLD_HEIGHT];
   const uint32_t world_lamp = tree[CYCLES_WEBGPU_TREE_WORLD_LAMP];
   const uint32_t world_emitter = tree[CYCLES_WEBGPU_TREE_WORLD_EMITTER];
-  const uint32_t area_lamp = tree[CYCLES_WEBGPU_TREE_AREA_LAMP];
+  const uint32_t forward_lamp = tree[CYCLES_WEBGPU_TREE_FIRST_FORWARD_LAMP];
   const bool sampled_world = world_lamp != CYCLES_WEBGPU_TREE_NO_LAMP;
   if (lamps == 0 || nodes == 0 || emitters != lamps ||
-      (area_lamp != CYCLES_WEBGPU_TREE_NO_LAMP && area_lamp >= lamps) ||
+      (forward_lamp != CYCLES_WEBGPU_TREE_NO_LAMP && forward_lamp >= lamps) ||
       (sampled_world ? world_lamp >= lamps || world_emitter >= emitters || !map_w || !map_h :
                        world_emitter != CYCLES_WEBGPU_TREE_NO_LAMP || map_w || map_h) ||
       std::max({map_w, map_h, tex_w, tex_h}) > light.size())
@@ -344,6 +353,7 @@ struct WebGPURenderPipeline::Impl {
   bool adaptive_loaded = false;
   bool guided = false;
   bool guided_loaded = false;
+  bool subsurface_loaded = false;
   bool guided_background_loaded = false;
   bool guided_tree_background_loaded = false;
   uint32_t sampling_pattern = 0;
@@ -646,7 +656,8 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
                                         std::span<const uint32_t> surface,
                                         std::span<const uint32_t> light,
                                         std::span<const uint32_t> svm,
-                                        std::span<const uint32_t> sampling)
+                                        std::span<const uint32_t> sampling,
+                                        bool has_subsurface)
 {
   Impl &p = *impl_;
   p.error.clear();
@@ -657,7 +668,14 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
       light.size() > max_scene_words - scene.size() - surface.size() ||
       svm.size() > max_scene_words - scene.size() - surface.size() - light.size())
   {
-    return p.fail("Cycles WebGPU preview scene exceeds 32 MiB");
+    return p.fail("Cycles WebGPU scene exceeds the packing budget");
+  }
+  const size_t binding_words = device_webgpu_compute_limits(p.device).storage_buffer_bytes /
+                               sizeof(uint32_t);
+  if (std::max({scene.size(), surface.size(), light.size(), svm.size(), sampling.size()}) >
+      binding_words)
+  {
+    return p.fail("Cycles WebGPU scene buffer exceeds the adapter's storage binding limit");
   }
   constexpr size_t light_header = CYCLES_WEBGPU_LIGHT_HEADER_WORDS;
   constexpr size_t reflective_lighting_words = light_header + CYCLES_WEBGPU_GGX_LOOKUP_WORDS;
@@ -733,6 +751,14 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
   const LightSampling mode = light_tree ? LightSampling::Tree :
                                point_distribution ? LightSampling::PointDistribution :
                                                     LightSampling::Legacy;
+  if (has_subsurface && !p.subsurface_loaded) {
+    const auto shader = p.load_shader("subsurface-compact.wgsl");
+    p.subsurface_loaded = !shader.empty() &&
+                          p.register_kernel(subsurface_kernel, shader, subsurface_bindings);
+    if (!p.subsurface_loaded) {
+      return p.fail("Cycles WebGPU could not load the Random Walk subsurface kernel");
+    }
+  }
   if (!p.prepare_shading(light_prefix == glass_lighting_words, mode)) {
     return false;
   }
@@ -1000,7 +1026,7 @@ bool WebGPURenderPipeline::enqueue_stage(const DeviceKernel stage)
   }
   if (stage != DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST &&
       stage != DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE &&
-      stage != DEVICE_KERNEL_INTEGRATOR_SHADE_BACKGROUND)
+      stage != DEVICE_KERNEL_INTEGRATOR_SHADE_BACKGROUND && stage != subsurface_kernel)
   {
     return p.fail("Cycles WebGPU received an unsupported scheduler stage");
   }
@@ -1028,6 +1054,15 @@ bool WebGPURenderPipeline::enqueue_stage(const DeviceKernel stage)
                                    p.adaptive_sampling ? adaptive_accumulate_kernel :
                                                          accumulate_kernel;
   const WebGPUDispatch accumulate{film_kernel, film, count};
+  if (stage == subsurface_kernel) {
+    const auto walk = p.bind(p.scene.bvh, p.scene.surface, p.sampling, p.points, p.materials,
+                             p.hits, p.rays, paths);
+    const WebGPUDispatch stages[] = {{subsurface_kernel, walk, count}, accumulate};
+    if (!p.wavefront_queue.enqueue_stage(stage, capacity, p.rays, paths, stages)) {
+      return p.fail("Cycles WebGPU subsurface dispatch failed");
+    }
+    return true;
+  }
   if (stage == DEVICE_KERNEL_INTEGRATOR_SHADE_BACKGROUND &&
       (p.background_loaded || p.active_background_kernel == tree_background_kernel))
   {

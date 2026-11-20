@@ -31,6 +31,8 @@ struct SvmReferenceGlobals {
   const KernelTileDescriptor *image_texture_tile_descriptors;
   uchar *image_texture_tile_access_state;
   const KernelImageInfo *image_info;
+  const uint *svm_nodes;
+  const float *lookup_table;
 };
 using KernelGlobals = const SvmReferenceGlobals *;
 }  // namespace ccl
@@ -39,6 +41,7 @@ using KernelGlobals = const SvmReferenceGlobals *;
 #define kernel_data (kg->data)
 #define kernel_data_fetch(name, index) (kg->name[index])
 #define kernel_data_array(name) (kg->name)
+#include "kernel/svm/voronoi.h"
 #include "kernel/util/image.h"
 #undef kernel_data_array
 #undef kernel_data_fetch
@@ -54,7 +57,8 @@ void cycles_svm_material(unsigned int shader,
                          Float4 &base,
                          Float4 &specular,
                          Float4 &layers,
-                         Float4 &transmission);
+                         Float4 &transmission,
+                         Float4 &subsurface);
 
 namespace {
 
@@ -80,7 +84,8 @@ constexpr unsigned int first_ggx_shader = first_principled_shader + 4;
 constexpr unsigned int first_multiscatter_shader = first_ggx_shader + 6;
 constexpr unsigned int first_transmission_shader = first_multiscatter_shader + 4;
 constexpr unsigned int first_glass_shader = first_transmission_shader + 6;
-constexpr unsigned int shader_count = first_glass_shader + 4;
+constexpr unsigned int procedural_shader = first_glass_shader + 4;
+constexpr unsigned int shader_count = procedural_shader + 1;
 constexpr unsigned int header_words = 2;
 constexpr unsigned int jump_words = 1 + sizeof(SVMNodeShaderJump) / sizeof(unsigned int);
 std::vector<unsigned int> bytecode(header_words + shader_count * jump_words, 0);
@@ -348,6 +353,30 @@ int main()
   push_shader(first_glass_shader + 3, [] {
     push_glass(CLOSURE_BSDF_MICROFACET_BECKMANN_GLASS_ID, 0.4f);
   });
+  constexpr float scale = 14.25f;
+  const std::array generated{make_float3(-0.3f, 0.8f, 0.1f),
+                             make_float3(0.5f, 0.2f, 0.4f),
+                             make_float3(0.3f, 0.8f, 0.1f)};
+  push_shader(procedural_shader, [=] {
+    push_node(NODE_ATTR,
+              SVMNodeAttr{.attr = ATTR_STD_GENERATED,
+                          .out_offset = 0,
+                          .output_type = NODE_ATTR_OUTPUT_FLOAT3});
+    push_node(NODE_TEX_VORONOI,
+              SVMNodeTexVoronoi{.dimensions = 3,
+                                .feature = NODE_VORONOI_F1,
+                                .metric = NODE_VORONOI_EUCLIDEAN,
+                                .scale = {std::bit_cast<uint>(scale)},
+                                .randomness = {std::bit_cast<uint>(1.0f)},
+                                .coord = 0,
+                                .distance_offset = SVM_STACK_INVALID,
+                                .color_offset = 6,
+                                .position_offset = SVM_STACK_INVALID,
+                                .w_out_offset = SVM_STACK_INVALID,
+                                .radius_offset = SVM_STACK_INVALID});
+    push_node(NODE_CLOSURE_WEIGHT, SVMNodeClosureWeight{.weight_offset = 6});
+    push_diffuse();
+  });
   bytecode[0] = bytecode.size() - header_words;
   bytecode[1] = shader_count;
   const std::array triangle_uv{0.0f, 0.0f, 2.0f, 0.0f, 0.0f, 2.0f,
@@ -375,15 +404,25 @@ int main()
       Image{5, EXTENSION_EXTEND, INTERPOLATION_LINEAR, true},
       Image{6, EXTENSION_REPEAT, INTERPOLATION_CLOSEST, true},
   };
-  bytecode.insert(bytecode.end(), {2, unsigned(images.size())});
+  constexpr unsigned int image_slots = 23;
+  constexpr unsigned int image_words = 5;
+  bytecode.insert(bytecode.end(), {2, image_slots, 1, 0, 0, 0});
   for (float uv : triangle_uv) {
     bytecode.push_back(std::bit_cast<unsigned>(uv));
   }
-  const auto float_offset = unsigned(bytecode.size() + 6 * images.size());
+  for (const float3 value : generated) {
+    bytecode.insert(bytecode.end(), {std::bit_cast<uint>(value.x),
+                                     std::bit_cast<uint>(value.y),
+                                     std::bit_cast<uint>(value.z)});
+  }
+  const size_t image_table = bytecode.size();
+  bytecode.resize(image_table + image_words * image_slots);
+  const auto float_offset = unsigned(bytecode.size());
   const auto byte_offset = float_offset + 3 * float_pixels.size();
   for (const auto &image : images) {
-    bytecode.insert(bytecode.end(), {unsigned(image.id), 2, 2, image.extension, image.interpolation,
-                                     image.is_byte ? unsigned(byte_offset) : float_offset});
+    const std::array record{2u, 2u, image.extension, image.interpolation,
+                            image.is_byte ? unsigned(byte_offset) : float_offset};
+    std::copy(record.begin(), record.end(), bytecode.begin() + image_table + image_words * image.id);
   }
   const auto push_pixel = [](const float3 rgb) {
     bytecode.insert(bytecode.end(), {std::bit_cast<unsigned>(rgb.x),
@@ -439,12 +478,12 @@ int main()
     surface_words.insert(surface_words.end(), {0, 0, 0, surface, 0, 0, 0, shader});
     std::array<Float4, CYCLES_WEBGPU_MATERIAL_VECTORS> result{};
     if (surface == 1 || surface == 2) {
-      cycles_svm_material(shader, primitive, u, v, result[0], result[1], result[2], result[3]);
+      cycles_svm_material(shader, primitive, u, v, result[0], result[1], result[2], result[3], result[4]);
     }
     else if (surface != 0) {
       result[0].w = 2;
     }
-    const std::array expected_material{expected, specular, layers, transmission};
+    const std::array expected_material{expected, specular, layers, transmission, MaterialVector{}};
     for (int entry = 0; entry < CYCLES_WEBGPU_MATERIAL_VECTORS; ++entry) {
       for (int channel = 0; channel < 4; ++channel) {
         const float value = expected_material[entry][channel];
@@ -503,6 +542,19 @@ int main()
         return 1;
       }
     }
+  }
+
+  VoronoiParams voronoi{};
+  voronoi.metric = NODE_VORONOI_EUCLIDEAN;
+  voronoi.randomness = 1.0f;
+  constexpr float voronoi_u = 0.12f, voronoi_v = 0.34f;
+  const float3 coord = ((1.0f - voronoi_u - voronoi_v) * generated[0] +
+                        voronoi_u * generated[1] + voronoi_v * generated[2]) * scale;
+  const float3 procedural_color = voronoi_f1(voronoi, coord).color;
+  if (!check(1, procedural_shader, 0, voronoi_u, voronoi_v,
+             {procedural_color.x, procedural_color.y, procedural_color.z, 1.0f}, 1.0e-6f))
+  {
+    return 1;
   }
 
   const float3 principled_color = color_srgb_to_linear_v3(color_byte_to_float(byte_pixels[0]));

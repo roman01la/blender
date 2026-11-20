@@ -44,7 +44,7 @@ struct DenoisingParameters {
 const workgroup_size_x = 64u;
 const words_per_pixel = 5u;
 // Match path_state_layout.h and the compact ray queue layout.
-const path_words = 23u;
+const path_words = 24u;
 const path_radiance = 3u;
 const path_queued_kernel = 7u;
 const path_pixel = 18u;

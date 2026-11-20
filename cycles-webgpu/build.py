@@ -38,11 +38,11 @@ def retarget(source: Path, wrapper: Path, output: Path) -> None:
             raise ValueError(f"Expected exactly one target {item} in Cycles IR")
     shader_ir = re.sub(r' "target-(?:cpu|features)"="[^"]*"', "", shader_ir)
     shader_ir = re.sub(r"^define hidden ", "define hidden spir_func ", shader_ir, flags=re.M)
-    # Match the calling convention of storage accessors supplied by HLSL.
+    # Match the calling convention of storage accessors and the shared film setting.
     shader_ir = re.sub(
         r"\b(call|declare) (?=(?:noundef )?i32 @_Z"
-        r"(?:17cycles_scene_word|19cycles_surface_word|17cycles_light_word|"
-        r"25cycles_camera_sample_word|15cycles_svm_word)j\b)",
+        r"(?:(?:17cycles_scene_word|19cycles_surface_word|17cycles_light_word|"
+        r"25cycles_camera_sample_word|15cycles_svm_word)j|23cycles_film_transparentv)\b)",
         r"\1 spir_func ",
         shader_ir,
     )
@@ -122,9 +122,31 @@ def normalize_spirv(code: bytes) -> bytes:
             signed_type = ensure_type(vectors, (signed_type, length), 23)
         return signed_type
 
+    # SVM's packed byte fields may survive optimization as unsigned scalar
+    # SSA values. WGSL has no u8. Preserve truncation with an explicit mask.
+    byte_types = {type_id for type_id, definition in int_types.items() if definition == (8, 0)}
+    byte_mask = None
+    if byte_types:
+        uint_type = ints[(32, 0)]
+
     normalized = []
     first_function = None
     for opcode, operands in instructions:
+        if byte_types:
+            if (opcode == 21 and operands[0] in byte_types) or (opcode == 17 and operands == (39,)):
+                continue  # OpTypeInt and OpCapability Int8
+            if opcode == 113:  # OpUConvert
+                result_type, result, value = operands
+                if result_type in byte_types and integer_value_types[value] == uint_type:
+                    if byte_mask is None:
+                        byte_mask = new_id()
+                        added_types.append((43, (uint_type, byte_mask, 255)))  # OpConstant
+                    opcode, operands = 199, (uint_type, result, value, byte_mask)  # OpBitwiseAnd
+                elif result_type == uint_type and integer_value_types[value] in byte_types:
+                    opcode = 83  # OpCopyObject
+            elif opcode in {1, 43, 46, 83, 169, 245} and operands[0] in byte_types:
+                # Undef, constant, null, copy, select, and phi.
+                operands = (uint_type, *operands[1:])
         # SPIR-V permits unsigned integer types in signed conversion
         # instructions. Naga uses the type's signedness to emit WGSL casts,
         # so make the signed interpretation explicit in both directions.
@@ -143,6 +165,19 @@ def normalize_spirv(code: bytes) -> bytes:
                 signed_value = new_id()
                 normalized.append((124, (signed_type, signed_value, value)))  # OpBitcast
                 operands = (result_type, result, signed_value)
+        elif opcode == 195:  # OpShiftRightArithmetic
+            result_type, result, value, shift = operands
+            signed_type = signed_integer_type(result_type)
+            if integer_value_types[value] != signed_type:
+                signed_value = new_id()
+                normalized.append((124, (signed_type, signed_value, value)))
+                value = signed_value
+            if result_type != signed_type:
+                signed_result = new_id()
+                normalized.append((opcode, (signed_type, signed_result, value, shift)))
+                opcode, operands = 124, (result_type, result, signed_result)
+            else:
+                operands = (signed_type, result, value, shift)
         if opcode == 54 and first_function is None:  # OpFunction
             first_function = len(normalized)
 
@@ -197,10 +232,13 @@ def build(options) -> None:
     options.output.mkdir(parents=True, exist_ok=True)
     headers = options.emscripten_sysroot / "include"
     cxx_flags = ("-std=c++20", "-DNDEBUG", "-O2", "-fno-math-errno", "-I", CYCLES)
+    if options.svm or options.svm_compact:
+        # The stock procedural texture hash uses wrapping signed arithmetic.
+        cxx_flags += ("-fwrapv",)
     light = options.direct_light or options.wavefront_light
     surface = options.surface or options.surface_compact
     compact = (options.bvh2_compact or options.surface_compact or options.svm_compact or
-               options.intersect_shadow)
+               options.intersect_shadow or options.subsurface_compact)
     kernel = ("bvh2" if options.bvh2 or options.bvh2_compact or surface or light or
               options.intersect_shadow else "camera")
     dispatch = kernel
@@ -221,6 +259,8 @@ def build(options) -> None:
         kernel, dispatch = "camera", "denoise_surface"
     elif options.svm or options.svm_compact:
         kernel = dispatch = "svm"
+    elif options.subsurface or options.subsurface_compact:
+        kernel, dispatch = "bvh2", "subsurface"
     elif adaptive:
         kernel = dispatch = "adaptive"
     elif options.adaptive_film:
@@ -271,6 +311,8 @@ def build(options) -> None:
         shader_flags.append("-DCYCLES_WEBGPU_INTERSECT_SHADOW=1")
     if options.bvh2_compact:
         shader_flags.append("-DCYCLES_WEBGPU_OFFSET_CLOSEST=1")
+    if options.subsurface or options.subsurface_compact:
+        shader_flags.append("-DCYCLES_WEBGPU_SUBSURFACE=1")
     if adaptive:
         shader_flags.append(f"-DCYCLES_WEBGPU_ADAPTIVE_{adaptive.replace('-', '_').upper()}=1")
     if options.reflection_only:
@@ -306,6 +348,11 @@ def build(options) -> None:
 
             overlay = prepare_light_tree_headers(work, CYCLES)
             build_cxx_flags = ("-I", overlay, *cxx_flags)
+        if options.subsurface or options.subsurface_compact:
+            from subsurface_headers import prepare_subsurface_headers
+
+            prepare_subsurface_headers(work, CYCLES)
+            build_cxx_flags = ("-I", work, *build_cxx_flags)
         if options.denoise_surface:
             from denoising_headers import prepare_denoising_header
 
@@ -320,7 +367,8 @@ def build(options) -> None:
             *shader_flags,
             "-O2", "-S", "-emit-llvm",
             "-I", SOURCE,
-            SOURCE / f"{dispatch}_dispatch.hlsl",
+            SOURCE / ("subsurface_compact_dispatch.hlsl" if options.subsurface_compact
+                      else f"{dispatch}_dispatch.hlsl"),
             "-o", wrapper_ir,
         )
         shader_modules = [wrapper_ir]
@@ -368,10 +416,15 @@ def build(options) -> None:
                 "-o", optimized,
             )
         else:
+            # Private C++ aggregates cannot cross function calls in WGSL.
+            svm = options.svm or options.svm_compact
+            opt_plugin = (f"-load-pass-plugin={plugin}",) if svm else ()
+            inline_helpers = "cycles-webgpu-inline-helpers,always-inline," if svm else ""
             run(
                 options.llvm_bin / "opt",
+                *opt_plugin,
                 "-internalize-public-api-list=main",
-                "-passes=internalize,default<O2>,globaldce",
+                f"-passes=internalize,{inline_helpers}default<O2>,globaldce",
                 work / "linked.bc",
                 "-o", optimized,
             )
@@ -385,10 +438,13 @@ def build(options) -> None:
                                                  options.bvh2_compact or options.intersect_shadow or
                                                  options.surface_compact or options.svm_compact or
                                                  options.path_update or options.wavefront_light or
-                                                 options.denoise_surface))
+                                                 options.denoise_surface or options.subsurface or
+                                                 options.subsurface_compact))
         run(
             options.llvm_bin / "llc",
             "-O0" if structured_dispatch else "-O2", "-filetype=obj",
+            # Disable vector_select_to_faceforward_lowering (rule 1 in LLVM 22.1.8).
+            "-spirvprelegalizercombiner-disable-rule=1",
             shader,
             "-o", work / "kernel.spv",
         )
@@ -427,14 +483,18 @@ def build(options) -> None:
             reference = "svm-reference"
             reference_source = "svm_reference.cc"
             reference_flags = ()
+        elif options.subsurface:
+            reference = "subsurface-reference"
+            reference_source = "subsurface_reference.cc"
+            reference_flags = ("-I", work)
         else:
             reference = "bvh2-reference" if options.bvh2 else "reference"
             reference_source = "bvh2_reference.cc" if options.bvh2 else "reference.cc"
             reference_flags = ()
         run(
             options.llvm_bin / "clang++",
-            *cxx_flags,
             *reference_flags,
+            *cxx_flags,
             *shader_flags,
             *(SOURCE / f"{name}_kernels.cc" for name in kernels),
             SOURCE / reference_source,
@@ -451,10 +511,11 @@ def build(options) -> None:
                 with (work / sampled_reference).open("w") as output:
                     run(work / reference, "--sampled-primary", stdout=output)
                 shutil.move(work / sampled_reference, options.output / sampled_reference)
-        if options.svm:
-            with (work / "svm-reference.json").open("w") as output:
+        if options.svm or options.subsurface:
+            reference_json = reference + ".json"
+            with (work / reference_json).open("w") as output:
                 run(work / reference, stdout=output)
-            shutil.move(work / "svm-reference.json", options.output / "svm-reference.json")
+            shutil.move(work / reference_json, options.output / reference_json)
         for result in (shader_name, result_reference):
             shutil.move(work / result, options.output / result)
 
@@ -503,6 +564,10 @@ if __name__ == "__main__":
                        help="compile environment and forward area emission for miss paths")
     modes.add_argument("--path-update", action="store_true",
                        help="compile diffuse continuation and radiance accumulation")
+    modes.add_argument("--subsurface", action="store_true",
+                       help="compile the stock Random Walk subsurface kernel for static triangles")
+    modes.add_argument("--subsurface-compact", action="store_true",
+                       help="compile Random Walk over queued subsurface paths")
     modes.add_argument("--adaptive-camera-slots", action="store_true",
                        help="compile adaptive camera slot candidate lookup")
     modes.add_argument("--adaptive-camera-rays", action="store_true",

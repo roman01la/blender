@@ -7,9 +7,10 @@
 @group(0) @binding(4) var<storage, read> pixels: array<vec4<u32>>;
 
 // Path-state entries store the Cycles DeviceKernel index plus one. Zero means terminated.
-const path_words = 23u;
+const path_words = 24u;
 const queued_kernel = 7u;
 const intersect_closest = 3u;
+const intersect_subsurface = 5u;
 const shade_background = 9u;
 const shade_surface = 12u;
 
@@ -81,6 +82,12 @@ fn compact_intersect(@builtin(global_invocation_id) id: vec3<u32>,
 fn compact_surface(@builtin(global_invocation_id) id: vec3<u32>,
                    @builtin(local_invocation_index) local: u32) {
   compact(id.x, shade_surface, local);
+}
+
+@compute @workgroup_size(64)
+fn compact_subsurface(@builtin(global_invocation_id) id: vec3<u32>,
+                      @builtin(local_invocation_index) local: u32) {
+  compact(id.x, intersect_subsurface, local);
 }
 
 @compute @workgroup_size(64)

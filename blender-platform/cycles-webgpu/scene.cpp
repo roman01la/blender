@@ -140,8 +140,10 @@ const char *scene_incompatibility(const Scene &scene)
     }
   }
 
-  if (dscene.data.background.transparent || dscene.data.background.volume_shader != SHADER_NONE) {
-    return "WebGPU Cycles needs an opaque world without volume";
+  if (dscene.data.background.volume_shader != SHADER_NONE ||
+      dscene.data.background.transparent_roughness_squared_threshold >= 0.0f)
+  {
+    return "WebGPU Cycles does not support world volume or transparent glass";
   }
   const KernelIntegrator &integrator = dscene.data.integrator;
   if (integrator.ao_bounces || integrator.ao_additive_factor != 0.0f ||
@@ -535,7 +537,7 @@ bool pack_light_tree_nodes(const std::span<const KernelLightTreeNode> nodes,
 const char *pack_light_tree_lamps(const DeviceScene &dscene,
                                  const std::span<const KernelLightTreeEmitter> emitters,
                                  const std::span<uint32_t> words,
-                                 uint32_t &forward_index,
+                                 uint32_t &first_forward_index,
                                  uint32_t &world_index,
                                  uint32_t &world_emitter)
 {
@@ -589,10 +591,9 @@ const char *pack_light_tree_lamps(const DeviceScene &dscene,
     if (light.type != LIGHT_AREA && !finite_point) {
       continue;
     }
-    if (forward_index != CYCLES_WEBGPU_TREE_NO_LAMP) {
-      return "WebGPU Cycles Light Tree currently supports one rectangular area or finite point light";
+    if (first_forward_index == CYCLES_WEBGPU_TREE_NO_LAMP) {
+      first_forward_index = uint32_t(index);
     }
-    forward_index = uint32_t(index);
     if (finite_point) {
       std::ifstream shader("/cycles-webgpu/wavefront-light-deferred-reflection-tree.wgsl");
       std::string version;
@@ -691,7 +692,8 @@ const char *encode_stock_light_tree(const Scene &scene,
   header[CYCLES_WEBGPU_TREE_NODES] = uint32_t(node_offset);
   header[CYCLES_WEBGPU_TREE_EMITTER_COUNT] = uint32_t(emitters.size());
   header[CYCLES_WEBGPU_TREE_EMITTERS] = uint32_t(emitter_offset);
-  header[CYCLES_WEBGPU_TREE_AREA_LAMP] = CYCLES_WEBGPU_TREE_NO_LAMP;
+  header[CYCLES_WEBGPU_TREE_FIRST_FORWARD_LAMP] = CYCLES_WEBGPU_TREE_NO_LAMP;
+  header[CYCLES_WEBGPU_TREE_TRANSPARENT_MAX_BOUNCE] = uint32_t(integrator.transparent_max_bounce);
   header[CYCLES_WEBGPU_TREE_WORLD_LAMP] = CYCLES_WEBGPU_TREE_NO_LAMP;
   header[CYCLES_WEBGPU_TREE_WORLD_EMITTER] = CYCLES_WEBGPU_TREE_NO_LAMP;
   header[CYCLES_WEBGPU_TREE_WORLD_MAP_WIDTH] = sampled_world ? uint32_t(world.map_res_x) : 0;
@@ -709,7 +711,7 @@ const char *encode_stock_light_tree(const Scene &scene,
           dscene,
           emitters,
           std::span(lighting).subspan(lamp_offset, size_t(lamp_words)),
-          header[CYCLES_WEBGPU_TREE_AREA_LAMP],
+          header[CYCLES_WEBGPU_TREE_FIRST_FORWARD_LAMP],
           header[CYCLES_WEBGPU_TREE_WORLD_LAMP],
           header[CYCLES_WEBGPU_TREE_WORLD_EMITTER]))
   {
@@ -918,7 +920,8 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
     return false;
   }
   if (!cycles_webgpu_encode_svm_materials(
-          scene, encoded.svm, encoded.has_ggx, encoded.has_transmission, reason, extra_words))
+          scene, encoded.svm, encoded.has_ggx, encoded.has_transmission, encoded.has_subsurface,
+          reason, extra_words))
   {
     return false;
   }

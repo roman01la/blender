@@ -54,6 +54,9 @@ void main(uint3 id : SV_DispatchThreadID)
   // lets the compiler strip BSDF evaluation and shadow traversal.
   const uint4 no_surface = uint4(0, 0, 0, 0);
   const float4 no_material = float4(0, 0, 0, 0);
+  const uint weight = path + CYCLES_WEBGPU_PATH_THROUGHPUT;
+  const float3 throughput = __builtin_bit_cast(
+      float3, uint3(path_words[weight], path_words[weight + 1], path_words[weight + 2]));
   float4 world, area;
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
   const uint mis_normal_word = path + CYCLES_WEBGPU_PATH_MIS_ORIGIN_N;
@@ -62,16 +65,15 @@ void main(uint3 id : SV_DispatchThreadID)
                                        path_words[mis_normal_word + 2], 0);
 #endif
   cycles_wavefront_light(no_surface, no_surface, no_surface, no_surface, no_surface, no_surface,
-                         closest, ray, origin, state, no_surface,
+                         closest, ray, origin, state,
+                         uint4(0, 0, 0, path_words[path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE]),
+                         0u,
                          no_material, no_material, no_material, no_material, world, area
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
-                         , mis_origin_normal
+                         , mis_origin_normal, float4(throughput, 0.0f)
 #endif
                          );
 
-  const uint weight = path + CYCLES_WEBGPU_PATH_THROUGHPUT;
-  const float3 throughput = __builtin_bit_cast(
-      float3, uint3(path_words[weight], path_words[weight + 1], path_words[weight + 2]));
   const uint sum = path + CYCLES_WEBGPU_PATH_RADIANCE;
   float3 rgb = __builtin_bit_cast(
       float3, uint3(path_words[sum], path_words[sum + 1], path_words[sum + 2]));
@@ -81,15 +83,17 @@ void main(uint3 id : SV_DispatchThreadID)
   const float4 feature_throughput = guide_state[feature];
   float3 albedo = float3(0, 0, 0);
 #endif
-  if (area.w > 0.0f) {
-    trace_past_area = cycles_trace_past_area(path);
-    const float3 contribution = clamp_light(throughput * area.xyz, area.w);
+  const uint forward_hits = cycles_forward_light_hits(area);
+  if (forward_hits != 0) {
+    trace_past_area = cycles_trace_past_area(path, forward_hits);
+    const float3 contribution = cycles_forward_emission(area, throughput);
     rgb += contribution;
 #ifdef CYCLES_WEBGPU_DENOISE_BACKGROUND
     albedo += feature_throughput.xyz * contribution;
 #endif
   }
-  if (trace_past_area && world.w < 0.0f) {
+  if (trace_past_area && !cycles_write_transparent_background(path, state.y, throughput) &&
+      world.w < 0.0f) {
     const float3 contribution = clamp_light(throughput * world.xyz, -world.w);
     rgb += contribution;
 #ifdef CYCLES_WEBGPU_DENOISE_BACKGROUND

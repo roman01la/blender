@@ -28,6 +28,7 @@ extern uint cycles_surface_bounce(uint rng_pixel, uint sample_index, uint4 posit
                                   uint4 normal, uint4 geometric_normal,
                                   uint4 specular_normal, uint4 ray, uint4 settings,
                                   uint4 lobe_settings, uint4 path_counts, uint bounce,
+                                  uint subsurface_steps,
                                   float min_ray_pdf, float4 material, float4 specular,
                                   float4 parameters, float4 glass, float4 throughput,
                                   out float4 next_throughput, out float next_pdf, out uint4 origin,
@@ -46,6 +47,7 @@ void main(uint3 id : SV_DispatchThreadID)
   const uint queued = path + CYCLES_WEBGPU_PATH_QUEUED_KERNEL;
   const uint bounce_word = path + CYCLES_WEBGPU_PATH_BOUNCE;
   const uint bounce = path_words[bounce_word];
+  const uint subsurface_steps = path_words[path + CYCLES_WEBGPU_PATH_SUBSURFACE_STEPS];
   const uint ray = 1 + 12 * lane;
   const uint surface = 8 * lane;
   const uint weight = path + CYCLES_WEBGPU_PATH_THROUGHPUT;
@@ -62,10 +64,11 @@ void main(uint3 id : SV_DispatchThreadID)
   const bool ggx = material.w == CYCLES_WEBGPU_MATERIAL_GGX ||
                    material.w == CYCLES_WEBGPU_MATERIAL_MULTISCATTER_GGX;
   const bool active = path_words[queued] != CYCLES_WEBGPU_PATH_TERMINATED;
-  const bool area_hit = active && area.w > 0.0f;
+  const uint forward_hits = cycles_forward_light_hits(area);
+  const bool area_hit = active && forward_hits != 0;
   bool trace_past_area = true;
   if (area_hit) {
-    trace_past_area = cycles_trace_past_area(path);
+    trace_past_area = cycles_trace_past_area(path, forward_hits);
   }
   const uint4 counts = uint4(path_words[path + CYCLES_WEBGPU_PATH_DIFFUSE_BOUNCE],
                               path_words[path + CYCLES_WEBGPU_PATH_GLOSSY_BOUNCE],
@@ -85,9 +88,12 @@ void main(uint3 id : SV_DispatchThreadID)
   /* Analytic lights contribute along the segment before the next surface
    * or world hit. Only the opaque surface applies roulette. */
   if (area_hit) {
-    rgb += clamp_light(throughput * area.xyz, area.w);
+    rgb += cycles_forward_emission(area, throughput);
   }
-  if (active && trace_past_area && incoming.w < 0.0f) {
+  const bool transparent_background = active && trace_past_area && hit_words[surface] == 0u &&
+                                      cycles_write_transparent_background(
+                                          path, counts.w, throughput);
+  if (active && trace_past_area && !transparent_background && incoming.w < 0.0f) {
     rgb += clamp_light(throughput * incoming.xyz, -incoming.w);
   }
   if (shade_surface && incoming.w > 0.0f && float(bounce) <= light_max_bounces) {
@@ -112,13 +118,14 @@ void main(uint3 id : SV_DispatchThreadID)
     float next_rr;
     visibility = cycles_surface_bounce(ray_words[ray + CYCLES_WEBGPU_RAY_RNG_PIXEL], pixels[lane].z,
                                        position, normal, geom_N, spec_N, incoming_ray,
-                                       settings, cycles_path_lobe_settings(), counts, bounce, min_pdf,
+                                       settings, cycles_path_lobe_settings(), counts, bounce,
+                                       subsurface_steps, min_pdf,
                                        material, materials[material_base + 1],
                                        materials[material_base + 2], materials[material_base + 3],
                                        float4(next_throughput, 0.0f), bounced_throughput,
                                        bounced_pdf, origin, direction, next_counts, next_rr);
     next_throughput = bounced_throughput.xyz;
-    if (visibility != 0) {
+    if (visibility != 0 && visibility != CYCLES_WEBGPU_PATH_SUBSURFACE_PENDING) {
       path_words[path + CYCLES_WEBGPU_PATH_DIFFUSE_BOUNCE] = next_counts.x;
       path_words[path + CYCLES_WEBGPU_PATH_GLOSSY_BOUNCE] = next_counts.y;
       path_words[path + CYCLES_WEBGPU_PATH_TRANSMISSION_BOUNCE] = next_counts.z;
@@ -141,10 +148,15 @@ void main(uint3 id : SV_DispatchThreadID)
   path_words[sum] = sum_bits.x;
   path_words[sum + 1] = sum_bits.y;
   path_words[sum + 2] = sum_bits.z;
+  radiance[lane] = float4(rgb, opacity);
+  if (visibility == CYCLES_WEBGPU_PATH_SUBSURFACE_PENDING) {
+    path_words[queued] = CYCLES_WEBGPU_PATH_INTERSECT_SUBSURFACE;
+    return;
+  }
+
   path_words[queued] = visibility == 0 ? CYCLES_WEBGPU_PATH_TERMINATED :
                                         CYCLES_WEBGPU_PATH_INTERSECT_CLOSEST;
   path_words[bounce_word] = bounce + 1;
-  radiance[lane] = float4(rgb, opacity);
 
   /* An empty ray interval keeps finished slots out of the existing traversal. */
   ray_words[ray] = origin.x;

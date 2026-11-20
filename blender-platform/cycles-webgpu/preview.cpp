@@ -117,6 +117,7 @@ bool pack_camera_sampling(const DeviceScene &scene,
   words.push_back(uint32_t(integrator.max_transmission_bounce));
   words.push_back(std::bit_cast<uint32_t>(integrator.filter_glossy));
   words.push_back(uint32_t(integrator.transparent_max_bounce));
+  words.push_back(uint32_t(scene.data.background.transparent));
   if (lookup_words) {
     const auto first = encoded.lighting.begin() + CYCLES_WEBGPU_LIGHT_HEADER_WORDS;
     words.insert(words.end(), first, first + lookup_words);
@@ -251,7 +252,7 @@ bool WebGPUPreview::begin_batch(const BufferParams &params,
   }
   if (scene_pending_) {
     if (!pipeline_->upload_scene(
-            scene_.bvh, scene_.surface, scene_.lighting, scene_.svm, sampling_))
+            scene_.bvh, scene_.surface, scene_.lighting, scene_.svm, sampling_, scene_.has_subsurface))
     {
       return report_error();
     }

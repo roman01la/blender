@@ -39,6 +39,7 @@ struct CyclesWebGPUScene {
   uint32_t max_bounces = 0;
   bool has_ggx = false;
   bool has_transmission = false;
+  bool has_subsurface = false;
 };
 
 /* Read the synchronized host DeviceScene under the Scene mutex. Preserve the previous output

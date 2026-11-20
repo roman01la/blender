@@ -237,6 +237,11 @@ bool type_array_accesses(Function &function)
         extension && isa<SExtInst, ZExtInst>(extension))
     {
       offset = extension->getOperand(0);
+      if (offset->getType()->getIntegerBitWidth() < 32) {
+        /* GEP indices are signed. Preserve an unsigned narrow stack index
+         * when replacing Wasm's pointer-width extension. */
+        offset = builder.CreateIntCast(offset, builder.getInt32Ty(), isa<SExtInst>(extension));
+      }
     }
     if (auto *constant = dyn_cast<ConstantInt>(offset)) {
       if (constant->getValue().isSignedIntN(32)) {
@@ -552,6 +557,19 @@ struct LegalizeSpirv : PassInfoMixin<LegalizeSpirv> {
   }
 };
 
+struct InlineShaderHelpers : PassInfoMixin<InlineShaderHelpers> {
+  PreservedAnalyses run(Module &module, ModuleAnalysisManager &)
+  {
+    for (Function &function : module) {
+      if (!function.isDeclaration() && function.hasLocalLinkage()) {
+        function.removeFnAttr(Attribute::NoInline);
+        function.addFnAttr(Attribute::AlwaysInline);
+      }
+    }
+    return PreservedAnalyses::none();
+  }
+};
+
 /* Give the original LLVM basic blocks a single structured loop. The Vulkan
  * backend cannot emit valid nested loops for the pinned Cycles traversal's
  * early exits. This pass changes the CFG while leaving each block's work in
@@ -656,10 +674,15 @@ extern "C" PassPluginLibraryInfo llvmGetPassPluginInfo()
             builder.registerPipelineParsingCallback([](StringRef name,
                                                        ModulePassManager &passes,
                                                        ArrayRef<PassBuilder::PipelineElement>) {
-              if (name != "cycles-webgpu-lower-film") {
+              if (name == "cycles-webgpu-lower-film") {
+                passes.addPass(LowerFilmStorage());
+              }
+              else if (name == "cycles-webgpu-inline-helpers") {
+                passes.addPass(InlineShaderHelpers());
+              }
+              else {
                 return false;
               }
-              passes.addPass(LowerFilmStorage());
               return true;
             });
             builder.registerPipelineParsingCallback([](StringRef name,

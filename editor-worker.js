@@ -1,5 +1,7 @@
 "use strict";
 
+importScripts("editor-local-files.js", "editor-recent-files.js");
+
 self.addEventListener("message", function start(event) {
   const { canvas, viewport, display, assets } = event.data;
   const send = (type, ...args) => self.postMessage({ type, args });
@@ -14,7 +16,9 @@ self.addEventListener("message", function start(event) {
   let framePending = false;
   let fileRequest = null;
   const fileHandles = new Map();
+  const recentFiles = new self.BlenderRecentFiles();
   const cyclesPreviews = new Map();
+  const downloadSize = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
 
   function requestFile(type, ...args) {
     if (fileRequest) return Promise.reject(new Error("A file picker is already open."));
@@ -75,24 +79,68 @@ self.addEventListener("message", function start(event) {
     chooseLocalDirectory(mode = "read") {
       return requestFile("chooseLocalDirectory", mode);
     },
-    createBlendPath(name, capacity = 1024) {
+    async createBlendPath(name, capacity, handle) {
       if (!name || /[\/\\\0]/.test(name) || name === "." || name === "..") {
         throw new Error("The selected project has an invalid file name.");
       }
       const parent = "/home/web_user";
-      const directory = "Browser Files/" + crypto.randomUUID();
-      const path = parent + "/" + directory + "/" + name;
+      const previous = await recentFiles.pathForHandle(handle);
+      const path = previous ?? parent + "/Browser Files/" + crypto.randomUUID() + "/" +
+        name.replace(/[\r\n]/g, " ");
       if (new TextEncoder().encode(path).length >= capacity) {
         throw new Error("The selected project file name is too long.");
       }
+      const directory = path.slice(parent.length + 1, path.lastIndexOf("/"));
       Module.FS_createPath(parent, directory, true, true);
       return path;
     },
     getBlendFileHandle(path) {
       return fileHandles.get(path) ?? null;
     },
-    setBlendFileHandle(path, handle) {
-      fileHandles.set(path, handle);
+    rememberBlendFile(path, handle, file) {
+      if (handle) fileHandles.set(path, handle);
+      recentFiles.remember(path, handle, file);
+    },
+    localFiles(fs) {
+      return Module.blenderLocalFiles ??= new self.BlenderLocalFiles(
+        fs, bridge.writeBlendFile, bridge.requestBlendFileWrite);
+    },
+    addBlendFile(fs, path, file) {
+      fs.mkdirTree(path.slice(0, path.lastIndexOf("/")));
+      if (fs.analyzePath(path).exists) fs.unlink(path);
+      bridge.localFiles(fs).addFile(path, file);
+    },
+    restoreRecentFiles(fs, path) {
+      recentFiles.restore(fs, path, bridge.localFiles(fs));
+    },
+    saveRecentFiles(history, opening) {
+      return recentFiles.save(history, opening);
+    },
+    hasRecentFile(path) {
+      return Boolean(recentFiles.get(path));
+    },
+    async reopenRecentFile(fs, path) {
+      const recent = recentFiles.get(path);
+      if (!recent) return true;
+      const { handle } = recent;
+      if (handle && await handle.queryPermission({ mode: "read" }) !== "granted" &&
+          !await requestFile("requestBlendFileRead", handle)) {
+        return false;
+      }
+      let file;
+      try {
+        file = handle ? await handle.getFile() : recent.file;
+      } catch (error) {
+        if (error.name === "NotFoundError") {
+          recentFiles.forget(path);
+          fileHandles.delete(path);
+          if (fs.analyzePath(path).exists) fs.unlink(path);
+        }
+        throw error;
+      }
+      bridge.addBlendFile(fs, path, file);
+      if (handle) fileHandles.set(path, handle);
+      return true;
     },
     async requestBlendFileWrite(handle) {
       if (await handle.queryPermission({ mode: "readwrite" }) === "granted") return true;
@@ -204,7 +252,20 @@ self.addEventListener("message", function start(event) {
     ghostBrowserWindow: bridge,
     preRun: prepare,
     setStatus(message) {
-      if (message) send("status", message);
+      if (!message) return;
+      // Emscripten's file packager reports downloaded and total bytes.
+      const download = /^Downloading data\.\.\.(?: \((\d+)\/(\d+)\))?$/.exec(message);
+      if (!download) {
+        send("status", message);
+        return;
+      }
+      const loaded = Number(download[1] ?? 0);
+      const total = Number(download[2] ?? 0);
+      const scale = Math.max(loaded, total);
+      const [divisor, unit] = scale >= 1e6 ? [1e6, "MB"] : scale >= 1e3 ? [1e3, "kB"] : [1, "B"];
+      const amount = downloadSize.format(loaded / divisor);
+      const received = total > 0 ? `${amount} of ${downloadSize.format(total / divisor)}` : amount;
+      send("status", loaded || total ? `Downloading Blender… ${received} ${unit}` : "Downloading Blender…");
     },
     onRuntimeInitialized() {
       send("status", "Starting the Blender editor…");
@@ -218,7 +279,7 @@ self.addEventListener("message", function start(event) {
     onAbort: reportError,
   };
 
-  function addDependency(name, promise, install) {
+  function addDependency(name, promise, install = () => {}) {
     // Register rejection handling while importScripts is still fetching blender.js.
     const ready = promise.catch(error => {
       reportError(error);
@@ -234,6 +295,8 @@ self.addEventListener("message", function start(event) {
       });
     });
   }
+
+  addDependency("recent-files", recentFiles.load().then(() => true));
 
   if (assets.translator) {
     addDependency(

@@ -46,6 +46,8 @@ class WebGPUWavefrontQueue {
            device_webgpu_register_kernel(
                device, compact_surface_kernel, source, 64, compact, "compact_surface") &&
            device_webgpu_register_kernel(
+               device, compact_subsurface_kernel, source, 64, compact, "compact_subsurface") &&
+           device_webgpu_register_kernel(
                device, compact_background_kernel, source, 64, compact, "compact_background") &&
            device_webgpu_register_kernel(
                device, classify_kernel, source, 64, classify, "classify_intersection") &&
@@ -83,6 +85,8 @@ class WebGPUWavefrontQueue {
                                             compact_intersect_kernel :
                                         stage == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE ?
                                             compact_surface_kernel :
+                                        stage == DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE ?
+                                            compact_subsurface_kernel :
                                             compact_background_kernel;
     return enqueue(compact_kernel, capacity, rays, paths, kernels);
   }
@@ -148,6 +152,8 @@ class WebGPUWavefrontQueue {
       DEVICE_KERNEL_INTEGRATOR_QUEUED_PATHS_ARRAY;
   static constexpr DeviceKernel compact_surface_kernel =
       DEVICE_KERNEL_INTEGRATOR_SORTED_PATHS_ARRAY;
+  static constexpr DeviceKernel compact_subsurface_kernel =
+      DEVICE_KERNEL_INTEGRATOR_SORT_WRITE_PASS;
   static constexpr DeviceKernel compact_background_kernel =
       DEVICE_KERNEL_INTEGRATOR_COMPACT_PATHS_ARRAY;
   static constexpr DeviceKernel count_kernel = DEVICE_KERNEL_INTEGRATOR_ACTIVE_PATHS_ARRAY;

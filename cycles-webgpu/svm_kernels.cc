@@ -39,24 +39,30 @@ void cycles_svm_material(unsigned int shader,
                          Float4 &base,
                          Float4 &specular,
                          Float4 &layers,
-                         Float4 &transmission)
+                         Float4 &transmission,
+                         Float4 &subsurface)
 {
   specular = {};
   layers = {};
   transmission = {};
+  subsurface = {};
   const auto fetch = [](const unsigned int index) {
     return cycles_svm_word(ccl::webgpu_svm_header_words + index);
   };
   const unsigned int word_count = cycles_svm_word(0);
   const unsigned int texture = ccl::webgpu_svm_header_words + word_count;
   const auto uv = ccl::webgpu_svm_triangle_uv(cycles_svm_word, texture, primitive, u, v);
+  const auto generated = ccl::webgpu_svm_triangle_generated(cycles_svm_word, texture, primitive, u, v);
+  const auto rgb_to_y = ccl::webgpu_svm_read_rgb(cycles_svm_word, texture + 3);
   const auto image = [texture](int id, ccl::float2 co, ccl::float3 &color) {
     return ccl::webgpu_svm_image(cycles_svm_word, texture, id, co, color);
   };
   ccl::WebGPUSvmMaterial material;
   bool uses_uv = false;
+  bool uses_generated = false;
   if (!ccl::webgpu_svm_eval_material(
-          fetch, image, uv, uses_uv, word_count, cycles_svm_word(1), shader, material))
+          fetch, image, uv, generated, rgb_to_y, uses_uv, uses_generated, word_count,
+          cycles_svm_word(1), shader, material))
   {
     base = {0, 0, 0, 2};
     return;
@@ -73,7 +79,14 @@ void cycles_svm_material(unsigned int shader,
     layers = {material.metallic, material.eta, material.f0, material.mix_weight};
     transmission = {material.transmission,
                     material.glass_ior,
-                    material.standalone_glass ? 1.0f : 0.0f,
-                    0.0f};
+                    material.subsurface > 0.0f ? float(material.subsurface_method) :
+                                                material.standalone_glass ? 1.0f : 0.0f,
+                    material.subsurface};
+    if (material.subsurface > 0.0f) {
+      subsurface = {material.subsurface_radius.x,
+                    material.subsurface_radius.y,
+                    material.subsurface_radius.z,
+                    material.subsurface_anisotropy};
+    }
   }
 }

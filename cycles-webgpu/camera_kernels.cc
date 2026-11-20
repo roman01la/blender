@@ -90,6 +90,11 @@ unsigned int cycles_path_transparent_max_bounce()
   return cycles_camera_sample_word(path_settings_offset() + 8);
 }
 
+unsigned int cycles_film_transparent()
+{
+  return cycles_camera_sample_word(path_settings_offset() + 9);
+}
+
 #endif
 
 #if defined(CYCLES_WEBGPU_PATH_UPDATE) || defined(CYCLES_WEBGPU_DENOISE_SURFACE)
@@ -158,6 +163,7 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
                                    UInt4 lobe_settings,
                                    UInt4 path_counts,
                                    unsigned int bounce,
+                                   unsigned int subsurface_steps,
                                    float min_ray_pdf,
                                    Float4 material,
                                    Float4 specular,
@@ -181,7 +187,7 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
   integrator.max_transmission_bounce = lobe_settings.z;
 
   const int sample = int(sample_index);
-  const int rng_offset = (int(bounce) + 1) * ccl::PRNG_BOUNCE_NUM;
+  const int rng_offset = (int(bounce + subsurface_steps) + 1) * ccl::PRNG_BOUNCE_NUM;
   const auto random = ccl::path_rng_3D(
       &globals, rng_pixel, sample, rng_offset + ccl::PRNG_SURFACE_BSDF);
   surface_rr = 0.0f;
@@ -229,6 +235,9 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
     D = ccl::make_float3(wo.x, wo.y, wo.z);
     pdf = weight.w;
     next_throughput *= weight;
+    if (label == ccl::LABEL_SUBSURFACE_SCATTER) {
+      return CYCLES_WEBGPU_PATH_SUBSURFACE_PENDING;
+    }
   }
   else {
     ccl::webgpu_sample_cos_hemisphere(N, ccl::make_float2(random.x, random.y), &D, &pdf);
@@ -248,7 +257,7 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
   state.path.glossy_bounce = path_counts.y;
   state.path.transmission_bounce = path_counts.z;
   state.path.rng_offset = rng_offset;
-  state.path.flag = path_counts.w;
+  state.path.flag = path_counts.w & ~ccl::PATH_RAY_SUBSURFACE;
   state.path.throughput = ccl::PackedSpectrum(
       ccl::make_float3(next_throughput.x, next_throughput.y, next_throughput.z));
   ccl::path_state_next(

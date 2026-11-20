@@ -18,8 +18,12 @@
 #undef __SHADOW_LINKING__
 
 __attribute__((pure)) unsigned int cycles_scene_word(unsigned int index);
-#if defined(CYCLES_WEBGPU_SURFACE) || defined(CYCLES_WEBGPU_OFFSET_CLOSEST)
+#if defined(CYCLES_WEBGPU_SURFACE) || defined(CYCLES_WEBGPU_OFFSET_CLOSEST) || \
+    defined(CYCLES_WEBGPU_SUBSURFACE)
 __attribute__((pure)) unsigned int cycles_surface_word(unsigned int index);
+#endif
+#ifdef CYCLES_WEBGPU_SUBSURFACE
+__attribute__((pure)) unsigned int cycles_camera_sample_word(unsigned int index);
 #endif
 
 namespace ccl {
@@ -161,6 +165,18 @@ ccl_device_inline float3 scene_fetch(KernelGlobals kg, tri_verts_tag, uint index
   return make_float3(scene_float(word), scene_float(word + 1), scene_float(word + 2));
 }
 
+#ifdef CYCLES_WEBGPU_SUBSURFACE
+ccl_device_inline uint scene_fetch(KernelGlobals, object_flag_tag, uint index)
+{
+  return cycles_surface_word(cycles_surface_word(0) + 13 * index);
+}
+
+ccl_device_inline float scene_fetch(KernelGlobals, sample_pattern_lut_tag, uint index)
+{
+  return std::bit_cast<float>(cycles_camera_sample_word(7 + FILTER_TABLE_SIZE + index));
+}
+#endif
+
 }  // namespace ccl
 
 #define kernel_data (kg->data)
@@ -236,9 +252,163 @@ ccl_device_inline void triangle_terminator_offsets(KernelGlobals kg,
 #define BVH_FUNCTION_NAME bvh_intersect_static_triangles
 #define BVH_FUNCTION_FEATURES 0
 #include "kernel/bvh/traversal.h"
+
+#ifdef CYCLES_WEBGPU_SUBSURFACE
+#  define BVH_FUNCTION_NAME bvh_intersect_local_static_triangles
+#  define BVH_FUNCTION_FEATURES 0
+#  include "kernel/bvh/local.h"
+
+template<bool single_hit>
+ccl_device_inline bool scene_intersect_local(KernelGlobals kg,
+                                              const Ray *ray,
+                                              LocalIntersection *isect,
+                                              const int object,
+                                              uint *lcg_state,
+                                              const int max_hits)
+{
+  if (!intersection_ray_valid(ray)) {
+    isect->num_hits = 0;
+    return false;
+  }
+  return bvh_intersect_local_static_triangles(kg, ray, isect, object, lcg_state, max_hits);
+}
+#endif
 }  // namespace ccl
 
 using UInt4 = unsigned int __attribute__((ext_vector_type(4)));
+
+#ifdef CYCLES_WEBGPU_SUBSURFACE
+#  undef ccl_device
+#  define ccl_device static inline __attribute__((always_inline))
+#  include "kernel/util/differential.h"
+#  include "kernel/integrator/subsurface_random_walk.h"
+#  include "kernel/closure/bssrdf.h"
+#  include "kernel/integrator/subsurface_entry.h"
+
+using Float4 = float __attribute__((ext_vector_type(4)));
+
+/* The extra components carry the entry controls: time, BSSRDF type
+ * (Skin toggle in the probe), IOR, encoded anisotropy, and microfacet alpha. */
+#ifdef CYCLES_WEBGPU_COMPACT_PATHS
+#  include "../blender-platform/cycles-webgpu/path_state_layout.h"
+#endif
+
+[[gnu::always_inline]] void cycles_subsurface_walk(const Float4 entry,
+                                                  const Float4 incident,
+                                                  const Float4 normal,
+                                                  const Float4 albedo,
+                                                  const Float4 radius,
+                                                  const Float4 weight,
+                                                  const UInt4 rng,
+                                                  const UInt4 surface,
+                                                  UInt4 &hit,
+                                                  Float4 &coordinates,
+                                                  Float4 &exit_direction,
+                                                  Float4 &throughput
+#ifdef CYCLES_WEBGPU_COMPACT_PATHS
+                                                  , const Float4 geometric,
+                                                  const Float4 shading_normal,
+                                                  Float4 &exit_origin
+#endif
+                                                  )
+{
+  using namespace ccl;
+  TraversalGlobals globals;
+  globals.data.bvh.root = std::bit_cast<int>(cycles_scene_word(0));
+  for (uint slot = 1; slot < SceneOffsetCount; ++slot) {
+    globals.offsets[slot] = cycles_scene_word(slot);
+  }
+  auto &integrator = globals.data.integrator;
+  integrator.sampling_pattern = cycles_camera_sample_word(0);
+  integrator.sobol_index_mask = cycles_camera_sample_word(2);
+  integrator.blue_noise_sequence_length = cycles_camera_sample_word(3);
+  integrator.tabulated_sobol_sequence_size = cycles_camera_sample_word(4);
+  integrator.pixel_jitter = make_float2(std::bit_cast<float>(cycles_camera_sample_word(5)),
+                                        std::bit_cast<float>(cycles_camera_sample_word(6)));
+#ifdef CYCLES_WEBGPU_COMPACT_PATHS
+  uint path_settings = 7 + FILTER_TABLE_SIZE;
+  if (integrator.sampling_pattern == ccl::SAMPLING_PATTERN_TABULATED_SOBOL) {
+    path_settings += integrator.tabulated_sobol_sequence_size *
+                     NUM_TAB_SOBOL_PATTERNS * NUM_TAB_SOBOL_DIMENSIONS;
+  }
+  integrator.scrambling_distance = std::bit_cast<float>(cycles_camera_sample_word(path_settings + 2));
+#else
+  integrator.scrambling_distance = std::bit_cast<float>(rng.w);
+#endif
+
+  IntegratorStateCPU state{};
+  state.ray.P = make_float3(entry.x, entry.y, entry.z);
+  state.ray.time = entry.w;
+  state.isect.prim = int(surface.x);
+  state.isect.object = int(surface.y);
+#ifdef CYCLES_WEBGPU_COMPACT_PATHS
+  state.subsurface.N = make_float3(shading_normal.x, shading_normal.y, shading_normal.z);
+#else
+  state.subsurface.N = make_float3(normal.x, normal.y, normal.z);
+#endif
+  state.subsurface.albedo = make_float3(albedo.x, albedo.y, albedo.z);
+  state.subsurface.radius = make_float3(radius.x, radius.y, radius.z);
+  state.subsurface.anisotropy = radius.w;
+  state.path.throughput = make_float3(weight.x, weight.y, weight.z);
+  RNGState rng_state{rng.x, rng.y, int(rng.z)};
+  ShaderData sd{};
+  sd.wi = -make_float3(incident.x, incident.y, incident.z);
+  Bssrdf bssrdf{};
+#ifdef CYCLES_WEBGPU_COMPACT_PATHS
+  bssrdf.type = ClosureType(int(normal.w));
+#else
+  bssrdf.type = normal.w == 0.0f ? CLOSURE_BSSRDF_RANDOM_WALK_ID :
+                                  CLOSURE_BSSRDF_RANDOM_WALK_SKIN_ID;
+#endif
+  bssrdf.N = make_float3(normal.x, normal.y, normal.z);
+  bssrdf.ior = albedo.w;
+  bssrdf.alpha = weight.w;
+#ifdef CYCLES_WEBGPU_COMPACT_PATHS
+  /* SVM has validated all three radii and clamped the uniform inputs. */
+  bssrdf.radius = state.subsurface.radius;
+  bssrdf.albedo = state.subsurface.albedo;
+  bssrdf_setup_radius(&bssrdf, bssrdf.type);
+  state.subsurface.radius = bssrdf.radius;
+  if (bssrdf.type == CLOSURE_BSSRDF_RANDOM_WALK_SKIN_ID) {
+    bssrdf.alpha = 1.0f;
+  }
+  const float3 Ng = make_float3(geometric.x, geometric.y, geometric.z);
+#else
+  const float3 Ng = bssrdf.N;
+#endif
+  float3 outgoing = zero_float3();
+  const bool entered = subsurface_entry_bounce(&globals, &bssrdf, &sd, &rng_state, &outgoing);
+  state.ray.D = outgoing;
+  Ray ray{};
+  LocalIntersection local{};
+  if (entered && dot(Ng, outgoing) < 0.0f &&
+      subsurface_random_walk(&globals, &state, rng_state, ray, local))
+  {
+    const Intersection &exit = local.hits[0];
+    hit = {1, uint(exit.prim), uint(exit.object), uint(exit.type)};
+    coordinates = {exit.t, exit.u, exit.v, 0.0f};
+#ifdef CYCLES_WEBGPU_COMPACT_PATHS
+    /* Match subsurface_scatter(): approach the exit from outside the object. */
+    const float3 P = ray.P + ray.D * ray.tmax * 2.0f;
+    exit_origin = {P.x, P.y, P.z, 0.0f};
+    exit_direction = {-ray.D.x, -ray.D.y, -ray.D.z, ray.tmax};
+#else
+    exit_direction = {ray.D.x, ray.D.y, ray.D.z, 0.0f};
+#endif
+    const Spectrum result = state.path.throughput;
+    throughput = {result.x, result.y, result.z, 0.0f};
+  }
+  else {
+    hit = {};
+    coordinates = {};
+    exit_direction = {};
+    throughput = {};
+#ifdef CYCLES_WEBGPU_COMPACT_PATHS
+    exit_origin = {};
+#endif
+  }
+}
+#endif
 
 #ifdef CYCLES_WEBGPU_SURFACE
 #  ifdef CYCLES_WEBGPU_COMPACT_PATHS

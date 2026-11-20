@@ -107,12 +107,68 @@ inline bool cycles_webgpu_svm_triangle_attributes(const Scene &scene,
   return required == 0;
 }
 
+inline bool cycles_webgpu_svm_generated_attributes(const Scene &scene,
+                                                   const std::vector<bool> &shaders,
+                                                   uint32_t *destination)
+{
+  const auto &triangle_shaders = scene.dscene.tri_shader;
+  size_t pending = 0;
+  for (size_t i = 0; i < triangle_shaders.size(); ++i) {
+    pending += shaders[triangle_shaders.data()[i] & SHADER_MASK];
+  }
+
+  for (const Geometry *geometry : scene.geometry) {
+    if (!geometry->is_mesh()) {
+      continue;
+    }
+    const auto &mesh = static_cast<const Mesh &>(*geometry);
+    if (mesh.prim_offset > triangle_shaders.size() ||
+        mesh.num_triangles() > triangle_shaders.size() - mesh.prim_offset)
+    {
+      return false;
+    }
+    const Attribute *attribute = mesh.attributes.find(ATTR_STD_GENERATED);
+    const bool valid = attribute && attribute->element == ATTR_ELEMENT_VERTEX &&
+                       attribute->type == TypePoint && attribute->size >= 0 &&
+                       size_t(attribute->size) == mesh.num_verts();
+    const packed_float3 *generated = valid ? attribute->data<packed_float3>() : nullptr;
+    for (size_t i = 0; i < mesh.num_triangles(); ++i) {
+      const size_t triangle = mesh.prim_offset + i;
+      if (!shaders[triangle_shaders.data()[triangle] & SHADER_MASK]) {
+        continue;
+      }
+      if (!generated || pending == 0) {
+        return false;
+      }
+      const Mesh::Triangle indices = mesh.get_triangle(i);
+      for (size_t corner = 0; corner < 3; ++corner) {
+        if (size_t(indices.v[corner]) >= mesh.num_verts()) {
+          return false;
+        }
+        const packed_float3 value = generated[indices.v[corner]];
+        if (!(fabsf(value.x) <= 8192.0f && fabsf(value.y) <= 8192.0f &&
+              fabsf(value.z) <= 8192.0f))
+        {
+          return false;
+        }
+        const size_t word = triangle * webgpu_svm_triangle_generated_words + 3 * corner;
+        destination[word] = std::bit_cast<uint32_t>(value.x);
+        destination[word + 1] = std::bit_cast<uint32_t>(value.y);
+        destination[word + 2] = std::bit_cast<uint32_t>(value.z);
+      }
+      --pending;
+    }
+  }
+  return pending == 0;
+}
+
 /* Keep the synchronized scene bytecode verbatim and snapshot the texture inputs
  * used by triangle materials. Eval and eligibility share the supported opcodes. */
 inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
                                                std::vector<uint32_t> &words,
                                                bool &has_ggx,
                                                bool &has_transmission,
+                                               bool &has_subsurface,
                                                std::string &reason,
                                                size_t max_words)
 {
@@ -129,6 +185,7 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   }
 
   std::vector<WebGPUSvmImage> images;
+  size_t image_slots = 0;
   size_t remaining = max_words - header - count;
   const auto fetch = [&](const uint index) { return uint(dscene.svm_nodes.data()[index]); };
   const auto image = [&](int id, float2 uv, float3 &color) {
@@ -140,11 +197,17 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
       if (!cycles_webgpu_svm_image_info(scene, id, item.info)) {
         return false;
       }
-      const size_t required = webgpu_svm_image_words + item.pixel_count() * 3;
+      const size_t slots = std::max(image_slots, size_t(id) + 1);
+      const size_t added_slots = slots - image_slots;
+      if (added_slots > remaining / webgpu_svm_image_words) {
+        return false;
+      }
+      const size_t required = added_slots * webgpu_svm_image_words + item.pixel_count() * 3;
       if (required > remaining) {
         return false;
       }
       remaining -= required;
+      image_slots = slots;
       images.push_back(item);
       found = images.end() - 1;
     }
@@ -161,9 +224,13 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
 
   std::vector<bool> checked(shader_count, false);
   std::vector<bool> uv_shaders(shader_count, false);
+  std::vector<bool> generated_shaders(shader_count, false);
   bool have_uv = false;
+  bool have_generated = false;
   bool have_ggx = false;
   bool have_transmission = false;
+  bool have_subsurface = false;
+  const float3 rgb_to_y = make_float3(dscene.data.film.rgb_to_y);
   for (size_t i = 0; i < dscene.tri_shader.size(); ++i) {
     const uint shader = dscene.tri_shader.data()[i] & SHADER_MASK;
     if (shader >= shader_count) {
@@ -177,13 +244,17 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     const Shader &material = *scene.shaders[shader];
     WebGPUSvmMaterial decoded;
     bool uses_uv = false;
+    bool uses_generated = false;
     if (material.id != shader || material.has_volume_connected || material.has_volume ||
         material.has_displacement || material.has_bump_from_surface ||
         material.has_bump_from_displacement || material.has_aov_output_node ||
         !webgpu_svm_eval_material(fetch,
                                  image,
                                  WebGPUSvmUv{0.25f, 0.25f},
+                                 make_float3(0.25f, 0.25f, 0.25f),
+                                 rgb_to_y,
                                  uses_uv,
+                                 uses_generated,
                                  uint(count),
                                  uint(shader_count),
                                  shader,
@@ -194,9 +265,12 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     }
     checked[shader] = true;
     uv_shaders[shader] = uses_uv;
+    generated_shaders[shader] = uses_generated;
     have_uv |= uses_uv;
+    have_generated |= uses_generated;
     have_ggx |= decoded.ggx;
     have_transmission |= decoded.ggx && decoded.transmission > 0.0f;
+    have_subsurface |= decoded.subsurface > 0.0f;
   }
 
   const size_t triangles = have_uv ? dscene.tri_shader.size() : 0;
@@ -205,6 +279,12 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     return false;
   }
   remaining -= triangles * webgpu_svm_triangle_uv_words;
+  const size_t generated_triangles = have_generated ? dscene.tri_shader.size() : 0;
+  if (generated_triangles > remaining / webgpu_svm_triangle_generated_words) {
+    reason = "WebGPU Cycles Generated coordinates exceed the scene budget";
+    return false;
+  }
+  remaining -= generated_triangles * webgpu_svm_triangle_generated_words;
   std::vector<uint32_t> packed(max_words - remaining);
   packed[0] = uint32_t(count);
   packed[1] = uint32_t(shader_count);
@@ -213,17 +293,28 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   }
   const size_t texture = webgpu_svm_header_words + count;
   packed[texture] = uint32_t(triangles);
-  packed[texture + 1] = uint32_t(images.size());
+  packed[texture + 1] = uint32_t(image_slots);
+  packed[texture + 2] = uint32_t(generated_triangles);
+  packed[texture + 3] = std::bit_cast<uint32_t>(rgb_to_y.x);
+  packed[texture + 4] = std::bit_cast<uint32_t>(rgb_to_y.y);
+  packed[texture + 5] = std::bit_cast<uint32_t>(rgb_to_y.z);
   const size_t uv = texture + webgpu_svm_texture_header_words;
   if (have_uv && !cycles_webgpu_svm_triangle_attributes(scene, uv_shaders, packed.data() + uv)) {
     reason = "WebGPU Cycles needs an active corner UV layer on textured triangles";
     return false;
   }
 
-  size_t record = uv + triangles * webgpu_svm_triangle_uv_words;
-  size_t texel = record + images.size() * webgpu_svm_image_words;
+  const size_t generated = uv + triangles * webgpu_svm_triangle_uv_words;
+  if (have_generated &&
+      !cycles_webgpu_svm_generated_attributes(scene, generated_shaders, packed.data() + generated))
+  {
+    reason = "WebGPU Cycles needs synchronized vertex Generated coordinates";
+    return false;
+  }
+  const size_t image_table = generated + generated_triangles * webgpu_svm_triangle_generated_words;
+  size_t texel = image_table + image_slots * webgpu_svm_image_words;
   for (const WebGPUSvmImage &item : images) {
-    packed[record++] = uint32_t(item.id);
+    size_t record = image_table + size_t(item.id) * webgpu_svm_image_words;
     packed[record++] = item.info.width;
     packed[record++] = item.info.height;
     packed[record++] = item.info.extension;
@@ -244,6 +335,7 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   words = std::move(packed);
   has_ggx = have_ggx;
   has_transmission = have_transmission;
+  has_subsurface = have_subsurface;
   reason.clear();
   return true;
 }

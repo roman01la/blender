@@ -2,10 +2,12 @@
 
 #pragma once
 
-/* Four float4 records per path: base color and status, specular tint and
+/* Five float4 records per path: base color and status, specular tint and
  * squared roughness, metallic/effective IOR/dielectric F0/mix weight, then
- * transmission weight, original IOR, and the standalone Glass BSDF flag. */
-#define CYCLES_WEBGPU_MATERIAL_VECTORS 4
+ * transmission weight, original IOR, the standalone Glass BSDF flag and
+ * subsurface weight, followed by subsurface RGB radius and encoded anisotropy.
+ * Subsurface stores its entry IOR and BSSRDF type in the two Glass slots. */
+#define CYCLES_WEBGPU_MATERIAL_VECTORS 5
 #define CYCLES_WEBGPU_MATERIAL_WORDS (4 * CYCLES_WEBGPU_MATERIAL_VECTORS)
 #define CYCLES_WEBGPU_MATERIAL_GGX 3.0f
 #define CYCLES_WEBGPU_MATERIAL_MULTISCATTER_GGX 4.0f
@@ -23,4 +25,4 @@
 #define CYCLES_WEBGPU_GGX_GLASS_LOOKUP_WORDS \
   (2 * (CYCLES_WEBGPU_GGX_GLASS_ENERGY_WORDS + CYCLES_WEBGPU_GGX_GLASS_AVERAGE_ENERGY_WORDS))
 #define CYCLES_WEBGPU_LIGHT_HEADER_WORDS 12
-#define CYCLES_WEBGPU_PATH_SETTINGS_WORDS 9
+#define CYCLES_WEBGPU_PATH_SETTINGS_WORDS 10

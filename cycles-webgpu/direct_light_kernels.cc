@@ -16,6 +16,9 @@
 #undef __KERNEL_GPU__
 
 __attribute__((pure)) unsigned int cycles_light_word(unsigned int index);
+#ifdef CYCLES_WEBGPU_SHADE_BACKGROUND
+unsigned int cycles_film_transparent();
+#endif
 
 namespace ccl {
 
@@ -88,6 +91,7 @@ static inline float cycles_rectangle_sinf(const float angle)
 #  include "kernel/light/area.h"
 #  undef sinf
 #  ifdef CYCLES_WEBGPU_LIGHT_TREE
+#    include "kernel/bvh/util.h"
 namespace ccl {
 
 inline float2 light_fetch(KernelGlobals kg, light_background_marginal_cdf_tag, uint index)
@@ -202,7 +206,8 @@ bool sample_point_distribution(const unsigned int descriptor,
                                const ccl::float3 P,
                                const ccl::float3 N,
                                ccl::LightSample &light,
-                               unsigned int &strength_offset)
+                               unsigned int &strength_offset,
+                               const unsigned int subsurface_steps)
 {
   ccl::LightGlobals globals;
   setup_light_sampling(globals, cycles_light_word(descriptor + CYCLES_WEBGPU_POINT_SAMPLING));
@@ -213,7 +218,7 @@ bool sample_point_distribution(const unsigned int descriptor,
                                                                CYCLES_WEBGPU_POINT_PDF);
 
   /* Cycles reserves the first two light random dimensions for position sampling. */
-  const auto random = light_sample_random(&globals, sampling.x, sampling.y, path.x);
+  const auto random = light_sample_random(&globals, sampling.x, sampling.y, path.x + subsurface_steps);
   ccl::light_distribution_sample(&globals, random.z, &light);
   const int lamp_id = ~ccl::light_fetch(
       &globals, ccl::light_distribution_tag{}, unsigned(light.emitter_id)).prim;
@@ -309,6 +314,7 @@ ccl::Spectrum environment_radiance(const unsigned int width,
 [[gnu::always_inline]] bool sample_mixed_lights(const unsigned int descriptor,
                          const UInt4 sampling,
                          const unsigned int bounce,
+                         const unsigned int subsurface_steps,
                          const ccl::float3 P,
                          const ccl::float3 N,
                          ccl::LightSample &light,
@@ -317,7 +323,7 @@ ccl::Spectrum environment_radiance(const unsigned int width,
   ccl::LightGlobals globals;
   ccl::setup_light_tree(globals, descriptor);
   setup_light_sampling(globals, cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_SAMPLING));
-  const auto random = light_sample_random(&globals, sampling.x, sampling.y, bounce);
+  const auto random = light_sample_random(&globals, sampling.x, sampling.y, bounce + subsurface_steps);
   if (!ccl::webgpu_light_tree_select(&globals, random.z, P, N, &light)) {
     return false;
   }
@@ -388,6 +394,7 @@ unsigned int direct_surface_light(UInt4 position,
                                   [[maybe_unused]] UInt4 sampling = {},
                                   [[maybe_unused]] UInt4 path = {},
                                   [[maybe_unused]] unsigned int descriptor = 0,
+                                  [[maybe_unused]] unsigned int subsurface_steps = 0,
                                   [[maybe_unused]] ShadowRay *shadow = nullptr)
 {
   result = {0, 0, 0, 1};
@@ -398,7 +405,7 @@ unsigned int direct_surface_light(UInt4 position,
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
 #  ifndef CYCLES_WEBGPU_SHADE_BACKGROUND
   ccl::Spectrum strength;
-  if (!sample_mixed_lights(descriptor, sampling, path.x, P, N, light, strength)) {
+  if (!sample_mixed_lights(descriptor, sampling, path.x, subsurface_steps, P, N, light, strength)) {
     return Backlit;
   }
 #  else
@@ -407,7 +414,8 @@ unsigned int direct_surface_light(UInt4 position,
 #else
   unsigned int strength_offset = 4;
 #  ifdef CYCLES_WEBGPU_POINT_DISTRIBUTION
-  if (!sample_point_distribution(descriptor, sampling, path, P, N, light, strength_offset)) {
+  if (!sample_point_distribution(descriptor, sampling, path, P, N, light, strength_offset,
+                                 subsurface_steps)) {
     return Backlit;
   }
 #else
@@ -418,7 +426,7 @@ unsigned int direct_surface_light(UInt4 position,
     unpack_area_light(descriptor, lamp);
     ccl::LightGlobals globals;
     setup_light_sampling(globals, cycles_light_word(descriptor + CYCLES_WEBGPU_LIGHT_SAMPLING));
-    const auto random = light_sample_random(&globals, sampling.x, sampling.y, path.x);
+    const auto random = light_sample_random(&globals, sampling.x, sampling.y, path.x + subsurface_steps);
     if (!ccl::area_light_sample<false>(&lamp, ccl::make_float2(random), P, &light))
     {
       return Backlit;
@@ -554,6 +562,93 @@ Float4 background_radiance()
   return {background.x, background.y, background.z, 1};
 }
 
+#if defined(CYCLES_WEBGPU_WAVEFRONT_LIGHT) && defined(CYCLES_WEBGPU_LIGHT_TREE)
+[[gnu::always_inline]] Float4 accumulate_forward_lamps(
+    ccl::KernelGlobals tree,
+    const unsigned int descriptor,
+    const UInt4 origin,
+    const ccl::float3 direction,
+    const float mesh_distance,
+    const ccl::PathRayVisibility visibility,
+    const UInt4 path,
+    const ccl::float3 previous_N,
+    const ccl::float3 throughput,
+    const unsigned int transparent_bounce,
+    const float clamp_limit)
+{
+  const unsigned int first = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_FIRST_FORWARD_LAMP);
+  const unsigned int end = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_LAMP_COUNT);
+  const unsigned int limit = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_TRANSPARENT_MAX_BOUNCE);
+  const unsigned int remaining = limit > transparent_bounce ? limit - transparent_bounce : 1;
+  const bool primary = (visibility & ccl::PATH_RAY_VISIBILITY_CAMERA) != 0;
+  ccl::Ray ray{};
+  ray.P = unpack_rgb(origin);
+  ray.D = direction;
+  ray.tmin = std::bit_cast<float>(origin.w);
+  ray.tmax = mesh_distance;
+
+  ccl::Spectrum radiance = ccl::zero_spectrum();
+  unsigned int previous = end;
+  unsigned int hits = 0;
+  /* Use Cycles' nearest-lamp order and transparent-bounce accounting. The
+   * mesh hit is already known, so there is no need to traverse it again. */
+  while (hits < remaining && ray.tmin < ray.tmax) {
+    unsigned int nearest = end;
+    float distance = ray.tmax;
+    for (unsigned int index = first; index < end; ++index) {
+      const unsigned int words = ccl::light_tree_lamp_word(tree, index);
+      const unsigned int type = cycles_light_word(words + CYCLES_WEBGPU_TREE_LAMP_TYPE);
+      if (index == previous || (type != ccl::LIGHT_AREA && type != ccl::LIGHT_POINT)) {
+        continue;
+      }
+      const int shader = std::bit_cast<int>(cycles_light_word(words + CYCLES_WEBGPU_TREE_LAMP_SHADER));
+      if (primary ? (shader & ccl::SHADER_EXCLUDE_CAMERA) : !(shader & ccl::SHADER_USE_MIS)) {
+        continue;
+      }
+      const ccl::KernelLight lamp = ccl::light_fetch(tree, ccl::lights_tag{}, index);
+      float t;
+      const bool hit = type == ccl::LIGHT_POINT ? ccl::point_light_intersect(&lamp, &ray, &t) :
+                                                ccl::area_light_intersect(&lamp, &ray, &t);
+      if (hit && t < distance) {
+        distance = t;
+        nearest = index;
+      }
+    }
+    if (nearest == end) {
+      break;
+    }
+    ++hits;
+    previous = nearest;
+    ray.tmin = ccl::intersection_t_offset(distance);
+    const ccl::KernelLight lamp = ccl::light_fetch(tree, ccl::lights_tag{}, nearest);
+    if (!ccl::is_light_shader_visible_to_path(lamp.shader_id, visibility, path.y)) {
+      continue;
+    }
+    const auto eval = lamp.type == ccl::LIGHT_POINT ?
+                          ccl::point_light_eval_from_intersection(
+                              &lamp, ray.P, ray.D, distance, previous_N, path.y) :
+                          ccl::area_light_eval_from_intersection(&lamp, ray.P, ray.D, distance);
+    const unsigned int words = ccl::light_tree_lamp_word(tree, nearest);
+    float mis = 1.0f;
+    if (!primary && !(path.y & ccl::PATH_RAY_MIS_SKIP)) {
+      const unsigned int emitter = cycles_light_word(words + CYCLES_WEBGPU_TREE_LAMP_EMITTER);
+      const float pdf = eval.pdf * ccl::webgpu_light_tree_pdf(tree, ray.P, previous_N, emitter);
+      mis = ccl::power_heuristic(std::bit_cast<float>(path.z), pdf);
+    }
+    auto contribution = ccl::ensure_finite(
+        throughput * (read_rgb(words + CYCLES_WEBGPU_TREE_LAMP_STRENGTH) * (eval.eval_fac * mis)));
+    const float sum = ccl::reduce_add(ccl::fabs(contribution));
+    if (sum > clamp_limit) {
+      contribution *= clamp_limit / sum;
+    }
+    radiance += contribution;
+  }
+  /* A negative count marks already-weighted, individually clamped emission.
+   * The legacy single-area path still outputs its positive clamp limit. */
+  return {radiance.x, radiance.y, radiance.z, -float(hits)};
+}
+#endif
+
 }  // namespace
 
 #ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
@@ -568,6 +663,7 @@ Float4 background_radiance()
                             UInt4 origin,
                             UInt4 path,
                             UInt4 sampling,
+                            unsigned int subsurface_steps,
                             Float4 material,
                             Float4 specular,
                             Float4 parameters,
@@ -575,7 +671,7 @@ Float4 background_radiance()
                             Float4 &result,
                             Float4 &area_result
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
-                            , UInt4 mis_origin_normal
+                            , UInt4 mis_origin_normal, Float4 throughput
 #endif
 #ifdef CYCLES_WEBGPU_DEFER_SHADOW
                             , UInt4 &shadow_origin,
@@ -606,76 +702,59 @@ Float4 background_radiance()
 #else
 #  ifdef CYCLES_WEBGPU_LIGHT_TREE
   const unsigned int descriptor = cycles_light_word(CYCLES_WEBGPU_LIGHT_TREE_OFFSET);
-  const unsigned int forward_lamp = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_AREA_LAMP);
   const auto previous_P = unpack_rgb(origin);
   const auto previous_N = unpack_rgb(mis_origin_normal);
   ccl::LightGlobals tree;
   ccl::setup_light_tree(tree, descriptor);
-  const bool has_forward_lamp = forward_lamp != CYCLES_WEBGPU_TREE_NO_LAMP;
 #  else
   const unsigned int descriptor = cycles_light_word(CYCLES_WEBGPU_LIGHT_EXTENDED);
   const bool has_area = descriptor != 0;
-  const bool has_forward_lamp = has_area;
 #  endif
   const auto direction = unpack_rgb(ray);
   const auto visibility = static_cast<ccl::PathRayVisibility>(ray.w);
-  if (has_forward_lamp) {
 #  ifdef CYCLES_WEBGPU_LIGHT_TREE
-    const unsigned int lamp_words = ccl::light_tree_lamp_word(&tree, forward_lamp);
-    const int lamp_shader = std::bit_cast<int>(
-        cycles_light_word(lamp_words + CYCLES_WEBGPU_TREE_LAMP_SHADER));
+  if (!(path.y & ccl::PATH_RAY_SUBSURFACE) &&
+      cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_FIRST_FORWARD_LAMP) !=
+      CYCLES_WEBGPU_TREE_NO_LAMP)
+  {
+    area_result = accumulate_forward_lamps(&tree,
+                                          descriptor,
+                                          origin,
+                                          direction,
+                                          std::bit_cast<float>(hit.w),
+                                          visibility,
+                                          path,
+                                          previous_N,
+                                          ccl::make_float3(throughput.x, throughput.y, throughput.z),
+                                          sampling.w,
+                                          forward_clamp);
+  }
 #  else
+  if (has_area && !(path.y & ccl::PATH_RAY_SUBSURFACE)) {
     const int lamp_shader = std::bit_cast<int>(
         cycles_light_word(descriptor + CYCLES_WEBGPU_AREA_SHADER));
-#  endif
     if ((primary && !(lamp_shader & ccl::SHADER_EXCLUDE_CAMERA)) ||
         (!primary && (lamp_shader & ccl::SHADER_USE_MIS)))
     {
-#  ifdef CYCLES_WEBGPU_LIGHT_TREE
-      const ccl::KernelLight lamp = ccl::light_fetch(&tree, ccl::lights_tag{}, forward_lamp);
-#  else
       ccl::KernelLight lamp{};
       unpack_area_light(descriptor, lamp);
-#  endif
       ccl::Ray forward{};
       forward.P = unpack_rgb(origin);
       forward.D = direction;
       forward.tmin = std::bit_cast<float>(origin.w);
       forward.tmax = std::bit_cast<float>(hit.w);
       float t;
-#  ifdef CYCLES_WEBGPU_LIGHT_TREE
-      const bool is_point = lamp.type == ccl::LIGHT_POINT;
-      const bool intersects = is_point ? ccl::point_light_intersect(&lamp, &forward, &t) :
-                                         ccl::area_light_intersect(&lamp, &forward, &t);
-#  else
       const bool intersects = ccl::area_light_intersect(&lamp, &forward, &t);
-#  endif
       if (intersects && t < forward.tmax) {
         area_result = {0, 0, 0, forward_clamp};
         if (ccl::is_light_shader_visible_to_path(lamp_shader, visibility, path.y)) {
-#  ifdef CYCLES_WEBGPU_LIGHT_TREE
-          const auto eval = is_point ? ccl::point_light_eval_from_intersection(
-                                          &lamp, forward.P, forward.D, t, previous_N, path.y) :
-                                       ccl::area_light_eval_from_intersection(
-                                           &lamp, forward.P, forward.D, t);
-#  else
           const auto eval = ccl::area_light_eval_from_intersection(&lamp, forward.P, forward.D, t);
-#  endif
           const float bsdf_pdf = std::bit_cast<float>(path.z);
           float mis = 1.0f;
           if (!(path.y & ccl::PATH_RAY_MIS_SKIP) && !primary) {
-            float pdf = eval.pdf;
-#  ifdef CYCLES_WEBGPU_LIGHT_TREE
-            const unsigned int emitter = cycles_light_word(lamp_words + CYCLES_WEBGPU_TREE_LAMP_EMITTER);
-            pdf *= ccl::webgpu_light_tree_pdf(&tree, previous_P, previous_N, emitter);
-#  endif
-            mis = ccl::power_heuristic(bsdf_pdf, pdf);
+            mis = ccl::power_heuristic(bsdf_pdf, eval.pdf);
           }
-#  ifdef CYCLES_WEBGPU_LIGHT_TREE
-          const auto rgb = read_rgb(lamp_words + CYCLES_WEBGPU_TREE_LAMP_STRENGTH) * (eval.eval_fac * mis);
-#  else
           const auto rgb = read_rgb(4) * (eval.eval_fac * mis);
-#  endif
           area_result = {rgb.x, rgb.y, rgb.z, forward_clamp};
         }
         /* Cycles continues the same ray after a forward light hit. The closest
@@ -683,7 +762,16 @@ Float4 background_radiance()
       }
     }
   }
+#  endif
   if (position.w == 0) {
+#  ifdef CYCLES_WEBGPU_SHADE_BACKGROUND
+    /* Film Transparent hides camera misses without changing world lighting
+     * on surfaces. Match the stock background kernel's early skip. */
+    if ((path.y & ccl::PATH_RAY_TRANSPARENT_BACKGROUND) && cycles_film_transparent()) {
+      result.w = -forward_clamp;
+      return;
+    }
+#  endif
 #  ifdef CYCLES_WEBGPU_LIGHT_TREE
     const int world_shader = std::bit_cast<int>(
         cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_SHADER));
@@ -742,7 +830,8 @@ Float4 background_radiance()
                          shadow_opposite,
                          sampling,
                          path,
-                         descriptor
+                         descriptor,
+                         subsurface_steps
 #ifdef CYCLES_WEBGPU_DEFER_SHADOW
                          , &shadow
 #endif

@@ -77,7 +77,7 @@ constexpr GgxGlobals energy_globals = [] {
   return globals;
 }();
 
-enum Lobe { Metal, Glass, Specular, Diffuse };
+enum Lobe { Metal, Glass, Specular, Subsurface, Diffuse };
 
 #ifdef CYCLES_WEBGPU_REFLECTION_ONLY
 constexpr bool glass_enabled = false;
@@ -89,12 +89,14 @@ struct ReflectiveClosures {
   Spectrum metal_weight;
   Spectrum specular_weight;
   Spectrum diffuse_weight;
+  Spectrum subsurface_weight;
   Spectrum metal_f0;
   Spectrum metal_tint_b;
   Spectrum specular_f0;
   float metal_sample_weight;
   float specular_sample_weight;
   float diffuse_sample_weight;
+  float subsurface_sample_weight;
   float alpha;
   float eta;
   float energy_scale;
@@ -200,6 +202,7 @@ ccl_device void setup_closures(ReflectiveClosures &closures,
                                const GgxFloat4 material,
                                const GgxFloat4 tint_alpha,
                                const GgxFloat4 weights,
+                               const float subsurface,
                                const float3 N,
                                const float3 wi)
 {
@@ -281,7 +284,12 @@ ccl_device void setup_closures(ReflectiveClosures &closures,
     }
   }
 
-  closures.diffuse_weight = base_color * weight;
+  /* bssrdf_alloc and bssrdf_setup with all RGB radii active. */
+  closures.subsurface_weight = saturate(base_color) * subsurface * weight;
+  const float bssrdf_weight = fabsf(average(closures.subsurface_weight));
+  closures.subsurface_sample_weight = bssrdf_weight >= CLOSURE_WEIGHT_CUTOFF ?
+                                         bssrdf_weight * SPECTRUM_CHANNELS : 0.0f;
+  closures.diffuse_weight = base_color * (1.0f - subsurface) * weight;
   closures.diffuse_sample_weight = closure_sample_weight(0, closures.diffuse_weight);
   closures.has_diffuse = closures.diffuse_sample_weight > 0.0f;
 }
@@ -399,7 +407,7 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
     weights.w *= 1.0f - glass.x;
   }
   ReflectiveClosures closures;
-  setup_closures(closures, material, tint_alpha, weights, specular_N, wi);
+  setup_closures(closures, material, tint_alpha, weights, glass.w, specular_N, wi);
   closures.alpha = fmaxf(closures.alpha, blur_alpha);
   Spectrum eval = zero_spectrum();
   float weighted_pdf = 0.0f;
@@ -418,7 +426,8 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
   }
   const float total = closures.metal_sample_weight +
                       (has_glass ? glass_bsdf.sample_weight : 0.0f) +
-                      closures.specular_sample_weight + closures.diffuse_sample_weight;
+                      closures.specular_sample_weight + closures.subsurface_sample_weight +
+                      closures.diffuse_sample_weight;
   return {eval.x, eval.y, eval.z, total > 0.0f ? weighted_pdf / total : 0.0f};
 }
 
@@ -457,14 +466,15 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
     weights.w *= 1.0f - glass.x;
   }
   ReflectiveClosures closures;
-  setup_closures(closures, material, tint_alpha, weights, specular_N, wi);
+  setup_closures(closures, material, tint_alpha, weights, glass.w, specular_N, wi);
   closures.alpha = fmaxf(closures.alpha, blur_alpha);
 
   const float metal = closures.metal_sample_weight;
   const float glass_weight = has_glass ? glass_bsdf.sample_weight : 0.0f;
   const float specular = closures.specular_sample_weight;
   const float diffuse = closures.diffuse_sample_weight;
-  const float total = metal + glass_weight + specular + diffuse;
+  const float subsurface = closures.subsurface_sample_weight;
+  const float total = metal + glass_weight + specular + subsurface + diffuse;
   if (!(total > 0.0f)) {
     return LABEL_NONE;
   }
@@ -473,7 +483,7 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
   Lobe lobe = closures.has_metal ? Metal : has_glass ? Glass :
               closures.has_specular ? Specular : Diffuse;
   float3 random = rgb(random_seed);
-  const bool multiple = (has_glass &&
+  const bool multiple = subsurface > 0.0f || (has_glass &&
                          (closures.has_metal || closures.has_specular || closures.has_diffuse)) ||
                         (closures.has_metal && closures.has_specular) ||
                         (closures.has_diffuse && (closures.has_metal || closures.has_specular));
@@ -491,6 +501,10 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
       lobe = Specular;
       random.z = (r - (metal + glass_weight)) / specular;
     }
+    else if (subsurface > 0.0f && (r < metal + glass_weight + specular + subsurface ||
+                                      diffuse == 0.0f)) {
+      lobe = Subsurface;
+    }
     else if (r < total) {
       lobe = Diffuse;
     }
@@ -501,7 +515,15 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
   float pdf = 0.0f;
   float selected_weight;
   int label = LABEL_REFLECT | LABEL_GLOSSY;
-  if (lobe == Diffuse) {
+  if (lobe == Subsurface) {
+    /* surface_shader_bssrdf_sample_weight compensates for choosing this closure. */
+    eval = closures.subsurface_weight * (total / subsurface);
+    wo = zero_float3();
+    pdf = 1.0f;
+    selected_weight = subsurface;
+    label = LABEL_SUBSURFACE_SCATTER;
+  }
+  else if (lobe == Diffuse) {
     wo = zero_float3();
     webgpu_sample_cos_hemisphere(N, make_float2(random), &wo, &pdf);
     if (!(dot(Ng, wo) > 0.0f)) {
@@ -565,9 +587,9 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
 
   /* The balance heuristic also evaluates the other lobes at the sampled
    * direction. The selected lobe is accumulated first, as in Cycles. */
-  if (multiple) {
+  if (multiple && lobe != Subsurface) {
     float weighted_pdf = pdf * selected_weight;
-    float sum_weight = selected_weight;
+    float sum_weight = selected_weight + subsurface;
     const bool specular_eval = valid_specular_eval(N, specular_N, wo);
     if (closures.has_metal && lobe != Metal) {
       if (specular_eval) {
@@ -662,7 +684,7 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
     }
 
     ReflectiveClosures closures;
-    setup_closures(closures, material, tint_alpha, weights, specular_N, wi);
+    setup_closures(closures, material, tint_alpha, weights, glass.w, specular_N, wi);
     const float alpha = fmaxf(closures.alpha, blur_alpha);
     if (closures.has_metal) {
       FresnelF82Tint fresnel = {.thin_film = {}, .f0 = closures.metal_f0, .b = closures.metal_tint_b};
@@ -692,6 +714,10 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
       const Spectrum estimate = bsdf_microfacet_estimate_albedo(&energy_globals, wi, &bsdf, true, true);
       features.add(closures.specular_weight * estimate, specular_N, alpha,
                    CLOSURE_BSDF_MICROFACET_GGX_ID, roughness_weighting);
+    }
+    if (closures.subsurface_sample_weight > 0.0f) {
+      features.add(closures.subsurface_weight, specular_N, 1.0f,
+                   CLOSURE_BSSRDF_RANDOM_WALK_ID, roughness_weighting);
     }
     if (closures.has_diffuse) {
       features.add(closures.diffuse_weight, N, 1.0f, CLOSURE_BSDF_DIFFUSE_ID, roughness_weighting);

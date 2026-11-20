@@ -65,10 +65,11 @@ void main(uint3 id : SV_DispatchThreadID)
   const float4 area = radiance[ray_words[0] + lane];
   float3 emission = float3(0, 0, 0);
   bool trace_past_area = true;
-  if (area.w > 0.0f) {
+  const uint forward_hits = cycles_forward_light_hits(area);
+  if (forward_hits != 0) {
     trace_past_area = cycles_trace_past_area_limit(
-        path_words[path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE] + 1);
-    emission += clamp_light(throughput * area.xyz, area.w);
+        path_words[path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE] + forward_hits);
+    emission += cycles_forward_emission(area, throughput);
   }
   if (trace_past_area && incoming.w < 0.0f) {
     emission += clamp_light(throughput * incoming.xyz, -incoming.w);
@@ -78,7 +79,9 @@ void main(uint3 id : SV_DispatchThreadID)
   const float surface_rr = __builtin_bit_cast(
       float, path_words[path + CYCLES_WEBGPU_PATH_SURFACE_RR]);
   const uint flags = path_words[path + CYCLES_WEBGPU_PATH_FLAGS];
-  const bool shade_surface = trace_past_area && incoming.w >= 0.0f && surface_rr > 0.0f &&
+  // Blender writes denoising features at the subsurface entry only.
+  const bool shade_surface = (flags & CYCLES_WEBGPU_PATH_SUBSURFACE_RANDOM_WALK) == 0 &&
+                             trace_past_area && incoming.w >= 0.0f && surface_rr > 0.0f &&
                              (flags & CYCLES_WEBGPU_PATH_TERMINATE_AFTER_TRANSPARENT) == 0;
   if (shade_surface) {
     const uint surface = 8 * lane;
