@@ -21,6 +21,67 @@ R2_FILES = {
 }
 STATIC_LIMIT = 25 * 1024**2
 WRANGLER_R2_LIMIT = 300 * 1024**2
+SITE = "https://blender.rocks/"
+TITLE = "Blender in the browser · free 3D editor on WebGPU"
+DESCRIPTION = (
+    "Run Blender in your browser with nothing to install. An unofficial WebGPU port of the "
+    "free 3D creation suite, with Eevee and Cycles rendering."
+)
+PREVIEW = "social-preview.jpg"
+PREVIEW_ALT = "The Blender editor running in a browser, showing the default cube scene"
+
+
+def search_metadata():
+    """Return head tags for search results and link previews."""
+    data = {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "Blender in the browser",
+        "url": SITE,
+        "description": DESCRIPTION,
+        "applicationCategory": "DesignApplication",
+        "operatingSystem": "Windows, macOS, Linux, ChromeOS",
+        "browserRequirements": "Requires WebGPU",
+        "isAccessibleForFree": True,
+        "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
+        "license": "https://www.gnu.org/licenses/gpl-3.0.html",
+        "screenshot": SITE + PREVIEW,
+    }
+    tags = [
+        f'<meta name="description" content="{DESCRIPTION}">',
+        f'<link rel="canonical" href="{SITE}">',
+        '<meta name="theme-color" content="#202020">',
+        '<meta property="og:type" content="website">',
+        '<meta property="og:site_name" content="blender.rocks">',
+        f'<meta property="og:url" content="{SITE}">',
+        f'<meta property="og:title" content="{TITLE}">',
+        f'<meta property="og:description" content="{DESCRIPTION}">',
+        f'<meta property="og:image" content="{SITE}{PREVIEW}">',
+        '<meta property="og:image:width" content="1200">',
+        '<meta property="og:image:height" content="630">',
+        f'<meta property="og:image:alt" content="{PREVIEW_ALT}">',
+        '<meta name="twitter:card" content="summary_large_image">',
+        f'<meta name="twitter:title" content="{TITLE}">',
+        f'<meta name="twitter:description" content="{DESCRIPTION}">',
+        f'<meta name="twitter:image" content="{SITE}{PREVIEW}">',
+        f'<meta name="twitter:image:alt" content="{PREVIEW_ALT}">',
+        f'<script type="application/ld+json">{json.dumps(data)}</script>',
+    ]
+    return "\n".join(tags) + "\n"
+
+
+def crawl_files(public):
+    """Point crawlers at the single public page."""
+    modified = subprocess.check_output(
+        ["git", "-C", PORT, "log", "-1", "--format=%cs"], text=True
+    ).strip()
+    (public / "robots.txt").write_text(f"User-agent: *\nAllow: /\n\nSitemap: {SITE}sitemap.xml\n")
+    (public / "sitemap.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"  <url><loc>{SITE}</loc><lastmod>{modified}</lastmod></url>\n"
+        "</urlset>\n"
+    )
 
 
 def source_url(repository, verify):
@@ -52,18 +113,33 @@ def stage(package, output, source):
     shutil.copytree(package, public, ignore=shutil.ignore_patterns(*R2_FILES))
     shutil.copyfile(PORT / "favicon.png", public / "favicon.png")
     shutil.copyfile(PORT / "LICENSE", public / "license.txt")
+    shutil.copyfile(CLOUDFLARE / PREVIEW, public / PREVIEW)
+    crawl_files(public)
     launcher = public / "index.html"
     html = launcher.read_text()
     html, favicon_count = re.subn(
         r'<link rel="icon"[^>]*>', '<link rel="icon" type="image/png" href="./favicon.png">', html
     )
+    html, title_count = re.subn(r"<title>[^<]*</title>", f"<title>{TITLE}</title>", html)
+    status = '  <p id="status" role="status">'
     indicator = '  <progress aria-label="Blender startup"></progress>'
-    if favicon_count != 1 or html.count("</style>") != 1 or html.count(indicator) != 1:
+    if (favicon_count != 1 or title_count != 1 or html.count("</style>") != 1
+            or html.count(status) != 1 or html.count(indicator) != 1):
         raise ValueError("browser package has an unexpected editor launcher")
     html = html.replace(
+        "</title>", "</title>\n" + search_metadata(), 1
+    ).replace(
         "</style>",
+        "  #loading h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }\n"
+        "  #about { max-width: 26rem; margin: 0.5rem 1rem 0; color: #aaa; font-size: 0.875rem;"
+        " line-height: 1.4; }\n"
         "  #source { font-size: 0.75rem; margin: 1rem auto 0; }\n"
         "  #source a { color: #ddd; }\n</style>",
+    ).replace(
+        status,
+        "  <h1>Blender in the browser</h1>\n"
+        '  <p id="about">An unofficial WebGPU port of Blender, the free and open-source 3D '
+        "creation suite. Nothing to install.</p>\n" + status,
     ).replace(
         indicator,
         f'{indicator}\n  <p id="source"><a href="{source}">Source code</a> · '
@@ -77,6 +153,8 @@ def stage(package, output, source):
         "  Cross-Origin-Resource-Policy: same-origin\n"
         "/\n"
         f'  Link: <{source}>; rel="alternate"; title="Source code"\n'
+        f"/{PREVIEW}\n"
+        "  ! Cross-Origin-Resource-Policy\n"
     )
     for path in public.rglob("*"):
         if path.is_file() and path.stat().st_size > STATIC_LIMIT:
