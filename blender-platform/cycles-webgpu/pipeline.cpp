@@ -1129,14 +1129,7 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
   if (!p.initialized) {
     return p.fail("Cycles WebGPU render pipeline needs to be initialized");
   }
-  if (scene.size() > max_scene_words || surface.size() > max_scene_words - scene.size() ||
-      light.size() > max_scene_words - scene.size() - surface.size() ||
-      svm.size() > max_scene_words - scene.size() - surface.size() - light.size())
-  {
-    return p.fail("Cycles WebGPU scene exceeds the packing budget");
-  }
-  const size_t binding_words = device_webgpu_compute_limits(p.device).storage_buffer_bytes /
-                               sizeof(uint32_t);
+  const size_t binding_words = device_webgpu_compute_limits(p.device).storage_buffer_words();
   if (std::max({scene.size(), surface.size(), light.size(), svm.size(), sampling.size()}) >
       binding_words)
   {

@@ -259,6 +259,13 @@ struct ComputeWorker {
             return;
           }
           wgpu::DeviceDescriptor descriptor{};
+          wgpu::Limits available{};
+          wgpu::Limits required{};
+          if (adapter.GetLimits(&available) == wgpu::Status::Success) {
+            required.maxStorageBufferBindingSize = available.maxStorageBufferBindingSize;
+            required.maxBufferSize = available.maxBufferSize;
+            descriptor.requiredLimits = &required;
+          }
           descriptor.SetDeviceLostCallback(
               wgpu::CallbackMode::AllowSpontaneous,
               [this, request](const wgpu::Device &, wgpu::DeviceLostReason reason, wgpu::StringView) {

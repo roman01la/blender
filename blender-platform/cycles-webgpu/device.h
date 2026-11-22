@@ -5,7 +5,9 @@
 #include "device/kernel.h"
 #include "util/unique_ptr.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <span>
 #include <string>
@@ -51,6 +53,12 @@ std::string device_webgpu_error(const Device &device);
 struct WebGPUComputeLimits {
   size_t storage_buffer_bytes = 0;
   uint32_t workgroups_per_dimension = 0;
+
+  /* Packed shader input offsets are unsigned 32-bit word indices. */
+  size_t storage_buffer_words() const
+  {
+    return std::min(storage_buffer_bytes / sizeof(uint32_t), size_t(UINT32_MAX));
+  }
 };
 
 /** Limits of the initialized compute device. */

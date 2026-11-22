@@ -31,9 +31,6 @@ struct WebGPURenderShaders {
  * pthread distinct from the WebGPU owner. The device must outlive the pipeline. */
 class WebGPURenderPipeline {
  public:
-  /* Bound temporary scene packing independently of each adapter's binding
-   * limit. A 2K environment and its stock importance table exceed 32 MiB. */
-  static constexpr size_t max_scene_words = (128 * 1024 * 1024) / sizeof(uint32_t);
   /* Keep one full HD slice within the film binding budget while camera work is tiled by the
    * scheduler. A 64-thread adaptive dispatch needs at most 32,768 workgroups. */
   static constexpr uint32_t max_crop_pixels = 2 * 1024 * 1024;

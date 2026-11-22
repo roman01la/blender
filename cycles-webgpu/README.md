@@ -565,8 +565,8 @@ The optional volume shaders support overlapping bounded media with opaque
 surface materials, disjoint point and area lights, and world lighting. They
 reuse Cycles' homogeneous integration, phase functions, and segment-conditioned
 Light Tree sampling. Static OpenVDB media use named Principled Volume inputs,
-NanoVDB voxel data, and stock filtering and null-collision integration. Grid
-uploads must fit the scene buffer budget, and the path supports up to eight
+NanoVDB voxel data, and stock filtering and null-collision integration. Packed
+scene buffers use the adapter's storage binding limit. The path supports up to eight
 media. Guided Open Image Denoise uses volume albedo and normal and can retain
 the film on WebGPU through export. Build `--volume-reference` to compare
 volume coefficients and phase functions with the native reference.

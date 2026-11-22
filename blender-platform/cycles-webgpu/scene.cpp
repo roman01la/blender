@@ -6,7 +6,6 @@
 #include "device/webgpu/device.h"
 #include "device/webgpu/lighting_layout.h"
 #include "device/webgpu/material_layout.h"
-#include "device/webgpu/pipeline.h"
 #include "device/webgpu/svm_materials.h"
 #include "device/webgpu/volume_grids.h"
 #include "device/webgpu/volume_layout.h"
@@ -1217,7 +1216,10 @@ bool WebGPUSceneBuffers::upload(const std::span<const uint32_t> bvh_words,
          upload_words(light, light_words) && upload_words(svm, svm_words);
 }
 
-bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std::string &reason)
+bool cycles_webgpu_encode_scene(const Scene &scene,
+                                const size_t binding_words,
+                                CyclesWebGPUScene &out,
+                                std::string &reason)
 {
   if (const char *error = scene_incompatibility(scene)) {
     reason = error;
@@ -1247,15 +1249,16 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
                                      uint64_t(dscene.objects.size()) +
                                  uint64_t(dscene.tri_shader.size()) + 2 * dscene.shaders.size() +
                                  (have_smooth ? dscene.attributes_normal.size() : 0);
-  const uint64_t base_words = bvh_words + surface_words + CYCLES_WEBGPU_LIGHT_HEADER_WORDS;
-  if (base_words > WebGPURenderPipeline::max_scene_words) {
-    reason = "WebGPU Cycles scene exceeds the upload budget";
+  if (bvh_words > binding_words || surface_words > binding_words ||
+      CYCLES_WEBGPU_LIGHT_HEADER_WORDS > binding_words)
+  {
+    reason = "WebGPU Cycles geometry or lighting exceeds the adapter storage binding limit";
     return false;
   }
-  const size_t extra_words = WebGPURenderPipeline::max_scene_words - size_t(base_words);
+  const size_t surface_extra_words = binding_words - size_t(surface_words);
   std::vector<uint> volume_shaders;
   std::vector<VolumeMedium> volume_media;
-  if (const char *error = volume ? encode_volumes(scene, extra_words, volume_shaders,
+  if (const char *error = volume ? encode_volumes(scene, surface_extra_words, volume_shaders,
                                                 volume_media) : nullptr)
   {
     reason = error;
@@ -1299,7 +1302,7 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
                                          encoded.advanced_query_svm,
                                          volume_shaders,
                                          reason,
-                                         extra_words))
+                                         binding_words))
   {
     return false;
   }
@@ -1350,8 +1353,8 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
     const size_t lookup_words = CYCLES_WEBGPU_GGX_LOOKUP_WORDS +
                                 (encoded.has_transmission ? CYCLES_WEBGPU_GGX_GLASS_LOOKUP_WORDS :
                                                             0);
-    if (lookup_words > extra_words - encoded.svm.size()) {
-      reason = "WebGPU Cycles GGX lookup tables exceed the scene upload budget";
+    if (lookup_words > binding_words - encoded.lighting.size()) {
+      reason = "WebGPU Cycles GGX lookup tables exceed the lighting storage binding limit";
       return false;
     }
     if (const char *error = encode_ggx_tables(
@@ -1361,22 +1364,20 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
       return false;
     }
   }
-  const size_t used = encoded.svm.size() + encoded.lighting.size() -
-                      CYCLES_WEBGPU_LIGHT_HEADER_WORDS + transparent_words + hair_words +
-                      volume_words;
-  if (used > extra_words) {
-    reason = "WebGPU Cycles scene metadata exceeds the upload budget";
+  if (transparent_words + hair_words + volume_words > surface_extra_words) {
+    reason = "WebGPU Cycles surface metadata exceeds the adapter storage binding limit";
     return false;
   }
+  const size_t light_extra_words = binding_words - encoded.lighting.size();
   const char *lighting_error = nullptr;
   if (light_tree) {
-    lighting_error = encode_stock_light_tree(scene, extra_words - used, encoded.lighting);
+    lighting_error = encode_stock_light_tree(scene, light_extra_words, encoded.lighting);
   }
   else if (multiple_points) {
-    lighting_error = encode_point_lighting(dscene, extra_words - used, encoded.lighting);
+    lighting_error = encode_point_lighting(dscene, light_extra_words, encoded.lighting);
   }
   else if (area) {
-    lighting_error = encode_area_lighting(scene, extra_words - used, encoded.lighting);
+    lighting_error = encode_area_lighting(scene, light_extra_words, encoded.lighting);
   }
   if (lighting_error) {
     reason = lighting_error;

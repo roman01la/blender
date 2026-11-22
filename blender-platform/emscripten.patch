@@ -11418,7 +11418,7 @@ index 4dd560fc..8595d7bb 100644
          unset(_suffix)
        endif()
  
-@@ -2071,6 +2102,60 @@ endif()
+@@ -2071,6 +2102,66 @@ endif()
  target_link_libraries(blender PRIVATE ${LIB})
  unset(LIB)
  
@@ -11430,10 +11430,17 @@ index 4dd560fc..8595d7bb 100644
 +    "-sPTHREAD_POOL_SIZE=ENVIRONMENT_IS_NODE ? 0 : (navigator.hardwareConcurrency || 1) + 6 + Math.min(navigator.hardwareConcurrency || 1, 10)"
 +    -sOFFSCREENCANVAS_SUPPORT=1
 +    -sALLOW_BLOCKING_ON_MAIN_THREAD=0
++    -sALLOW_MEMORY_GROWTH=1
 +    # Release builds skip Asyncify's diagnostic wrapper on every Wasm import.
 +    "$<$<CONFIG:Release>:-sASSERTIONS=0>"
 +    -sSTACK_SIZE=2MB
 +  )
++  # Allow heap growth up to the browser's linear memory limit.
++  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
++    target_link_options(blender PRIVATE -sMAXIMUM_MEMORY=16GB)
++  else()
++    target_link_options(blender PRIVATE -sMAXIMUM_MEMORY=4GB)
++  endif()
 +  # The Emscripten data loader populates the filesystem before main().
 +  target_link_options(blender PRIVATE
 +    -sFORCE_FILESYSTEM=1
@@ -11469,7 +11476,6 @@ index 4dd560fc..8595d7bb 100644
 +    target_link_options(blender PRIVATE
 +      -sMAIN_MODULE=2
 +      -sAUTOLOAD_DYLIBS=0
-+      -sALLOW_MEMORY_GROWTH=1
 +      "-sINITIAL_MEMORY=${BLENDER_WEB_INITIAL_MEMORY}"
 +    )
 +    target_link_libraries(blender PRIVATE ${wasm_numpy_modules})

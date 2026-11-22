@@ -7,6 +7,7 @@
 #include "device/webgpu/volume_layout.h"
 
 #include "device/device.h"
+#include "device/webgpu/device.h"
 #include "device/webgpu/pipeline.h"
 #include "scene/integrator.h"
 #include "scene/pass.h"
@@ -198,7 +199,15 @@ void WebGPUPreview::prepare(const Scene &scene, bool scene_changed)
   bool ray_differentials = camera_[CYCLES_WEBGPU_CAMERA_DIFFERENTIAL_SCALE] != 0.0f;
   if (scene_changed || !scene_checked_) {
     std::string reason;
-    scene_supported_ = cycles_webgpu_encode_scene(scene, scene_, reason);
+    const auto limits = device_webgpu_prepare_compute_limits(device_);
+    if (limits.storage_buffer_bytes) {
+      scene_supported_ = cycles_webgpu_encode_scene(
+          scene, limits.storage_buffer_words(), scene_, reason);
+    }
+    else {
+      reason = device_webgpu_error(device_);
+      scene_supported_ = false;
+    }
     volume_ = scene_supported_ && !scene_.surface.empty() &&
               scene_.surface.front() == CYCLES_WEBGPU_SURFACE_ABSORPTION_OFFSETS;
     if (volume_) {

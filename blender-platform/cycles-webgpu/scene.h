@@ -4,6 +4,7 @@
 
 #include "device/memory.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -45,6 +46,9 @@ struct CyclesWebGPUScene {
 
 /* Read the synchronized host DeviceScene under the Scene mutex. Preserve the previous output
  * if the scene requires a kernel outside the experimental static surface renderer. */
-bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std::string &reason);
+bool cycles_webgpu_encode_scene(const Scene &scene,
+                                size_t binding_words,
+                                CyclesWebGPUScene &out,
+                                std::string &reason);
 
 CCL_NAMESPACE_END
