@@ -359,38 +359,253 @@ bool rebase_array_byte_offsets(Function &function)
   return changed;
 }
 
-bool is_word_buffer_pointer(Value *pointer)
+/* Clang represents fields of dynamically indexed C++ structs with byte GEPs.
+ * Restore their types before lowering private arrays to SPIR-V access chains. */
+struct LocalAggregateAddress {
+  AllocaInst *base = nullptr;
+  Type *type = nullptr;
+  SmallVector<Value *, 5> indices;
+  bool changed = false;
+};
+
+bool select_aggregate_member(LocalAggregateAddress &address,
+                             int64_t offset,
+                             Type *target,
+                             const DataLayout &layout,
+                             IRBuilder<> &builder)
+{
+  do {
+    if (offset == 0 && (!target || target == address.type)) {
+      return true;
+    }
+    if (auto *record = dyn_cast<StructType>(address.type)) {
+      const auto *fields = layout.getStructLayout(record);
+      if (offset < 0 || uint64_t(offset) >= fields->getSizeInBytes()) {
+        return false;
+      }
+      const unsigned field = fields->getElementContainingOffset(uint64_t(offset));
+      address.indices.push_back(builder.getInt32(field));
+      address.type = record->getElementType(field);
+      offset -= int64_t(fields->getElementOffset(field));
+    }
+    else if (auto *array = dyn_cast<ArrayType>(address.type)) {
+      const int64_t stride = layout.getTypeAllocSize(array->getElementType()).getFixedValue();
+      if (offset < 0 || !stride || uint64_t(offset / stride) >= array->getNumElements()) {
+        return false;
+      }
+      address.indices.push_back(builder.getInt32(offset / stride));
+      address.type = array->getElementType();
+      offset %= stride;
+    }
+    else {
+      return false;
+    }
+  } while (true);
+}
+
+/* Move an address within the same containing array. */
+bool adjust_aggregate_index(LocalAggregateAddress &address,
+                            Value *offset,
+                            IRBuilder<> &builder)
+{
+  const auto *constant = dyn_cast<ConstantInt>(offset);
+  if (constant && constant->isZero()) {
+    return true;
+  }
+  if (address.indices.size() <= 1) {
+    return false;
+  }
+
+  Type *parent = GetElementPtrInst::getIndexedType(
+      address.base->getAllocatedType(), ArrayRef<Value *>(address.indices).drop_back());
+  if (!isa_and_nonnull<ArrayType>(parent)) {
+    return false;
+  }
+  Value *index = address.indices.back();
+  address.indices.back() = builder.CreateAdd(index, builder.CreateIntCast(
+      offset, index->getType(), true));
+  return true;
+}
+
+bool describe_local_aggregate(Value *pointer,
+                              LocalAggregateAddress &address,
+                              const DataLayout &layout,
+                              IRBuilder<> &builder)
+{
+  if (auto *base = dyn_cast<AllocaInst>(pointer)) {
+    if (!base->getAllocatedType()->isAggregateType() || base->isArrayAllocation()) {
+      return false;
+    }
+    address.base = base;
+    address.type = base->getAllocatedType();
+    address.indices.push_back(builder.getInt32(0));
+    return true;
+  }
+
+  auto *gep = dyn_cast<GetElementPtrInst>(pointer);
+  if (!gep || !describe_local_aggregate(gep->getPointerOperand(), address, layout, builder)) {
+    return false;
+  }
+
+  auto index = gep->idx_begin();
+  Type *source = gep->getSourceElementType();
+  if (source->isIntegerTy(8) && gep->getNumIndices() == 1) {
+    auto *bytes = dyn_cast<ConstantInt>(*index);
+    if (!bytes) {
+      /* InstCombine flattens a dynamically indexed pair of scalar fields
+       * into a byte offset. Restore the aligned array item and its stride. */
+      auto *array = dyn_cast<ArrayType>(address.type);
+      Value *item = nullptr;
+      const APInt *shift = nullptr;
+      if (!array || !PatternMatch::match(index->get(), PatternMatch::m_Shl(
+                        PatternMatch::m_Value(item), PatternMatch::m_APInt(shift))))
+      {
+        return false;
+      }
+      const uint64_t stride = layout.getTypeAllocSize(array->getElementType()).getFixedValue();
+      if (!isPowerOf2_64(stride) || shift->getZExtValue() < Log2_64(stride)) {
+        return false;
+      }
+      Value *narrow = builder.CreateIntCast(item, builder.getInt32Ty(), true);
+      address.indices.push_back(builder.CreateShl(
+          narrow, builder.getInt32(shift->getZExtValue() - Log2_64(stride))));
+      address.type = array->getElementType();
+      address.changed = true;
+      return true;
+    }
+    if (!bytes->getValue().isSignedIntN(32)) {
+      return false;
+    }
+    int64_t offset = bytes->getSExtValue();
+    const int64_t stride = layout.getTypeAllocSize(address.type).getFixedValue();
+    if (offset < 0 || offset >= stride) {
+      if (!stride || offset % stride ||
+          !adjust_aggregate_index(address, builder.getInt32(offset / stride), builder))
+      {
+        return false;
+      }
+      offset = 0;
+    }
+    address.changed = true;
+    /* If the byte address itself is an array's first element, callers append
+     * the final index once they know whether they need the array or its item. */
+    return select_aggregate_member(address, offset, nullptr, layout, builder);
+  }
+
+  if (!select_aggregate_member(address, 0, source, layout, builder) ||
+      !adjust_aggregate_index(address, *index++, builder))
+  {
+    return false;
+  }
+  for (; index != gep->idx_end(); ++index) {
+    if (auto *record = dyn_cast<StructType>(address.type)) {
+      auto *field = cast<ConstantInt>(*index);
+      address.indices.push_back(field);
+      address.type = record->getElementType(field->getZExtValue());
+    }
+    else if (auto *array = dyn_cast<ArrayType>(address.type)) {
+      Value *item = builder.CreateIntCast(*index, builder.getInt32Ty(), true);
+      address.indices.push_back(item);
+      address.type = array->getElementType();
+    }
+    else {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool type_local_aggregate_accesses(Function &function)
+{
+  SmallVector<Instruction *, 16> accesses;
+  for (BasicBlock &block : function) {
+    for (Instruction &instruction : block) {
+      if (isa<LoadInst, StoreInst>(instruction)) {
+        accesses.push_back(&instruction);
+      }
+    }
+  }
+
+  bool changed = false;
+  const auto &layout = function.getParent()->getDataLayout();
+  for (auto *access : accesses) {
+    auto *load = dyn_cast<LoadInst>(access);
+    const unsigned operand = load ? load->getPointerOperandIndex() :
+                                    cast<StoreInst>(access)->getPointerOperandIndex();
+    Value *pointer = access->getOperand(operand);
+    if (!isa<GetElementPtrInst, AllocaInst>(pointer)) {
+      continue;
+    }
+
+    Type *type = load ? load->getType() : cast<StoreInst>(access)->getValueOperand()->getType();
+    IRBuilder<> builder(access);
+    LocalAggregateAddress address;
+    if (!describe_local_aggregate(pointer, address, layout, builder)) {
+      continue;
+    }
+    const bool selects_member = address.type != type;
+    if (!select_aggregate_member(address, 0, type, layout, builder)) {
+      continue;
+    }
+
+    /* Some shader adapters use volatile loads to stop O2 from folding private
+     * field copies into aggregate memcpy. The values are private to a lane. */
+    if (load && load->isVolatile()) {
+      load->setVolatile(false);
+      address.changed = true;
+    }
+    if (address.changed || selects_member)
+    {
+      auto *typed = builder.Insert(
+          GetElementPtrInst::Create(address.base->getAllocatedType(), address.base, address.indices),
+          "typed.aggregate.field");
+      access->setOperand(operand, typed);
+      RecursivelyDeleteTriviallyDeadInstructions(pointer);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+Type *buffer_element_type(Value *pointer)
 {
   auto *call = dyn_cast<CallInst>(pointer);
   if (!call || !call->getCalledFunction() ||
       !call->getCalledFunction()->getName().starts_with("llvm.spv.resource.getpointer."))
   {
-    return false;
+    return nullptr;
   }
   auto *storage = dyn_cast<TargetExtType>(call->getArgOperand(0)->getType());
   auto *array = storage && storage->getName() == "spirv.VulkanBuffer" ?
                     dyn_cast<ArrayType>(storage->getTypeParameter(0)) :
                     nullptr;
-  return array && array->getElementType()->isIntegerTy(32);
+  return array ? array->getElementType() : nullptr;
 }
 
-Type *scalar_word_address_type(Value *pointer)
+Type *word_address_type(Value *pointer)
 {
-  if (is_word_buffer_pointer(pointer)) {
-    return Type::getInt32Ty(pointer->getContext());
+  if (Type *element = buffer_element_type(pointer)) {
+    return element;
   }
   auto *array = local_array_element_address(pointer);
   Type *element = array ? array->getElementType() : nullptr;
   return element && (element->isFloatTy() || element->isIntegerTy(32)) ? element : nullptr;
 }
 
-bool needs_scalar_bitcast(Value *pointer, Type *access_type)
+bool needs_word_bitcast(Value *pointer, Type *access_type)
 {
-  if (access_type->isFloatTy() || access_type->isIntegerTy(32)) {
-    Type *expected_type = scalar_word_address_type(pointer);
-    return expected_type && expected_type != access_type;
+  Type *expected = word_address_type(pointer);
+  if (!expected || expected == access_type ||
+      expected->getPrimitiveSizeInBits() != access_type->getPrimitiveSizeInBits())
+  {
+    return false;
   }
-  return false;
+  Type *read = access_type->getScalarType();
+  Type *stored = expected->getScalarType();
+  /* LLVM can fold bitcasts into a differently typed load of the same
+   * storage lanes, including a uint4 shadow record read as float4. */
+  return (read->isFloatTy() && stored->isIntegerTy(32)) ||
+         (read->isIntegerTy(32) && stored->isFloatTy());
 }
 
 bool can_widen_int_compare(const ICmpInst &compare)
@@ -444,6 +659,13 @@ bool split_packed_words(PHINode &packed)
   using namespace llvm::PatternMatch;
   SmallVector<std::pair<Value *, Value *>, 4> incoming;
   for (Value *value : packed.incoming_values()) {
+    if (const auto *constant = dyn_cast<ConstantInt>(value)) {
+      const uint64_t bits = constant->getZExtValue();
+      auto *word = Type::getInt32Ty(packed.getContext());
+      incoming.emplace_back(ConstantInt::get(word, uint32_t(bits)),
+                            ConstantInt::get(word, uint32_t(bits >> 32)));
+      continue;
+    }
     Value *low, *high;
     if (!match(value,
                m_c_Or(m_Shl(m_ZExt(m_Value(high)), m_SpecificInt(32)), m_ZExt(m_Value(low)))) ||
@@ -523,20 +745,22 @@ bool lower_spirv_values(Function &function)
   for (BasicBlock &block : function) {
     for (Instruction &instruction : block) {
       if (auto *load = dyn_cast<LoadInst>(&instruction);
-          load && needs_scalar_bitcast(load->getPointerOperand(), load->getType()))
+          load && needs_word_bitcast(load->getPointerOperand(), load->getType()))
       {
         replacements.push_back(load);
       }
       if (auto *store = dyn_cast<StoreInst>(&instruction);
           store &&
-          needs_scalar_bitcast(store->getPointerOperand(), store->getValueOperand()->getType()))
+          needs_word_bitcast(store->getPointerOperand(), store->getValueOperand()->getType()))
       {
         replacements.push_back(store);
       }
       if (auto *call = dyn_cast<IntrinsicInst>(&instruction);
           call && ((call->getIntrinsicID() == Intrinsic::copysign && call->getType()->isFloatTy()) ||
                    ((call->getIntrinsicID() == Intrinsic::ctlz ||
-                     call->getIntrinsicID() == Intrinsic::fshl) && call->getType()->isIntegerTy(32))))
+                     call->getIntrinsicID() == Intrinsic::fshl ||
+                     call->getIntrinsicID() == Intrinsic::usub_sat) &&
+                    call->getType()->isIntegerTy(32))))
       {
         replacements.push_back(call);
       }
@@ -559,7 +783,7 @@ bool lower_spirv_values(Function &function)
     IRBuilder<> builder(instruction);
     if (auto *load = dyn_cast<LoadInst>(instruction)) {
       auto *word = builder.CreateAlignedLoad(
-          scalar_word_address_type(load->getPointerOperand()),
+          word_address_type(load->getPointerOperand()),
           load->getPointerOperand(),
           load->getAlign(),
           load->isVolatile());
@@ -567,7 +791,7 @@ bool lower_spirv_values(Function &function)
     }
     else if (auto *store = dyn_cast<StoreInst>(instruction)) {
       auto *word = builder.CreateBitCast(store->getValueOperand(),
-                                         scalar_word_address_type(store->getPointerOperand()));
+                                         word_address_type(store->getPointerOperand()));
       builder.CreateAlignedStore(
           word, store->getPointerOperand(), store->getAlign(), store->isVolatile());
     }
@@ -631,6 +855,16 @@ bool lower_spirv_values(Function &function)
                                                       high,
                                                       builder.CreateOr(left, right)));
     }
+    else if (auto *subtract = dyn_cast<IntrinsicInst>(instruction);
+             subtract && subtract->getIntrinsicID() == Intrinsic::usub_sat)
+    {
+      /* The Vulkan backend does not select an unsigned saturating subtraction. */
+      Value *left = subtract->getArgOperand(0);
+      Value *right = subtract->getArgOperand(1);
+      subtract->replaceAllUsesWith(builder.CreateSelect(builder.CreateICmpULT(left, right),
+                                                        builder.getInt32(0),
+                                                        builder.CreateSub(left, right)));
+    }
     else {
       auto *call = cast<IntrinsicInst>(instruction);
       auto *magnitude = builder.CreateBitCast(call->getArgOperand(0), builder.getInt32Ty());
@@ -649,8 +883,9 @@ struct LegalizeSpirv : PassInfoMixin<LegalizeSpirv> {
   {
     const bool access = type_array_accesses(function);
     const bool offsets = rebase_array_byte_offsets(function);
+    const bool aggregates = type_local_aggregate_accesses(function);
     const bool values = lower_spirv_values(function);
-    return access || offsets || values ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    return access || offsets || aggregates || values ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 };
 
@@ -658,7 +893,11 @@ struct InlineShaderHelpers : PassInfoMixin<InlineShaderHelpers> {
   PreservedAnalyses run(Module &module, ModuleAnalysisManager &)
   {
     for (Function &function : module) {
-      if (!function.isDeclaration() && function.hasLocalLinkage()) {
+      /* These stock helpers take only scalars and can remain separate SPIR-V functions. */
+      const bool outlined_scalar = function.hasFnAttribute(Attribute::NoInline) &&
+                                   (function.getName().contains("9perlin_") ||
+                                    function.getName().contains("webgpu_scalar_noise_"));
+      if (!function.isDeclaration() && function.hasLocalLinkage() && !outlined_scalar) {
         function.removeFnAttr(Attribute::NoInline);
         function.addFnAttr(Attribute::AlwaysInline);
       }

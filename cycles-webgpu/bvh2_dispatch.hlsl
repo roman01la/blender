@@ -13,6 +13,40 @@ StructuredBuffer<uint> ray_words : register(t1);
 #ifdef CYCLES_WEBGPU_INTERSECT_SHADOW
 StructuredBuffer<uint4> shadow_words : register(t2);
 RWStructuredBuffer<float4> radiance : register(u3);
+#  ifdef CYCLES_WEBGPU_TRANSPARENT_SHADOW
+#    include "../blender-platform/cycles-webgpu/material_layout.h"
+#    include "../blender-platform/cycles-webgpu/path_state_layout.h"
+typedef float float3 __attribute__((ext_vector_type(3)));
+StructuredBuffer<uint> metadata_words : register(t4);
+StructuredBuffer<uint> path_words : register(t5);
+
+#    include "wavefront_radiance.hlsl"
+
+#    ifdef CYCLES_WEBGPU_SHADOW_SVM
+StructuredBuffer<uint> svm_words : register(t6);
+StructuredBuffer<uint> camera_words : register(t7);
+
+#      include "svm_context.hlsl"
+
+uint cycles_svm_word(uint index)
+{
+  return svm_words[index];
+}
+
+uint4 cycles_svm_shadow_context(uint field, uint object, uint shader)
+{
+  return cycles_svm_scene_context(field, object, shader);
+}
+#    endif
+
+uint cycles_surface_word(uint index)
+{
+  return metadata_words[index];
+}
+
+extern float4 cycles_bvh2_transparent_shadow(uint4 origin, uint4 direction, uint4 options,
+                                             uint4 geometric, uint transparent_bounce);
+#  endif
 #else
 RWStructuredBuffer<uint> hit_words : register(u2);
 #endif
@@ -52,12 +86,24 @@ void main(uint3 id : SV_DispatchThreadID)
   if (options.x == 0u) {
     return;
   }
+#  ifdef CYCLES_WEBGPU_TRANSPARENT_SHADOW
+  const uint forward_hits = cycles_forward_light_hits(radiance[ray_words[0] + lane]);
+  const uint transparent_bounce = (path_words[CYCLES_WEBGPU_PATH_WORDS * lane +
+                                              CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE] &
+                                   CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK) + forward_hits;
+  const float4 visibility = cycles_bvh2_transparent_shadow(
+      shadow_words[shadow], shadow_words[shadow + 1], options, shadow_words[shadow + 3],
+      transparent_bounce);
+  const float4 sample = radiance[lane];
+  radiance[lane] = float4(sample.xyz * visibility.xyz, sample.w);
+#  else
   uint4 hit, coordinates;
   cycles_bvh2_trace(shadow_words[shadow], shadow_words[shadow + 1], options,
                     hit, coordinates, shadow_words[shadow + 3]);
   if (hit.x != 0u) {
     radiance[lane] = float4(0.0f, 0.0f, 0.0f, radiance[lane].w);
   }
+#  endif
 #else
   const uint ray = 1 + 12 * lane;
   const uint4 origin = uint4(ray_words[ray], ray_words[ray + 1],

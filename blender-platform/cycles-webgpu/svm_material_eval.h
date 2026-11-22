@@ -3,6 +3,7 @@
 #pragma once
 
 #include "material_layout.h"
+#include "svm_image_projection.h"
 #include "svm_surface_context.h"
 
 #include "kernel/camera/projection.h"
@@ -31,8 +32,11 @@
 #include "kernel/svm/white_noise.h"
 
 #include "kernel/closure/bsdf_oren_nayar.h"
+#include "kernel/closure/bsdf_transparent.h"
+#include "kernel/closure/bsdf_ray_portal.h"
 #include "kernel/closure/bsdf_util.h"
 #include "kernel/util/colorspace.h"
+#include "kernel/util/differential.h"
 #include "util/color.h"
 #include "util/types_image.h"
 
@@ -50,11 +54,14 @@ static_assert(SHADER_MASK == CYCLES_WEBGPU_SVM_SHADER_ID_MASK);
 constexpr uint webgpu_svm_header_words = 2;
 constexpr uint webgpu_svm_jump_words = 1 + sizeof(SVMNodeShaderJump) / sizeof(uint);
 /* After the bytecode: UV triangle count, image slots, Generated triangle
- * count, attribute slot and triangle counts, the IES table offset from this
- * header or zero, the working space's luminance coefficients, its three XYZ to
+ * count, attribute slot and triangle counts, the IES table offset (or the
+ * lookup descriptor in scenes with Sheen), the luminance coefficients, three XYZ to
  * RGB rows and the stock CIE color matching table. UV, Generated and attribute
  * records precede the image records and their texels. The IES table follows. */
 constexpr uint webgpu_svm_ies_offset = 5;
+constexpr uint webgpu_svm_lookup_ies = 0;
+constexpr uint webgpu_svm_lookup_sheen = 1;
+constexpr uint webgpu_svm_lookup_words = 2;
 constexpr uint webgpu_svm_color_space_offset = 6;
 constexpr uint webgpu_svm_cie_table_offset = 18;
 constexpr uint webgpu_svm_cie_table_words = (WAVELENGTH_RESOLUTION + 1) * 3;
@@ -322,7 +329,7 @@ ccl_device_inline bool webgpu_svm_uses_cubic_filter(const uint interpolation)
   return interpolation == INTERPOLATION_CUBIC || interpolation == INTERPOLATION_SMART;
 }
 
-#ifndef CYCLES_WEBGPU_SVM_CORE
+#if !defined(CYCLES_WEBGPU_SVM_CORE) || defined(CYCLES_WEBGPU_SVM_PROJECTED_IMAGES)
 ccl_device_inline float4 webgpu_svm_cubic_weights(const float t)
 {
   /* B-spline weights from ImageInterpolator::interp_cubic(). */
@@ -363,7 +370,7 @@ ccl_device_inline auto webgpu_svm_sample_image(FetchTexel texel,
   const uint nix = webgpu_svm_texel_axis<1>(sx, width, extension);
   const uint iy = webgpu_svm_texel_axis<0>(sy, height, extension);
   const uint niy = webgpu_svm_texel_axis<1>(sy, height, extension);
-#ifndef CYCLES_WEBGPU_SVM_CORE
+#if !defined(CYCLES_WEBGPU_SVM_CORE) || defined(CYCLES_WEBGPU_SVM_PROJECTED_IMAGES)
   if constexpr (AllowCubic) {
     if (webgpu_svm_uses_cubic_filter(interpolation)) {
       const uint px = webgpu_svm_texel_axis<-1>(sx, width, extension);
@@ -408,7 +415,7 @@ ccl_device_inline bool webgpu_svm_image(
   const uint height = word(base + 1);
   const uint extension = word(base + 2);
   const uint interpolation = word(base + 3);
-#ifdef CYCLES_WEBGPU_SVM_CORE
+#if defined(CYCLES_WEBGPU_SVM_CORE) && !defined(CYCLES_WEBGPU_SVM_PROJECTED_IMAGES)
   if (webgpu_svm_uses_cubic_filter(interpolation & ~webgpu_svm_image_alpha)) {
     return false;
   }
@@ -555,8 +562,35 @@ ccl_device_inline bool webgpu_svm_surface_normal(const uint normal, const uint s
 }
 
 template<typename Image, typename Node>
+ccl_device_inline bool webgpu_svm_fetch_image(Image image,
+                                              const Node &node,
+                                              const float2 uv,
+                                              float4 &color)
+{
+  const bool unassociate = node.flags & NODE_IMAGE_ALPHA_UNASSOCIATE;
+  if (!image(node.id, uv, unassociate || stack_valid(node.alpha_offset), color)) {
+    return false;
+  }
+  if (stack_valid(node.out_offset)) {
+    if (unassociate && color.w != 0.0f && color.w != 1.0f) {
+      color.x /= color.w;
+      color.y /= color.w;
+      color.z /= color.w;
+    }
+    if (node.flags & NODE_IMAGE_COMPRESS_AS_SRGB) {
+      /* Stock SVM decodes RGB after interpolation and unassociation. */
+      color.x = color_srgb_to_linear(color.x);
+      color.y = color_srgb_to_linear(color.y);
+      color.z = color_srgb_to_linear(color.z);
+    }
+  }
+  return true;
+}
+
+template<typename Image, typename Node, typename Surface>
 ccl_device_inline bool webgpu_svm_eval_image(Image image,
                                              const Node &node,
+                                             Surface surface,
                                              ccl_private float *stack,
                                              WebGPUSvmStackUsage &written,
                                              WebGPUSvmStackUsage &varying,
@@ -573,53 +607,71 @@ ccl_device_inline bool webgpu_svm_eval_image(Image image,
   if (!(fabsf(co.x) <= 8194.0f && fabsf(co.y) <= 8194.0f)) {
     return false;
   }
-  float2 uv = make_float2(co);
-#ifndef CYCLES_WEBGPU_SVM_CORE
-  if constexpr (std::is_same_v<Node, SVMNodeTexEnvironment>) {
-    if (!(fabsf(co.z) <= 8194.0f)) {
+  float4 color;
+#if !defined(CYCLES_WEBGPU_SVM_CORE) || defined(CYCLES_WEBGPU_SVM_PROJECTED_IMAGES)
+  if constexpr (std::is_same_v<Node, SVMNodeTexImageBox>) {
+    if (!(fabsf(co.z) <= 8194.0f && node.blend >= 0.0f && node.blend <= 1.0f)) {
       return false;
     }
-    const float3 direction = safe_normalize(co);
-    if (node.projection == NODE_ENVIRONMENT_EQUIRECTANGULAR) {
-      if (direction.x == 0.0f && direction.y == 0.0f && direction.z != 0.0f) {
-        /* WGSL atan2 is undefined at the poles. Equirectangular images repeat. */
-        const bool negative_x = (__float_as_uint(direction.x) >> 31) != 0;
-        uv = make_float2(negative_x ? 0.0f : 0.5f, direction.z > 0.0f ? 1.0f : 0.0f);
+    /* object_inverse_normal_transform() for a static triangle. */
+    const Transform tfm = webgpu_svm_context_transform(surface,
+                                                       CYCLES_WEBGPU_SVM_OBJECT_TRANSFORM);
+    const float3 normal = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_NORMAL));
+    const float3 object_normal = safe_normalize(transform_direction_transposed(&tfm, normal));
+    const float3 weights = webgpu_svm_image_box_weights(object_normal, node.blend);
+    color = zero_float4();
+    /* Keep the texture lookup shared by all three faces. */
+#  pragma clang loop unroll(disable)
+    for (uint axis = 0; axis < 3; ++axis) {
+      const float weight = axis == 0 ? weights.x : (axis == 1 ? weights.y : weights.z);
+      if (weight > 0.0f) {
+        float4 face;
+        if (!webgpu_svm_fetch_image(
+                image, node, webgpu_svm_image_box_uv(co, object_normal, axis), face))
+        {
+          return false;
+        }
+        color += weight * face;
+      }
+    }
+  }
+  else
+#endif
+  {
+    float2 uv = make_float2(co);
+#if !defined(CYCLES_WEBGPU_SVM_CORE) || defined(CYCLES_WEBGPU_SVM_PROJECTED_IMAGES)
+    if constexpr (std::is_same_v<Node, SVMNodeTexEnvironment>) {
+      if (!(fabsf(co.z) <= 8194.0f)) {
+        return false;
+      }
+      const float3 direction = safe_normalize(co);
+      if (node.projection == NODE_ENVIRONMENT_EQUIRECTANGULAR) {
+        if (direction.x == 0.0f && direction.y == 0.0f && direction.z != 0.0f) {
+          /* WGSL atan2 is undefined at the poles. Equirectangular images repeat. */
+          const bool negative_x = (__float_as_uint(direction.x) >> 31) != 0;
+          uv = make_float2(negative_x ? 0.0f : 0.5f, direction.z > 0.0f ? 1.0f : 0.0f);
+        }
+        else {
+          uv = direction_to_equirectangular(direction);
+        }
       }
       else {
-        uv = direction_to_equirectangular(direction);
+        uv = direction_to_mirrorball(direction);
       }
     }
-    else {
-      uv = direction_to_mirrorball(direction);
+    else if (node.projection != NODE_IMAGE_PROJ_FLAT) {
+      if (!(fabsf(co.z) <= 8194.0f)) {
+        return false;
+      }
+      const float3 square = (co - make_float3(0.5f)) * 2.0f;
+      uv = node.projection == NODE_IMAGE_PROJ_SPHERE ? map_to_sphere(square) : map_to_tube(square);
     }
-  }
-  else if (node.projection != NODE_IMAGE_PROJ_FLAT) {
-    if (!(fabsf(co.z) <= 8194.0f)) {
+#endif
+    if (!webgpu_svm_fetch_image(image, node, uv, color)) {
       return false;
     }
-    const float3 square = (co - make_float3(0.5f)) * 2.0f;
-    uv = node.projection == NODE_IMAGE_PROJ_SPHERE ? map_to_sphere(square) : map_to_tube(square);
-  }
-#endif
-  const bool unassociate = node.flags & NODE_IMAGE_ALPHA_UNASSOCIATE;
-  const bool alpha = unassociate || stack_valid(node.alpha_offset);
-  float4 color;
-  if (!image(node.id, uv, alpha, color)) {
-    return false;
   }
   if (stack_valid(node.out_offset)) {
-    if (unassociate && color.w != 0.0f && color.w != 1.0f) {
-      color.x /= color.w;
-      color.y /= color.w;
-      color.z /= color.w;
-    }
-    if (node.flags & NODE_IMAGE_COMPRESS_AS_SRGB) {
-      /* Stock SVM decodes RGB after interpolation and unassociation. */
-      color.x = color_srgb_to_linear(color.x);
-      color.y = color_srgb_to_linear(color.y);
-      color.z = color_srgb_to_linear(color.z);
-    }
     stack_store_float3(stack, node.out_offset, make_float3(color));
   }
   if (stack_valid(node.alpha_offset)) {
@@ -630,11 +682,43 @@ ccl_device_inline bool webgpu_svm_eval_image(Image image,
   return true;
 }
 
+struct WebGPUSvmRaycastHit {
+  float distance;
+  float is_hit;
+  float is_self_hit;
+  float3 normal;
+};
+
 /* Scene facts resolved by the host while packing. The packed bytecode marks an
  * attribute that no object using the material provides as ATTR_STD_NOT_FOUND
  * and other attributes with their packed slot. The host only accepts Particle
  * Info on objects using the dummy particle. */
 struct WebGPUSvmPackedHost {
+  /* Host eligibility and emission-only SVM have no ray-query context. The
+   * defaults here also match the stock light-evaluation feature mask. */
+  static constexpr bool uses_ray_queries = false;
+  ccl_device_inline_method float ambient_occlusion(float3, float, uint, uint) const
+  {
+    return 1.0f;
+  }
+  ccl_device_inline_method WebGPUSvmRaycastHit raycast(float3, float3, float distance, bool) const
+  {
+    return {distance, 0.0f, 0.0f, zero_float3()};
+  }
+  ccl_device_inline_method float3 bevel(float3 normal, float, uint) const
+  {
+    return normal;
+  }
+  ccl_device_inline_method bool evaluate_aov() const
+  {
+    return true;
+  }
+  ccl_device_inline_method void write_aov(const int /*offset*/,
+                                          const bool /*color*/,
+                                          const float4 /*value*/) const
+  {
+  }
+
   ccl_device_inline_method int attribute(const uint /*word*/, const int attr) const
   {
     return attr;
@@ -697,9 +781,27 @@ struct WebGPUSvmMaterial {
   bool multiscatter;
   float standalone_transmission;
   bool requires_extended_svm;
+  bool requires_full_svm;
+  bool requires_advanced_procedural_svm;
+  bool varying_transparency;
+  bool mixed_transparency;
+  Spectrum transparency;
+  float transparent_sample_weight;
+  float diffuse_sample_weight;
+  bool transparent_first;
+  bool pixel_wireframe;
   /* A lone Holdout closure, with its weight in color. Camera paths write the
    * weighted transparency and end without scattering or emission. */
   bool holdout;
+  /* Standalone surface closures reuse the specular, layer and transmission records. */
+  float surface_closure;
+  float2 surface_parameters;
+  float3 surface_tangent;
+  float3 surface_fresnel_a;
+  float3 surface_fresnel_b;
+  uint surface_model;
+  float surface_hair_ior;
+  float surface_hair_aspect;
   /* Accumulated emission closure weight, as emission_setup() stores it. */
   float3 emission;
 };
@@ -724,10 +826,141 @@ ccl_device_inline bool webgpu_svm_surface_color(const SVMInputFloat3 input,
   return webgpu_svm_finite(color.x) && webgpu_svm_finite(color.y) && webgpu_svm_finite(color.z);
 }
 
+ccl_device_inline bool webgpu_svm_principled_hair(const SVMNodePrincipledHairBsdfData &data,
+                                                 const bool huang,
+                                                 const WebGPUSvmStackUsage &written,
+                                                 const float *stack,
+                                                 const float3 tangent,
+                                                 WebGPUSvmMaterial &material)
+{
+  if (!webgpu_svm_inputs_valid(written, data.roughness, data.random_roughness, data.offset,
+                               data.ior, data.random))
+  {
+    return false;
+  }
+  /* The static-triangle adapter has no per-curve random attribute. Use the
+   * fallback socket, as svm_node_closure_bsdf() does on mesh geometry. */
+  const float random = stack_load(stack, data.random);
+  const float factor = 1.0f + 2.0f * (random - 0.5f) * stack_load(stack, data.random_roughness);
+  const float roughness = stack_load(stack, data.roughness) * factor;
+  const float ior = stack_load(stack, data.ior);
+  if (!webgpu_svm_finite(roughness) || !webgpu_svm_finite(ior) || ior <= 1.0f ||
+      (!huang && !webgpu_svm_inputs_valid(written, data.radial_roughness, data.coat)) ||
+      (huang && !webgpu_svm_inputs_valid(written, data.R, data.TT, data.TRT, data.aspect_ratio)))
+  {
+    return false;
+  }
+  const float radial = huang ? roughness : stack_load(stack, data.radial_roughness) * factor;
+  Spectrum sigma;
+  if (data.parametrization == NODE_PRINCIPLED_HAIR_DIRECT_ABSORPTION) {
+    if (!webgpu_svm_surface_color(data.absorption_coefficient, written, stack, sigma)) {
+      return false;
+    }
+    sigma = rgb_to_spectrum(sigma);
+  }
+  else if (data.parametrization == NODE_PRINCIPLED_HAIR_PIGMENT_CONCENTRATION) {
+    float3 tint;
+    if (!webgpu_svm_surface_color(data.tint, written, stack, tint) ||
+        !webgpu_svm_inputs_valid(written, data.melanin, data.melanin_redness, data.random_color))
+    {
+      return false;
+    }
+    const float factor_color = 1.0f + 2.0f * (random - 0.5f) *
+                                        saturatef(stack_load(stack, data.random_color));
+    const float melanin = -logf(fmaxf(1.0f - stack_load(stack, data.melanin) * factor_color,
+                                      0.0001f));
+    const float redness = stack_load(stack, data.melanin_redness);
+    sigma = bsdf_principled_hair_sigma_from_concentration(melanin * (1.0f - redness),
+                                                         melanin * redness) +
+            bsdf_principled_hair_sigma_from_reflectance(rgb_to_spectrum(tint), radial);
+  }
+  else if (data.parametrization == NODE_PRINCIPLED_HAIR_REFLECTANCE) {
+    float3 color;
+    if (!webgpu_svm_surface_color(data.color, written, stack, color)) {
+      return false;
+    }
+    sigma = bsdf_principled_hair_sigma_from_reflectance(rgb_to_spectrum(color), radial);
+  }
+  else {
+    return false;
+  }
+  material.surface_tangent = tangent;
+  material.surface_parameters = make_float2(stack_load(stack, data.offset), roughness);
+  material.surface_fresnel_a = sigma;
+  material.surface_hair_ior = ior;
+  if (huang) {
+    material.surface_hair_aspect = stack_load(stack, data.aspect_ratio);
+    material.surface_fresnel_b = max(make_float3(stack_load(stack, data.R),
+                                                 stack_load(stack, data.TT),
+                                                 stack_load(stack, data.TRT)),
+                                     zero_float3());
+    return webgpu_svm_finite(material.surface_hair_aspect) && material.surface_hair_aspect > 0.0f;
+  }
+  material.surface_fresnel_b = make_float3(radial,
+                                           1.0f - saturatef(stack_load(stack, data.coat)),
+                                           0.0f);
+  return webgpu_svm_finite(radial);
+}
+
 ccl_device_inline bool webgpu_svm_rough_ggx(const float alpha)
 {
   /* The fused Principled reflection path evaluates non-singular GGX lobes. */
   return sqr(alpha) > 2e-10f;
+}
+
+/* Match the unlayered glossy and metallic cases of svm_node_closure_bsdf().
+ * The GPU applies energy compensation and blur after it knows the view direction. */
+ccl_device_inline bool webgpu_svm_glossy_geometry(const SVMInputFloat roughness_input,
+                                                  const SVMInputFloat anisotropy_input,
+                                                  const SVMInputFloat rotation_input,
+                                                  const SVMStackOffset tangent_offset,
+                                                  const bool metallic,
+                                                  const WebGPUSvmStackUsage &written,
+                                                  const float *stack,
+                                                  const float3 N,
+                                                  WebGPUSvmMaterial &material)
+{
+  if (!webgpu_svm_inputs_valid(written, roughness_input, anisotropy_input, rotation_input)) {
+    return false;
+  }
+  const float roughness = stack_load(stack, roughness_input);
+  const float anisotropy_value = stack_load(stack, anisotropy_input);
+  const float rotation = stack_load(stack, rotation_input);
+  if (!webgpu_svm_finite(roughness) || !webgpu_svm_finite(anisotropy_value) ||
+      !webgpu_svm_finite(rotation))
+  {
+    return false;
+  }
+  const float alpha = sqr(saturatef(roughness));
+  material.surface_parameters = make_float2(alpha, alpha);
+  material.surface_tangent = zero_float3();
+  const float anisotropy = metallic ? saturatef(anisotropy_value) :
+                                     clamp(anisotropy_value, -0.99f, 0.99f);
+  if (!stack_valid(tangent_offset) ||
+      (metallic ? anisotropy == 0.0f : fabsf(anisotropy) <= 1e-4f))
+  {
+    return true;
+  }
+  if (!webgpu_svm_stack_has3(written, tangent_offset)) {
+    return false;
+  }
+  material.surface_tangent = stack_load_float3(stack, tangent_offset);
+  if (metallic) {
+    const float aspect = sqrtf(1.0f - anisotropy * 0.9f);
+    material.surface_parameters = make_float2(alpha / aspect, alpha * aspect);
+    if (rotation != 0.0f) {
+      material.surface_tangent = rotate_around_axis(
+          material.surface_tangent, N, rotation * M_2PI_F);
+    }
+  }
+  else {
+    const float aspect = 1.0f - fabsf(anisotropy);
+    material.surface_parameters = anisotropy < 0.0f ? make_float2(alpha / aspect, alpha * aspect) :
+                                                     make_float2(alpha * aspect, alpha / aspect);
+    /* Glossy rotates about the corrected specular normal, available during closure setup. */
+    material.surface_fresnel_b.x = rotation;
+  }
+  return true;
 }
 
 ccl_device_inline bool webgpu_svm_rough_glass_ior(const float ior)
@@ -750,7 +983,7 @@ ccl_device_inline bool webgpu_svm_subsurface(const SVMInputFloat3 input_radius,
                                     __uint_as_float(input_radius.y.bits),
                                     __uint_as_float(input_radius.z.bits)) * scale;
   if ((!random_walk && method != CLOSURE_BSSRDF_RANDOM_WALK_SKIN_ID &&
-       method != CLOSURE_BSSRDF_RANDOM_WALK_LEGACY_ID) ||
+       method != CLOSURE_BSSRDF_RANDOM_WALK_LEGACY_ID && method != CLOSURE_BSSRDF_BURLEY_ID) ||
       !webgpu_svm_finite(scale) || !(scale > 0.0f) || !webgpu_svm_finite(anisotropy) ||
       !webgpu_svm_finite(ior) || !webgpu_svm_finite(radius.x) ||
       !webgpu_svm_finite(radius.y) || !webgpu_svm_finite(radius.z) ||
@@ -1216,7 +1449,21 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
                                                const Host host = {})
 {
   material.requires_extended_svm = false;
+  material.requires_full_svm = false;
+  material.requires_advanced_procedural_svm = false;
+  material.varying_transparency = false;
+  material.mixed_transparency = false;
+  material.ggx = false;
+  material.standalone_transmission = 0.0f;
+  material.transmission = 0.0f;
+  material.subsurface = 0.0f;
+  material.transparency = zero_spectrum();
+  material.transparent_sample_weight = 0.0f;
+  material.diffuse_sample_weight = 0.0f;
+  material.transparent_first = false;
+  material.pixel_wireframe = false;
   material.holdout = false;
+  material.surface_closure = 0.0f;
   material.emission = zero_float3();
   bool has_emission = false;
   const uint shader = packed_shader & SHADER_MASK;
@@ -1240,8 +1487,12 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
   WebGPUSvmStackUsage written;
   WebGPUSvmStackUsage varying;
   Spectrum weight = zero_spectrum();
+  bool weight_varying = false;
   uint surface_normal_offset = uint(SVM_STACK_INVALID);
   bool has_closure = false;
+  bool has_transparent = false;
+  bool has_principled = false;
+  bool opaque_principled = false;
   uint lambert_closures = 0;
   bool mixes_closures = false;
 
@@ -1249,7 +1500,53 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
     const uint type = fetch(offset++);
     host.visit(type, offset - 1);
     switch (type) {
+      case NODE_AOV_START:
+        /* Match stock SVM's early exit when this path cannot write film AOVs. */
+        if (!host.evaluate_aov()) {
+          offset = end - 1;
+        }
+        break;
+      case NODE_AOV_COLOR: {
+        SVMNodeAOVColor node;
+        if (!webgpu_svm_read(fetch, offset, end, node) || node.aov_offset < 0 ||
+            node.aov_offset % 4 != 0 || !webgpu_svm_inputs_valid(written, node.color))
+        {
+          return false;
+        }
+        host.write_aov(node.aov_offset, true, make_float4(stack_load(stack, node.color), 1.0f));
+        break;
+      }
+      case NODE_AOV_VALUE: {
+        SVMNodeAOVValue node;
+        if (!webgpu_svm_read(fetch, offset, end, node) || node.aov_offset < 0 ||
+            !webgpu_svm_inputs_valid(written, node.value))
+        {
+          return false;
+        }
+        host.write_aov(node.aov_offset, false, make_float4(stack_load(stack, node.value), 0, 0, 0));
+        break;
+      }
       case NODE_END:
+        if ((has_transparent ||
+             material.surface_closure == CYCLES_WEBGPU_MATERIAL_RAY_PORTAL) && has_emission) {
+          return false;
+        }
+        if (has_principled && ((has_transparent && !opaque_principled) ||
+                               (!has_transparent && mixes_closures))) {
+          return false;
+        }
+        if (has_transparent) {
+          if (lambert_closures != 0 || has_principled) {
+            material.mixed_transparency = true;
+            if (!material.ggx) {
+              material.surface_closure = CYCLES_WEBGPU_MATERIAL_MIXED_TRANSPARENT;
+            }
+          }
+          else {
+            material.surface_closure = CYCLES_WEBGPU_MATERIAL_TRANSPARENT;
+            material.color = material.transparency;
+          }
+        }
         if (!has_closure) {
           /* Emission alone, or a shader the compiler reduced to no closures
            * (for example black or zero-strength emission): no scattering,
@@ -1310,6 +1607,95 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
         }
         break;
       }
+#if !defined(CYCLES_WEBGPU_RUNTIME_SVM) || defined(CYCLES_WEBGPU_SCENE_QUERIES) || \
+    defined(CYCLES_WEBGPU_SAMPLED_EMISSION)
+      case NODE_AMBIENT_OCCLUSION: {
+        SVMNodeAmbientOcclusion node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            !webgpu_svm_inputs_valid(written, node.dist, node.color) ||
+            (stack_valid(node.normal_offset) &&
+             !webgpu_svm_stack_has3(written, node.normal_offset)) ||
+            !webgpu_svm_outputs_valid(node.out_ao_offset, node.out_color_offset))
+        {
+          return false;
+        }
+        const float3 N = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_NORMAL));
+        const float3 normal = safe_normalize(stack_load_float3_default(stack, node.normal_offset, N));
+        const float ao = host.ambient_occlusion(normal, stack_load(stack, node.dist),
+                                                node.samples, node.flags);
+        if (stack_valid(node.out_ao_offset)) {
+          stack_store_float(stack, node.out_ao_offset, ao);
+        }
+        if (stack_valid(node.out_color_offset)) {
+          stack_store_float3(stack, node.out_color_offset, ao * stack_load(stack, node.color));
+        }
+        webgpu_svm_mark_outputs(
+            written, varying, surface_normal_offset, node.out_ao_offset, node.out_color_offset);
+        break;
+      }
+      case NODE_BEVEL: {
+        SVMNodeBevel node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            !webgpu_svm_inputs_valid(written, node.radius) ||
+            (stack_valid(node.normal_offset) &&
+             !webgpu_svm_stack_has3(written, node.normal_offset)) ||
+            uint(node.out_offset) + 2 >= SVM_STACK_SIZE)
+        {
+          return false;
+        }
+        const float3 N = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_NORMAL));
+        float3 bevel_N = host.bevel(N, stack_load(stack, node.radius), node.num_samples);
+        if constexpr (Host::uses_ray_queries) {
+          if (stack_valid(node.normal_offset)) {
+            /* Preserve the linked input normal, as svm_node_bevel() does. */
+            bevel_N = normalize(stack_load_float3(stack, node.normal_offset) + (bevel_N - N));
+          }
+        }
+        stack_store_float3(stack, node.out_offset, bevel_N);
+        webgpu_svm_mark_outputs(
+            written, varying, surface_normal_offset, SVM_STACK_INVALID, node.out_offset);
+        break;
+      }
+      case NODE_RAYCAST: {
+        SVMNodeRaycast node;
+        if (!webgpu_svm_read(fetch, offset, end, node) || node.bump_filter_width != 0.0f ||
+            node.num_attributes != 0 ||
+            !webgpu_svm_inputs_valid(written, node.position, node.direction, node.distance) ||
+            !webgpu_svm_outputs_valid(node.is_hit_offset, node.hit_position_offset) ||
+            !webgpu_svm_outputs_valid(node.is_self_hit_offset, node.hit_normal_offset) ||
+            !webgpu_svm_outputs_valid(node.hit_distance_offset, SVM_STACK_INVALID))
+        {
+          return false;
+        }
+        const float3 position = stack_load(stack, node.position);
+        const float3 direction = stack_load(stack, node.direction);
+        const auto hit = host.raycast(position, direction, stack_load(stack, node.distance),
+                                      node.only_local);
+        if (stack_valid(node.is_hit_offset)) {
+          stack_store_float(stack, node.is_hit_offset, hit.is_hit);
+        }
+        if (stack_valid(node.is_self_hit_offset)) {
+          stack_store_float(stack, node.is_self_hit_offset, hit.is_self_hit);
+        }
+        if (stack_valid(node.hit_distance_offset)) {
+          stack_store_float(stack, node.hit_distance_offset, hit.distance);
+        }
+        if (stack_valid(node.hit_position_offset)) {
+          stack_store_float3(stack, node.hit_position_offset,
+                             hit.is_hit != 0.0f ? position + direction * hit.distance : zero_float3());
+        }
+        if (stack_valid(node.hit_normal_offset)) {
+          stack_store_float3(stack, node.hit_normal_offset, hit.normal);
+        }
+        webgpu_svm_mark_outputs(
+            written, varying, surface_normal_offset, node.is_hit_offset, node.hit_position_offset);
+        webgpu_svm_mark_outputs(
+            written, varying, surface_normal_offset, node.is_self_hit_offset, node.hit_normal_offset);
+        webgpu_svm_mark_outputs(
+            written, varying, surface_normal_offset, node.hit_distance_offset, SVM_STACK_INVALID);
+        break;
+      }
+#endif
       case NODE_CAMERA: {
         SVMNodeCamera node;
         if (!webgpu_svm_read(fetch, offset, end, node) ||
@@ -1354,6 +1740,12 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
             break;
           case NODE_TEXCO_WINDOW:
             value = webgpu_svm_window_position(surface);
+            break;
+          case NODE_TEXCO_DUPLI_GENERATED:
+            value = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_DUPLI_GENERATED));
+            break;
+          case NODE_TEXCO_DUPLI_UV:
+            value = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_DUPLI_UV));
             break;
           case NODE_TEXCO_REFLECTION: {
             const float3 wi = -webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_DIRECTION));
@@ -1835,10 +2227,10 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
         break;
       }
       case NODE_WIREFRAME: {
-        /* svm_node_wireframe() without pixel size, which needs ray differentials. */
+        /* Match the stock wireframe projection and triangle edge test. */
         const uint slot_word = offset + offsetof(SVMNodeWireframe, bump_filter_width) / sizeof(uint);
         SVMNodeWireframe node;
-        if (!webgpu_svm_read(fetch, offset, end, node) || node.use_pixel_size ||
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
             node.bump_offset != NODE_BUMP_OFFSET_CENTER ||
             !webgpu_svm_input_valid(written, node.in_size) ||
             !webgpu_svm_outputs_valid(node.out_fac_offset, SVM_STACK_INVALID))
@@ -1864,6 +2256,19 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
         }
         const float3 P = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_POSITION));
         float pixelwidth = 1.0f;
+        if (node.use_pixel_size) {
+          const auto ray = surface(CYCLES_WEBGPU_SVM_DIFFERENTIAL);
+          const float3 Ng = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_GEOMETRIC));
+          const float3 wi = -webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_DIRECTION));
+          const float t = __uint_as_float(surface(CYCLES_WEBGPU_SVM_INTERSECTION).x);
+          const float radius = differential_transfer_compact(
+              __uint_as_float(ray.x), -wi, __uint_as_float(ray.y), t);
+          const differential3 dP = differential_from_compact(Ng, radius);
+          const float pixelwidth_x = len(dP.dx - dot(dP.dx, wi) * wi);
+          const float pixelwidth_y = len(dP.dy - dot(dP.dy, wi) * wi);
+          pixelwidth = (pixelwidth_x + pixelwidth_y) * 0.5f;
+          material.pixel_wireframe = true;
+        }
         pixelwidth *= 0.5f * stack_load(stack, node.in_size);
         pixelwidth *= pixelwidth;
         float f = 0.0f;
@@ -2133,7 +2538,7 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
             written, varying, surface_normal_offset, SVM_STACK_INVALID, node.out_offset);
         break;
       }
-#ifndef CYCLES_WEBGPU_SVM_CORE
+#if !defined(CYCLES_WEBGPU_SVM_CORE) || defined(CYCLES_WEBGPU_SVM_TEXTURES)
       case NODE_TEX_NOISE: {
         material.requires_extended_svm = true;
         SVMNodeTexNoise node;
@@ -2151,8 +2556,12 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
             written, varying, surface_normal_offset, node.value_offset, node.color_offset);
         break;
       }
+#endif
+#if !defined(CYCLES_WEBGPU_SVM_CORE) || defined(CYCLES_WEBGPU_SVM_ADVANCED_QUERIES)
       case NODE_TEX_GABOR: {
         material.requires_extended_svm = true;
+        material.requires_full_svm = true;
+        material.requires_advanced_procedural_svm = true;
         SVMNodeTexGabor node;
         if (!webgpu_svm_read(fetch, offset, end, node) || node.gabor_type > NODE_GABOR_TYPE_3D ||
             !webgpu_svm_stack_has3(written, node.coordinates) ||
@@ -2240,7 +2649,7 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
               written, varying, surface_normal_offset, SVM_STACK_INVALID, node.color_offset);
           break;
         }
-#ifndef CYCLES_WEBGPU_SVM_CORE
+#if !defined(CYCLES_WEBGPU_SVM_CORE) || defined(CYCLES_WEBGPU_SVM_ADVANCED_QUERIES)
         if (node.dimensions < 1 || node.dimensions > 4 ||
             node.feature > NODE_VORONOI_N_SPHERE_RADIUS ||
             node.metric > NODE_VORONOI_MINKOWSKI || !webgpu_svm_stack_has3(written, node.coord) ||
@@ -2253,6 +2662,8 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
           return false;
         }
         material.requires_extended_svm = true;
+        material.requires_full_svm = true;
+        material.requires_advanced_procedural_svm = true;
         svm_node_tex_voronoi<KERNEL_FEATURE_NODE_VORONOI_EXTRA>(stack, node);
         webgpu_svm_mark_outputs(
             written, varying, surface_normal_offset, node.distance_offset, node.color_offset);
@@ -2404,7 +2815,7 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
             written, varying, surface_normal_offset, node.value_offset, node.vector_offset);
         break;
       }
-#ifndef CYCLES_WEBGPU_SVM_CORE
+#if !defined(CYCLES_WEBGPU_SVM_CORE) || defined(CYCLES_WEBGPU_SVM_TEXTURES)
       case NODE_CLAMP: {
         material.requires_extended_svm = true;
         SVMNodeClamp node;
@@ -2740,7 +3151,7 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
         }
         break;
       }
-#ifndef CYCLES_WEBGPU_SVM_CORE
+#if !defined(CYCLES_WEBGPU_SVM_CORE) || defined(CYCLES_WEBGPU_SVM_TEXTURES)
       case NODE_RGB_RAMP: {
         material.requires_extended_svm = true;
         SVMNodeRGBRamp node;
@@ -2832,24 +3243,40 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
         SVMNodeTexImage node;
         if (!webgpu_svm_read(fetch, offset, end, node) ||
             (node.projection != NODE_IMAGE_PROJ_FLAT
-#ifndef CYCLES_WEBGPU_SVM_CORE
+#if !defined(CYCLES_WEBGPU_SVM_CORE) || defined(CYCLES_WEBGPU_SVM_PROJECTED_IMAGES)
              && node.projection != NODE_IMAGE_PROJ_SPHERE && node.projection != NODE_IMAGE_PROJ_TUBE
 #endif
              ) ||
-            !webgpu_svm_eval_image(image, node, stack, written, varying, surface_normal_offset))
+            !webgpu_svm_eval_image(
+                image, node, surface, stack, written, varying, surface_normal_offset))
         {
           return false;
         }
         material.requires_extended_svm |= node.projection != NODE_IMAGE_PROJ_FLAT;
+        material.requires_full_svm |= node.projection != NODE_IMAGE_PROJ_FLAT;
         break;
       }
-#ifndef CYCLES_WEBGPU_SVM_CORE
+#if !defined(CYCLES_WEBGPU_SVM_CORE) || defined(CYCLES_WEBGPU_SVM_PROJECTED_IMAGES)
+      case NODE_TEX_IMAGE_BOX: {
+        material.requires_full_svm = true;
+        SVMNodeTexImageBox node;
+        if (!webgpu_svm_read(fetch, offset, end, node) ||
+            !webgpu_svm_eval_image(
+                image, node, surface, stack, written, varying, surface_normal_offset))
+        {
+          return false;
+        }
+        material.requires_extended_svm = true;
+        break;
+      }
       case NODE_TEX_ENVIRONMENT: {
+        material.requires_full_svm = true;
         SVMNodeTexEnvironment node;
         if (!webgpu_svm_read(fetch, offset, end, node) ||
             (node.projection != NODE_ENVIRONMENT_EQUIRECTANGULAR &&
              node.projection != NODE_ENVIRONMENT_MIRROR_BALL) ||
-            !webgpu_svm_eval_image(image, node, stack, written, varying, surface_normal_offset))
+            !webgpu_svm_eval_image(
+                image, node, surface, stack, written, varying, surface_normal_offset))
         {
           return false;
         }
@@ -2863,6 +3290,7 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
           return false;
         }
         weight = rgb_to_spectrum(node.rgb);
+        weight_varying = false;
         break;
       }
       case NODE_CLOSURE_WEIGHT: {
@@ -2875,6 +3303,9 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
         weight = rgb_to_spectrum(make_float3(stack_load_float(stack, node.weight_offset),
                                              stack_load_float(stack, uint(node.weight_offset) + 1),
                                              stack_load_float(stack, uint(node.weight_offset) + 2)));
+        weight_varying = webgpu_svm_stack_has(varying, node.weight_offset) ||
+                         webgpu_svm_stack_has(varying, uint(node.weight_offset) + 1) ||
+                         webgpu_svm_stack_has(varying, uint(node.weight_offset) + 2);
         break;
       }
       case NODE_EMISSION_WEIGHT: {
@@ -2886,10 +3317,15 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
           return false;
         }
         weight = rgb_to_spectrum(stack_load(stack, node.color)) * stack_load(stack, node.strength);
+        weight_varying = true;
         break;
       }
+      case NODE_CLOSURE_BACKGROUND:
       case NODE_CLOSURE_EMISSION: {
-        /* svm_node_closure_emission() and emission_setup() for a surface. */
+        /* Both stock closures add the mixed weight to closure_emission_background. */
+        static_assert(sizeof(SVMNodeClosureEmission) == sizeof(SVMNodeClosureBackground));
+        static_assert(offsetof(SVMNodeClosureEmission, mix_weight_offset) ==
+                      offsetof(SVMNodeClosureBackground, mix_weight_offset));
         SVMNodeClosureEmission node;
         if (material.holdout || !webgpu_svm_read(fetch, offset, end, node) ||
             (stack_valid(node.mix_weight_offset) &&
@@ -2943,7 +3379,7 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
       }
       case NODE_MIX_CLOSURE: {
         SVMNodeMixClosure node;
-        if ((has_closure && lambert_closures == 0) ||
+        if ((has_closure && lambert_closures == 0 && !has_transparent && !has_principled) ||
             !webgpu_svm_read(fetch, offset, end, node) ||
             !webgpu_svm_input_valid(written, node.fac) ||
             (stack_valid(node.in_weight_offset) &&
@@ -2977,7 +3413,7 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
         static_assert(offsetof(SVMNodeJumpIfZero, stack_offset) ==
                       offsetof(SVMNodeJumpIfOne, stack_offset));
         SVMNodeJumpIfZero jump;
-        if ((has_closure && lambert_closures == 0) ||
+        if ((has_closure && lambert_closures == 0 && !has_transparent && !has_principled) ||
             !webgpu_svm_read(fetch, offset, end, jump) ||
             !webgpu_svm_stack_has(written, jump.stack_offset) || jump.jump_offset < 0 ||
             uint(jump.jump_offset) > end - offset)
@@ -2995,21 +3431,51 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
           return false;
         }
         const bool lambert = closure.closure_type == CLOSURE_BSDF_DIFFUSE_ID;
-        if ((has_closure && lambert_closures == 0) ||
-            ((has_closure || mixes_closures) && !lambert) || lambert_closures == MAX_CLOSURE ||
+        const bool transparent = closure.closure_type == CLOSURE_BSDF_TRANSPARENT_ID;
+        const bool principled = closure.closure_type == CLOSURE_BSDF_PRINCIPLED_ID;
+        if ((has_closure && lambert_closures == 0 && !has_transparent && !has_principled) ||
+            ((has_closure || mixes_closures) && !lambert && !transparent && !principled) ||
+            lambert_closures == MAX_CLOSURE || (transparent && lambert_closures > 1) ||
+            (lambert && has_transparent && lambert_closures != 0) ||
+            (principled && (has_principled || lambert_closures != 0)) ||
+            (lambert && has_principled) ||
             (closure.mix_weight_offset != SVM_STACK_INVALID &&
              (!webgpu_svm_stack_has(written, closure.mix_weight_offset) ||
-              (!lambert && webgpu_svm_stack_has(varying, closure.mix_weight_offset)))))
+              (!lambert && !transparent && !principled &&
+               webgpu_svm_stack_has(varying, closure.mix_weight_offset)))))
         {
           return false;
         }
         const float mix_weight = stack_load_float_default(stack, closure.mix_weight_offset, 1.0f);
-        material.ggx = false;
-        material.standalone_transmission = 0.0f;
-        material.transmission = 0.0f;
-        material.subsurface = 0.0f;
-        Spectrum closure_weight;
-        const Spectrum previous = lambert_closures != 0 ? material.color : zero_spectrum();
+        if (transparent) {
+          SVMNodeSimpleBsdfData data;
+          const Spectrum tint = weight * mix_weight;
+          const bool varying_tint = weight_varying ||
+              (stack_valid(closure.mix_weight_offset) &&
+               webgpu_svm_stack_has(varying, closure.mix_weight_offset));
+          if (!webgpu_svm_read(fetch, offset, end, data) ||
+              !webgpu_svm_finite(tint.x) || !webgpu_svm_finite(tint.y) ||
+              !webgpu_svm_finite(tint.z) ||
+              (!varying_tint && (reduce_min(tint) < 0.0f || reduce_max(tint) > 1.0f)))
+          {
+            return false;
+          }
+          ShaderData sd{};
+          sd.num_closure_left = 1;
+          bsdf_transparent_setup(&sd, tint, 0);
+          if (sd.num_closure != 0) {
+            if (material.transparent_sample_weight == 0.0f) {
+              material.transparent_first = material.diffuse_sample_weight == 0.0f &&
+                                           !has_principled;
+            }
+            material.transparency += sd.closure_transparent_extinction;
+            material.transparent_sample_weight += sd.closure[0].sample_weight;
+          }
+          material.varying_transparency |= varying_tint;
+          has_transparent = true;
+          has_closure = true;
+          break;
+        }
         if (lambert) {
           SVMNodeDiffuseBsdfData diffuse;
           if (!webgpu_svm_read(fetch, offset, end, diffuse) ||
@@ -3021,24 +3487,255 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
             return false;
           }
           const float roughness = stack_load(stack, diffuse.roughness);
-          if (!webgpu_svm_finite(roughness) || !diffuse_roughness_is_almost_zero(roughness)) {
-            return false;
-          }
-          closure_weight = weight * mix_weight;
-        }
-        else if (closure.closure_type == CLOSURE_BSDF_PRINCIPLED_ID) {
-          SVMNodePrincipledBsdfData principled;
-          if (!webgpu_svm_read(fetch, offset, end, principled) ||
-              !webgpu_svm_principled(
-                  principled, written, stack, surface_normal_offset, mix_weight, material))
+          Spectrum closure_weight = weight * mix_weight;
+          if (!webgpu_svm_finite(roughness) || !diffuse_roughness_is_almost_zero(roughness) ||
+              !webgpu_svm_finite(closure_weight.x) || !webgpu_svm_finite(closure_weight.y) ||
+              !webgpu_svm_finite(closure_weight.z))
           {
             return false;
           }
+          const float sample_weight = closure_sample_weight(0, closure_weight);
+          if (lambert_closures == 0) {
+            material.color = zero_spectrum();
+          }
+          if (sample_weight > 0.0f) {
+            material.color += closure_weight;
+            material.diffuse_sample_weight += sample_weight;
+          }
+          if (!webgpu_svm_finite(average(material.color))) {
+            return false;
+          }
+          lambert_closures++;
+          has_closure = true;
+          break;
+        }
+#ifdef CYCLES_WEBGPU_SHADOW_SVM
+        if (principled) {
+          SVMNodePrincipledBsdfData data;
+          if (!webgpu_svm_read(fetch, offset, end, data)) {
+            return false;
+          }
+          /* Host eligibility already validated the opaque Principled lobes.
+           * Stock shadow evaluation only uses the Transparent extinction. */
+          has_principled = has_closure = opaque_principled = true;
+          break;
+        }
+        if (closure.closure_type == CLOSURE_BSDF_HAIR_HUANG_ID) {
+          SVMNodePrincipledHairBsdfData hair;
+          if (!webgpu_svm_read(fetch, offset, end, hair) ||
+              !webgpu_svm_inputs_valid(written, hair.aspect_ratio, hair.R, hair.TT, hair.TRT))
+          {
+            return false;
+          }
+          material.color = weight * mix_weight;
+          if (!(stack_load(stack, hair.R) > 0.0f || stack_load(stack, hair.TT) > 0.0f ||
+                stack_load(stack, hair.TRT) > 0.0f))
+          {
+            material.color = zero_spectrum();
+          }
+          material.surface_hair_aspect = stack_load(stack, hair.aspect_ratio);
+          material.surface_tangent = webgpu_svm_context_xyz(
+              surface(CYCLES_WEBGPU_SVM_TRIANGLE_DPDU));
+          material.surface_closure = CYCLES_WEBGPU_MATERIAL_HAIR_HUANG;
+          has_closure = true;
+          break;
+        }
+        return false;
+#else
+        Spectrum closure_weight;
+        if (principled) {
+          SVMNodePrincipledBsdfData data;
+          if (!webgpu_svm_read(fetch, offset, end, data) ||
+              !webgpu_svm_principled(
+                  data, written, stack, surface_normal_offset, mix_weight, material))
+          {
+            return false;
+          }
+          has_principled = true;
+          opaque_principled = material.transmission == 0.0f && material.subsurface == 0.0f &&
+                              (data.emission_strength.bits & 0x7fffffffu) == 0 &&
+                              !(webgpu_svm_input_on_stack(data.metallic) && !material.ggx);
           if (material.ggx) {
             has_closure = true;
             break;
           }
           closure_weight = material.color;
+        }
+        else if (closure.closure_type == CLOSURE_BSDF_RAY_PORTAL_ID) {
+          SVMNodeRayPortalBsdfData portal;
+          if (!webgpu_svm_read(fetch, offset, end, portal) ||
+              !webgpu_svm_inputs_valid(written, portal.direction) ||
+              (stack_valid(portal.position_offset) &&
+               !webgpu_svm_stack_has3(written, portal.position_offset)))
+          {
+            return false;
+          }
+          ShaderData sd{};
+          sd.num_closure_left = 1;
+          sd.P = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_POSITION));
+          sd.N = webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_NORMAL));
+          sd.wi = -webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_DIRECTION));
+          const float3 P = stack_load_float3_default(stack, portal.position_offset, sd.P);
+          bsdf_ray_portal_setup(&sd, weight * mix_weight, P, stack_load(stack, portal.direction));
+          material.color = sd.closure_transparent_extinction;
+          material.surface_closure = CYCLES_WEBGPU_MATERIAL_RAY_PORTAL;
+          material.surface_fresnel_a = P;
+          material.surface_fresnel_b = sd.num_closure > 0 ?
+                                           reinterpret_cast<const RayPortalClosure *>(&sd.closure[0])
+                                               ->D :
+                                           zero_float3();
+          has_closure = true;
+          break;
+        }
+        else if (closure.closure_type == CLOSURE_BSDF_TRANSLUCENT_ID) {
+          SVMNodeSimpleBsdfData translucent;
+          if (!webgpu_svm_read(fetch, offset, end, translucent) ||
+              !webgpu_svm_surface_normal(translucent.normal_offset, surface_normal_offset))
+          {
+            return false;
+          }
+          material.surface_closure = CYCLES_WEBGPU_MATERIAL_TRANSLUCENT;
+          material.surface_parameters = zero_float2();
+          closure_weight = weight * mix_weight;
+        }
+        else if (closure.closure_type == CLOSURE_BSDF_DIFFUSE_TOON_ID ||
+                 closure.closure_type == CLOSURE_BSDF_GLOSSY_TOON_ID)
+        {
+          SVMNodeToonBsdfData toon;
+          if (!webgpu_svm_read(fetch, offset, end, toon) ||
+              !webgpu_svm_surface_normal(toon.normal_offset, surface_normal_offset) ||
+              !webgpu_svm_inputs_valid(written, toon.size, toon.smooth))
+          {
+            return false;
+          }
+          const float size = stack_load(stack, toon.size);
+          const float smooth = stack_load(stack, toon.smooth);
+          if (!webgpu_svm_finite(size) || !webgpu_svm_finite(smooth)) {
+            return false;
+          }
+          material.surface_closure = closure.closure_type == CLOSURE_BSDF_DIFFUSE_TOON_ID ?
+                                         CYCLES_WEBGPU_MATERIAL_DIFFUSE_TOON :
+                                         CYCLES_WEBGPU_MATERIAL_GLOSSY_TOON;
+          material.surface_parameters = make_float2(size, smooth);
+          closure_weight = weight * mix_weight;
+        }
+        else if (closure.closure_type == CLOSURE_BSDF_ASHIKHMIN_VELVET_ID ||
+                 closure.closure_type == CLOSURE_BSDF_SHEEN_ID)
+        {
+          SVMNodeSimpleBsdfData sheen;
+          if (!webgpu_svm_read(fetch, offset, end, sheen) ||
+              !webgpu_svm_surface_normal(sheen.normal_offset, surface_normal_offset) ||
+              !webgpu_svm_inputs_valid(written, sheen.param1))
+          {
+            return false;
+          }
+          const float roughness = stack_load(stack, sheen.param1);
+          if (!webgpu_svm_finite(roughness)) {
+            return false;
+          }
+          material.surface_closure = closure.closure_type == CLOSURE_BSDF_SHEEN_ID ?
+                                         CYCLES_WEBGPU_MATERIAL_SHEEN :
+                                         CYCLES_WEBGPU_MATERIAL_VELVET;
+          material.surface_parameters = make_float2(saturatef(roughness), 0.0f);
+          closure_weight = weight * mix_weight;
+        }
+        else if (closure.closure_type == CLOSURE_BSDF_MICROFACET_GGX_ID ||
+                 closure.closure_type == CLOSURE_BSDF_MICROFACET_BECKMANN_ID ||
+                 closure.closure_type == CLOSURE_BSDF_MICROFACET_MULTI_GGX_ID ||
+                 closure.closure_type == CLOSURE_BSDF_ASHIKHMIN_SHIRLEY_ID)
+        {
+          SVMNodeGlossyBsdfData glossy;
+          material.surface_fresnel_a = zero_float3();
+          material.surface_fresnel_b = zero_float3();
+          if (!webgpu_svm_read(fetch, offset, end, glossy) ||
+              !webgpu_svm_surface_normal(glossy.normal_offset, surface_normal_offset) ||
+              !webgpu_svm_glossy_geometry(glossy.roughness, glossy.anisotropy, glossy.rotation,
+                                         glossy.tangent_offset, false, written, stack,
+                                         zero_float3(), material))
+          {
+            return false;
+          }
+          if (closure.closure_type == CLOSURE_BSDF_MICROFACET_MULTI_GGX_ID) {
+            if (!webgpu_svm_surface_color(glossy.color, written, stack, material.surface_fresnel_a)) {
+              return false;
+            }
+            material.surface_fresnel_a = max(material.surface_fresnel_a, zero_float3());
+          }
+          material.surface_closure = CYCLES_WEBGPU_MATERIAL_GLOSSY;
+          material.surface_model = uint(closure.closure_type);
+          closure_weight = weight * mix_weight;
+        }
+        else if (closure.closure_type == CLOSURE_BSDF_PHYSICAL_CONDUCTOR ||
+                 closure.closure_type == CLOSURE_BSDF_F82_CONDUCTOR)
+        {
+          SVMNodeMetallicBsdfData metallic;
+          if (!webgpu_svm_read(fetch, offset, end, metallic) ||
+              !webgpu_svm_surface_normal(metallic.normal_offset, surface_normal_offset) ||
+              !webgpu_svm_inputs_valid(written, metallic.thin_film_thickness) ||
+              (webgpu_svm_input_on_stack(metallic.thin_film_thickness) &&
+               webgpu_svm_stack_has(varying, metallic.thin_film_thickness.bits & 0xffu)) ||
+              !webgpu_svm_surface_color(metallic.base_ior, written, stack, material.surface_fresnel_a) ||
+              !webgpu_svm_surface_color(metallic.edge_tint_k, written, stack, material.surface_fresnel_b))
+          {
+            return false;
+          }
+          const float film_thickness = stack_load(stack, metallic.thin_film_thickness);
+          if (!webgpu_svm_finite(film_thickness) || film_thickness > THINFILM_THICKNESS_CUTOFF ||
+              (metallic.distribution != CLOSURE_BSDF_MICROFACET_GGX_ID &&
+               metallic.distribution != CLOSURE_BSDF_MICROFACET_BECKMANN_ID &&
+               metallic.distribution != CLOSURE_BSDF_MICROFACET_MULTI_GGX_ID) ||
+              !webgpu_svm_glossy_geometry(metallic.roughness, metallic.anisotropy, metallic.rotation,
+                                         metallic.tangent_offset, true, written, stack,
+                                         webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_NORMAL)),
+                                         material))
+          {
+            return false;
+          }
+          material.surface_closure = CYCLES_WEBGPU_MATERIAL_GLOSSY;
+          material.surface_model = uint(metallic.distribution) | (uint(closure.closure_type) << 8u);
+          closure_weight = make_spectrum(mix_weight);
+        }
+        else if (closure.closure_type == CLOSURE_BSDF_HAIR_REFLECTION_ID ||
+                 closure.closure_type == CLOSURE_BSDF_HAIR_TRANSMISSION_ID)
+        {
+          SVMNodeHairBsdfData hair;
+          if (!webgpu_svm_read(fetch, offset, end, hair) ||
+              !webgpu_svm_inputs_valid(written, hair.roughness1, hair.roughness2, hair.offset) ||
+              (stack_valid(hair.tangent_offset) &&
+               !webgpu_svm_stack_has3(written, hair.tangent_offset)))
+          {
+            return false;
+          }
+          const bool custom_tangent = stack_valid(hair.tangent_offset);
+          material.surface_tangent = safe_normalize(stack_load_float3_default(
+              stack, hair.tangent_offset,
+              webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_TRIANGLE_DPDV))));
+          material.surface_parameters = make_float2(
+              custom_tangent ? -stack_load(stack, hair.offset) : 0.0f,
+              stack_load(stack, hair.roughness1));
+          material.surface_fresnel_b.x = stack_load(stack, hair.roughness2);
+          material.surface_closure = closure.closure_type == CLOSURE_BSDF_HAIR_REFLECTION_ID ?
+                                         CYCLES_WEBGPU_MATERIAL_HAIR_REFLECTION :
+                                         CYCLES_WEBGPU_MATERIAL_HAIR_TRANSMISSION;
+          closure_weight = weight * mix_weight;
+        }
+        else if (closure.closure_type == CLOSURE_BSDF_HAIR_CHIANG_ID ||
+                 closure.closure_type == CLOSURE_BSDF_HAIR_HUANG_ID)
+        {
+          SVMNodePrincipledHairBsdfData hair;
+          const bool huang = closure.closure_type == CLOSURE_BSDF_HAIR_HUANG_ID;
+          if (!webgpu_svm_read(fetch, offset, end, hair) ||
+              !webgpu_svm_principled_hair(hair, huang, written, stack,
+                  webgpu_svm_context_xyz(surface(CYCLES_WEBGPU_SVM_TRIANGLE_DPDU)), material))
+          {
+            return false;
+          }
+          material.surface_closure = huang ? CYCLES_WEBGPU_MATERIAL_HAIR_HUANG :
+                                            CYCLES_WEBGPU_MATERIAL_HAIR_CHIANG;
+          closure_weight = weight * mix_weight;
+          if (huang && is_zero(material.surface_fresnel_b)) {
+            closure_weight = zero_spectrum();
+          }
         }
         else if (CLOSURE_IS_BSSRDF(closure.closure_type)) {
           SVMNodeBssrdfData data;
@@ -3112,17 +3809,17 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
         {
           return false;
         }
-        /* Lambert closures with the same surface normal have the same cosine PDF. */
-        material.color = previous;
-        if (closure_sample_weight(0, closure_weight) > 0.0f) {
-          material.color += closure_weight;
+        const float sample_weight = closure_sample_weight(0, closure_weight);
+        material.color = sample_weight > 0.0f ? closure_weight : zero_spectrum();
+        if (principled) {
+          material.diffuse_sample_weight = sample_weight;
         }
         if (!webgpu_svm_finite(average(material.color))) {
           return false;
         }
         has_closure = true;
-        lambert_closures += uint(lambert);
         break;
+#endif
       }
       default:
         return false;

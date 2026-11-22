@@ -1,0 +1,69 @@
+diff --git a/intern/cycles/scene/shader_graph.cpp b/intern/cycles/scene/shader_graph.cpp
+--- a/intern/cycles/scene/shader_graph.cpp
++++ b/intern/cycles/scene/shader_graph.cpp
+@@ -1001,8 +1001,50 @@
+     }
+   }
+ }
+ 
++static bool displacement_bump_has_uniform_taps(const ShaderOutput &source)
++{
++  ShaderNode &node = *source.parent;
++  /* constant_fold() restores a folded displacement through a Color node and
++   * its automatic Color-to-Vector conversion, a stack alias in stock SVM. */
++  const ShaderNode *color = &node;
++  if (node.special_type == SHADER_SPECIAL_TYPE_AUTOCONVERT &&
++      source.type() == SocketType::VECTOR && node.inputs.size() == 1)
++  {
++    const ShaderOutput *input = node.inputs[0]->link;
++    if (input && input->type() == SocketType::COLOR) {
++      color = input->parent;
++    }
++  }
++  if (color->type == ColorNode::get_node_type()) {
++    return isfinite_safe(static_cast<const ColorNode &>(*color).get_value());
++  }
++  if (node.type == DisplacementNode::get_node_type()) {
++    const auto &displacement = static_cast<const DisplacementNode &>(node);
++    const ShaderOutput *normal = node.input("Normal")->link;
++    /* The stock Geometry normals do not use the bump sample's position or UV.
++     * The normal and vector transforms use the same object for all three taps. */
++    const bool uniform_normal = !normal ||
++                                (normal->parent->type == GeometryNode::get_node_type() &&
++                                 (normal->name() == "Normal" || normal->name() == "True Normal"));
++    return uniform_normal && !node.input("Height")->link && !node.input("Midlevel")->link &&
++           !node.input("Scale")->link &&
++           isfinite_safe((displacement.get_height() - displacement.get_midlevel()) *
++                         displacement.get_scale());
++  }
++  if (node.type == VectorDisplacementNode::get_node_type()) {
++    const auto &displacement = static_cast<const VectorDisplacementNode &>(node);
++    /* This SVM operation fetches its tangent at the original hit. The stock
++     * vector displacement opcode has no bump offset and uses the same tangent
++     * and transform for all three taps. */
++    return !check_node_inputs_has_links(&node) &&
++           isfinite_safe((displacement.get_vector() - make_float3(displacement.get_midlevel())) *
++                         displacement.get_scale());
++  }
++  return false;
++}
++
+ void ShaderGraph::bump_from_displacement(bool use_object_space)
+ {
+   /* generate bump mapping automatically from displacement. bump mapping is
+    * done using a 3-tap filter, computing the displacement at the center,
+@@ -1019,8 +1061,14 @@
+ 
+   ShaderInput *displacement_in = output()->input("Displacement");
+ 
+   if (!displacement_in->link) {
++    return;
++  }
++
++  /* These graphs sample an identical height in all three directions. Keep the
++   * original normal for bump-only materials, where the surface was undisplaced. */
++  if (!use_object_space && displacement_bump_has_uniform_taps(*displacement_in->link)) {
+     return;
+   }
+ 
+   /* find dependencies for the given input */

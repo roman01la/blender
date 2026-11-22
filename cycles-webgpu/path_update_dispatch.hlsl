@@ -2,7 +2,9 @@
 
 #include "../blender-platform/cycles-webgpu/path_state_layout.h"
 #include "../blender-platform/cycles-webgpu/material_layout.h"
+#include "../blender-platform/cycles-webgpu/volume_layout.h"
 
+typedef uint uint2 __attribute__((ext_vector_type(2)));
 typedef float float3 __attribute__((ext_vector_type(3)));
 
 RWStructuredBuffer<uint> ray_words : register(u0);
@@ -24,15 +26,23 @@ uint cycles_camera_sample_word(uint index)
 
 extern uint4 cycles_path_settings();
 extern uint4 cycles_path_lobe_settings();
+extern float4 cycles_advance_differential(float4 ray, float glossy_filter, uint portal);
+extern uint4 cycles_transparent_advance(uint4 rng, uint4 path, float4 throughput,
+                                       uint portal);
+extern float4 cycles_sample_mixed_transparency(uint4 rng, float4 diffuse, float4 transparent,
+                                               float4 weights, float4 normal, float4 ray);
+extern uint2 cycles_absorption_bounce(uint4 rng, uint4 path, float4 throughput);
 extern uint cycles_surface_bounce(uint rng_pixel, uint sample_index, uint4 position,
                                   uint4 normal, uint4 geometric_normal,
                                   uint4 specular_normal, uint4 ray, uint4 settings,
                                   uint4 lobe_settings, uint4 path_counts, uint bounce,
-                                  uint subsurface_steps,
+                                  uint subsurface_steps, uint ray_differentials,
                                   float min_ray_pdf, float4 material, float4 specular,
-                                  float4 parameters, float4 glass, float4 throughput,
+                                  float4 parameters, float4 glass, float4 hair,
+                                  float4 throughput,
                                   out float4 next_throughput, out float next_pdf, out uint4 origin,
-                                  out uint4 direction, out uint4 next_counts, out float surface_rr);
+                                  out uint4 direction, out uint4 next_counts, out float surface_rr,
+                                  out float roughness_squared);
 
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -47,7 +57,7 @@ void main(uint3 id : SV_DispatchThreadID)
   const uint queued = path + CYCLES_WEBGPU_PATH_QUEUED_KERNEL;
   const uint bounce_word = path + CYCLES_WEBGPU_PATH_BOUNCE;
   const uint bounce = path_words[bounce_word];
-  const uint subsurface_steps = path_words[path + CYCLES_WEBGPU_PATH_SUBSURFACE_STEPS];
+  const uint subsurface_steps = path_words[path + CYCLES_WEBGPU_PATH_EXTRA_RNG_STEPS];
   const uint ray = 1 + 12 * lane;
   const uint surface = 8 * lane;
   const uint weight = path + CYCLES_WEBGPU_PATH_THROUGHPUT;
@@ -63,6 +73,14 @@ void main(uint3 id : SV_DispatchThreadID)
   const float4 material = materials[material_base];
   const bool ggx = material.w == CYCLES_WEBGPU_MATERIAL_GGX ||
                    material.w == CYCLES_WEBGPU_MATERIAL_MULTISCATTER_GGX;
+  const bool standalone = CYCLES_WEBGPU_MATERIAL_IS_STANDALONE(material.w);
+  const bool portal = material.w == CYCLES_WEBGPU_MATERIAL_RAY_PORTAL;
+  const bool mixed = material.w == CYCLES_WEBGPU_MATERIAL_MIXED_TRANSPARENT;
+  const bool mixed_ggx = ggx && materials[material_base + 3].w == 0.0f &&
+                         materials[material_base + 4].w != 0.0f;
+  const uint boundary = hit_words[surface + CYCLES_WEBGPU_HIT_SPECIAL];
+  const bool volume = boundary == CYCLES_WEBGPU_ABSORPTION_BOUNDARY ||
+                      boundary == CYCLES_WEBGPU_ABSORPTION_TERMINATE;
   const bool active = path_words[queued] != CYCLES_WEBGPU_PATH_TERMINATED;
   const uint forward_hits = cycles_forward_light_hits(area);
   const bool area_hit = active && forward_hits != 0;
@@ -75,13 +93,33 @@ void main(uint3 id : SV_DispatchThreadID)
                               path_words[path + CYCLES_WEBGPU_PATH_TRANSMISSION_BOUNCE],
                               path_words[path + CYCLES_WEBGPU_PATH_FLAGS]);
   const float surface_rr = __builtin_bit_cast(float, path_words[path + CYCLES_WEBGPU_PATH_SURFACE_RR]);
-  const bool shade_surface = active && trace_past_area && incoming.w >= 0.0f && surface_rr > 0.0f &&
+  const uint4 rng = uint4(ray_words[ray + CYCLES_WEBGPU_RAY_RNG_PIXEL], pixels[lane].z,
+                           bounce + subsurface_steps + 1, counts.w);
+  float4 mixed_sample = float4(0, 0, 0, 0);
+  if (mixed && active && trace_past_area && surface_rr > 0.0f) {
+    const uint4 normal = uint4(surface_words[surface + 4], surface_words[surface + 5],
+                               surface_words[surface + 6], 0);
+    const uint4 direction = uint4(ray_words[ray + 4], ray_words[ray + 5], ray_words[ray + 6], 0);
+    mixed_sample = cycles_sample_mixed_transparency(
+        rng, material, materials[material_base + 1], materials[material_base + 2],
+        __builtin_bit_cast(float4, normal), __builtin_bit_cast(float4, direction));
+  }
+  bool transparent = material.w == CYCLES_WEBGPU_MATERIAL_TRANSPARENT || portal ||
+                           mixed_sample.w != 0.0f;
+  const bool shade_surface = !volume && active && trace_past_area && incoming.w >= 0.0f && surface_rr > 0.0f &&
                              (counts.w & CYCLES_WEBGPU_PATH_TERMINATE_AFTER_TRANSPARENT) == 0;
   const float3 surface_throughput = throughput * surface_rr;
-  float3 next_throughput = ggx ? surface_throughput : surface_throughput * material.xyz;
-  const uint4 settings = cycles_path_settings();
+  float3 next_throughput = ggx || standalone ? surface_throughput :
+                               surface_throughput * (mixed_sample.w != 0.0f ?
+                                                         mixed_sample.xyz :
+                                                         material.xyz);
+  uint4 settings = cycles_path_settings();
+  const bool ray_differentials = (settings.x & CYCLES_WEBGPU_PATH_SETTINGS_DIFFERENTIALS) != 0u;
+  settings.x &= ~CYCLES_WEBGPU_PATH_SETTINGS_DIFFERENTIALS;
   const float light_max_bounces = __builtin_bit_cast(float4, settings).w;
   uint visibility = 0;
+  float roughness_squared = 0.0f;
+  bool skip_self = !transparent;
   uint4 origin = uint4(0, 0, 0, 0);
   uint4 direction = uint4(0, 0, 0, 0);
 
@@ -102,11 +140,11 @@ void main(uint3 id : SV_DispatchThreadID)
     const float transparent = (weighted.x + weighted.y + weighted.z) * (1.0f / 3.0f);
     path_words[sum + 3] = __builtin_bit_cast(uint, 1.0f - transparent);
   }
-  /* integrate_surface_emission() for emissive surfaces outside light sampling,
-   * so the MIS weight is one. It precedes Russian roulette, and
+  /* integrate_surface_emission(): the Light Tree dispatch has already applied
+   * the forward MIS weight to sampled emitters. It precedes Russian roulette, and
    * film_clamp_light() uses bounce - 1: unclamped through the first bounce
    * (the scene requires an unlimited direct clamp), then the indirect clamp. */
-  const float4 emission = materials[material_base + 5];
+  const float4 emission = materials[material_base + CYCLES_WEBGPU_MATERIAL_EMISSION_SLOT];
   if (active && trace_past_area && hit_words[surface] != 0u &&
       (emission.x != 0.0f || emission.y != 0.0f || emission.z != 0.0f)) {
     rgb += clamp_light(throughput * emission.xyz, bounce <= 1u ? 3.40282347e+38f : emission.w);
@@ -117,7 +155,12 @@ void main(uint3 id : SV_DispatchThreadID)
   if (shade_surface && incoming.w > 0.0f && float(bounce) <= light_max_bounces) {
     rgb += clamp_light(surface_throughput * incoming.xyz, incoming.w);
   }
-  if (shade_surface && bounce < settings.x && (material.w == 1.0f || ggx) &&
+  const bool ordinary_bounce = shade_surface && bounce < settings.x &&
+                               (material.w == 1.0f || mixed || ggx || standalone);
+  const bool terminal_mixed = mixed_ggx && active && trace_past_area && surface_rr > 0.0f &&
+                              (counts.w & CYCLES_WEBGPU_PATH_TERMINATE_AFTER_TRANSPARENT) != 0 &&
+                              (counts.w & CYCLES_WEBGPU_PATH_TERMINATE_ON_NEXT_SURFACE) == 0;
+  if (!transparent && !volume && (ordinary_bounce || terminal_mixed) &&
       (next_throughput.x > 0.0f || next_throughput.y > 0.0f || next_throughput.z > 0.0f)) {
     const uint4 position = uint4(surface_words[surface], surface_words[surface + 1],
                                  surface_words[surface + 2], surface_words[surface + 3]);
@@ -137,13 +180,19 @@ void main(uint3 id : SV_DispatchThreadID)
     visibility = cycles_surface_bounce(ray_words[ray + CYCLES_WEBGPU_RAY_RNG_PIXEL], pixels[lane].z,
                                        position, normal, geom_N, spec_N, incoming_ray,
                                        settings, cycles_path_lobe_settings(), counts, bounce,
-                                       subsurface_steps, min_pdf,
+                                       subsurface_steps, uint(ray_differentials), min_pdf,
                                        material, materials[material_base + 1],
                                        materials[material_base + 2], materials[material_base + 3],
-                                       float4(next_throughput, 0.0f), bounced_throughput,
-                                       bounced_pdf, origin, direction, next_counts, next_rr);
+                                       materials[material_base + 4], float4(next_throughput, 0.0f), bounced_throughput,
+                                       bounced_pdf, origin, direction, next_counts, next_rr,
+                                       roughness_squared);
     next_throughput = bounced_throughput.xyz;
-    if (visibility != 0 && visibility != CYCLES_WEBGPU_PATH_SUBSURFACE_PENDING) {
+    if (visibility == CYCLES_WEBGPU_MIXED_TRANSPARENT_PENDING) {
+      transparent = true;
+      skip_self = false;
+      visibility = 0;
+    }
+    else if (visibility != 0 && visibility != CYCLES_WEBGPU_PATH_SUBSURFACE_PENDING) {
       path_words[path + CYCLES_WEBGPU_PATH_DIFFUSE_BOUNCE] = next_counts.x;
       path_words[path + CYCLES_WEBGPU_PATH_GLOSSY_BOUNCE] = next_counts.y;
       path_words[path + CYCLES_WEBGPU_PATH_TRANSMISSION_BOUNCE] = next_counts.z;
@@ -157,6 +206,49 @@ void main(uint3 id : SV_DispatchThreadID)
       path_words[mis_normal + 2] = normal.z;
       path_words[path + CYCLES_WEBGPU_PATH_SURFACE_RR] = __builtin_bit_cast(uint, next_rr);
     }
+  }
+  if (volume) {
+    if (boundary == CYCLES_WEBGPU_ABSORPTION_BOUNDARY && active && trace_past_area &&
+        surface_rr > 0.0f && (counts.w & CYCLES_WEBGPU_PATH_TERMINATE_ON_NEXT_SURFACE) == 0u) {
+      next_throughput = surface_throughput;
+      visibility = ray_words[ray + 8];
+      direction = uint4(ray_words[ray + 4], ray_words[ray + 5], ray_words[ray + 6], ray_words[ray + 7]);
+      const uint4 rng = uint4(ray_words[ray + CYCLES_WEBGPU_RAY_RNG_PIXEL], pixels[lane].z,
+                               bounce + subsurface_steps + 2, counts.w);
+      const uint2 next = cycles_absorption_bounce(
+          rng, uint4(bounce, hit_words[surface + 4], 0, 0), float4(next_throughput, 0));
+      origin = uint4(ray_words[ray], ray_words[ray + 1], ray_words[ray + 2], next.x);
+      path_words[path + CYCLES_WEBGPU_PATH_SURFACE_RR] = next.y;
+      path_words[path + CYCLES_WEBGPU_PATH_EXTRA_RNG_STEPS] = subsurface_steps + 1;
+      skip_self = false;
+    }
+  }
+  else if (transparent && active && trace_past_area && surface_rr > 0.0f &&
+      (counts.w & CYCLES_WEBGPU_PATH_TERMINATE_ON_NEXT_SURFACE) == 0 &&
+      (next_throughput.x != 0.0f || next_throughput.y != 0.0f || next_throughput.z != 0.0f)) {
+    const uint counter = path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE;
+    visibility = ray_words[ray + 8];
+    direction = uint4(ray_words[ray + 4], ray_words[ray + 5], ray_words[ray + 6],
+                       ray_words[ray + 7]);
+    const uint4 next = cycles_transparent_advance(
+        rng, uint4(visibility, path_words[counter], hit_words[surface + 4], 0),
+        float4(next_throughput, 0), uint(portal));
+    origin = uint4(ray_words[ray], ray_words[ray + 1], ray_words[ray + 2], next.x);
+    if (portal) {
+      const float3 destination = materials[material_base + 1].xyz;
+      const uint3 position = uint3(surface_words[surface], surface_words[surface + 1],
+                                  surface_words[surface + 2]);
+      const float3 delta = __builtin_bit_cast(float3, position) - destination;
+      // integrate_surface_ray_portal resets self-intersection only after teleporting.
+      skip_self = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z <= 1.0e-9f;
+      origin = uint4(__builtin_bit_cast(uint3, destination), 0);
+      direction = uint4(__builtin_bit_cast(uint3, materials[material_base + 2].xyz),
+                        __builtin_bit_cast(uint, 3.40282347e+38f));
+    }
+    path_words[path + CYCLES_WEBGPU_PATH_FLAGS] = next.y;
+    path_words[counter] = next.z;
+    path_words[path + CYCLES_WEBGPU_PATH_SURFACE_RR] = next.w;
+    path_words[path + CYCLES_WEBGPU_PATH_EXTRA_RNG_STEPS] = subsurface_steps + 1;
   }
   const uint3 next_bits = __builtin_bit_cast(uint3, next_throughput);
   const uint3 sum_bits = __builtin_bit_cast(uint3, rgb);
@@ -174,7 +266,20 @@ void main(uint3 id : SV_DispatchThreadID)
 
   path_words[queued] = visibility == 0 ? CYCLES_WEBGPU_PATH_TERMINATED :
                                         CYCLES_WEBGPU_PATH_INTERSECT_CLOSEST;
-  path_words[bounce_word] = bounce + 1;
+  path_words[bounce_word] = bounce + uint(!transparent && !volume);
+
+  if (ray_differentials && visibility != 0 && !volume && (!transparent || portal)) {
+    const uint differential = CYCLES_WEBGPU_RAY_DIFFERENTIAL_BASE(ray_words[0], lane);
+    const uint4 ray_diff = uint4(ray_words[differential], ray_words[differential + 1],
+                                 hit_words[surface + 4],
+                                 __builtin_bit_cast(uint, roughness_squared));
+    const float glossy_filter = __builtin_bit_cast(float, cycles_path_lobe_settings().w);
+    const uint4 advanced = __builtin_bit_cast(
+        uint4, cycles_advance_differential(__builtin_bit_cast(float4, ray_diff),
+                                           glossy_filter, uint(portal)));
+    ray_words[differential] = advanced.x;
+    ray_words[differential + 1] = advanced.y;
+  }
 
   /* An empty ray interval keeps finished slots out of the existing traversal. */
   ray_words[ray] = origin.x;
@@ -186,6 +291,7 @@ void main(uint3 id : SV_DispatchThreadID)
   ray_words[ray + 6] = direction.z;
   ray_words[ray + 7] = visibility == 0 ? 0 : direction.w;
   ray_words[ray + 8] = visibility;
-  ray_words[ray + 9] = hit_words[surface + 2];
-  ray_words[ray + 10] = hit_words[surface + 1];
+  // Straight transparency excludes the hit through tmin and preserves the ray origin.
+  ray_words[ray + 9] = skip_self ? hit_words[surface + 2] : 0xffffffffu;
+  ray_words[ray + 10] = skip_self ? hit_words[surface + 1] : 0xffffffffu;
 }

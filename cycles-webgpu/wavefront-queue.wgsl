@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Cycles WebGPU volume scatter classification
 
 @group(0) @binding(0) var<storage, read_write> paths: array<u32>;
 @group(0) @binding(1) var<storage, read_write> rays: array<atomic<u32>>;
@@ -13,6 +14,9 @@ const intersect_closest = 3u;
 const intersect_subsurface = 5u;
 const shade_background = 9u;
 const shade_surface = 12u;
+// CYCLES_WEBGPU_HIT_SPECIAL and CYCLES_WEBGPU_VOLUME_SCATTER_HIT.
+const hit_special = 7u;
+const volume_scatter_hit = 4u;
 
 // Match the C++ IntegratorQueueCounter, then extend it with the live sample range.
 const queue_kernels = 18u;
@@ -101,8 +105,11 @@ fn classify_intersection(@builtin(global_invocation_id) id: vec3<u32>) {
   let queue = queue_offset();
   if (id.x < atomicLoad(&rays[queue])) {
     let lane = atomicLoad(&rays[queue + 1u + id.x]);
-    paths[lane * path_words + queued_kernel] =
-        select(shade_background, shade_surface, hits[8u * lane] != 0u);
+    let hit = 8u * lane;
+    if (hits[hit + hit_special] != volume_scatter_hit) {
+      paths[lane * path_words + queued_kernel] =
+          select(shade_background, shade_surface, hits[hit] != 0u);
+    }
   }
 }
 

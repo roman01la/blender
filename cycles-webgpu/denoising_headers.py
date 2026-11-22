@@ -14,10 +14,9 @@ def prepare_denoising_header(work: Path, cycles: Path) -> Path:
         return source[source.index(start):source.index(end, source.index(start))]
 
     fields = section("  float3 normal = ", "  for (int i")
-    fields = fields.replace("  Spectrum transparent_albedo = zero_spectrum();\n", "")
     fields = fields.replace("  float specular_roughness = 0.0f;\n", "")
     accumulate = section("    const float closure_weight", "\n  }\n\n  /* Fraction")
-    # The compact renderer has neither hair nor transparent closures.
+    # The compact renderer uses a world-space normal for each opaque closure.
     accumulate = (
         accumulate.split("    /* All closures", 1)[0] +
         "    normal += N * closure_weight;\n" +
@@ -44,7 +43,7 @@ def prepare_denoising_header(work: Path, cycles: Path) -> Path:
     finish = finish.replace("    specular_roughness /= sum_weight;\n", "")
     finish = finish.replace("kernel_data.film.denoising_pass_options_flag", "options")
     # The caller consumes the RGB albedo, normal and deferred throughput. The
-    # other denoising data passes and transparent closures are outside its film layout.
+    # other denoising data passes are outside its film layout.
     header = work / "denoising_features.h"
     text = """/* SPDX-License-Identifier: Apache-2.0 */
 /* Derived during the shader build from Cycles' kernel/film/denoising_passes.h. */
@@ -67,10 +66,11 @@ struct DenoisingFeatureAccumulator {
 """
     text += indent(dedent(finish), "    ")
     text += """    albedo = ensure_finite(diffuse_albedo * feature_weight * denoising_feature_throughput);
-    const float opaque_fraction = sum_weight > 0.0f ? 1.0f : 0.0f;
+    const float total_weight = sum_weight + average(transparent_albedo);
+    const float opaque_fraction = total_weight > 0.0f ? sum_weight / total_weight : 0.0f;
     guide_normal = normal * opaque_fraction * feature_weight * average(denoising_feature_throughput);
-    const Spectrum deferred_albedo = follow_reflections ?
-                                        specular_albedo * deferred_feature_weight : zero_spectrum();
+    const Spectrum deferred_albedo = transparent_albedo + (follow_reflections ?
+                                        specular_albedo * deferred_feature_weight : zero_spectrum());
     throughput = reduce_max(fabs(deferred_albedo)) > 1e-4f ?
                      throughput * deferred_albedo : zero_spectrum();
   }
@@ -78,3 +78,44 @@ struct DenoisingFeatureAccumulator {
 """
     header.write_text(text)
     return work
+
+
+def prepare_volume_denoising_header(work: Path, cycles: Path) -> None:
+    source = (cycles / "kernel/film/denoising_passes.h").read_text()
+    start = source.index("void film_write_denoising_features_volume(")
+    first = source.index("  if (scatter &&", start)
+    policy = source[first:source.index("\n}\n", first)]
+    # Keep the stock albedo multiplication, camera-facing normal and feature
+    # termination. Redirect film writes to the path retired by the GPU film.
+    replacements = {
+        "kernel_data.film.pass_denoising_normal != PASS_UNUSED": "write_normal",
+        "kernel_data.film.pass_denoising_albedo != PASS_UNUSED": "write_albedo",
+        "INTEGRATOR_STATE_WRITE(state, path, flag) &= ~PATH_RAY_DENOISING_FEATURES;":
+            "feature_throughput = 0.0f;",
+        "make_float3(0.0f, 0.0f, -1.0f)": "float3(0.0f, 0.0f, -1.0f)",
+        "film_write_pass_float3(buffer + kernel_data.film.pass_denoising_normal, denoising_normal);":
+            "normal_sum.w += denoising_normal.z;",
+        "const Spectrum denoising_albedo = ensure_finite(denoising_feature_throughput * albedo);":
+            "const float3 denoising_albedo = guide_finite(denoising_feature_throughput * albedo);",
+        "film_write_pass_spectrum(buffer + kernel_data.film.pass_denoising_albedo, denoising_albedo);":
+            "albedo_sum.xyz += denoising_albedo;",
+    }
+    for original, replacement in replacements.items():
+        if policy.count(original) != 1:
+            raise ValueError(f"Cannot adapt stock volume denoising feature: {original}")
+        policy = policy.replace(original, replacement)
+    (work / "volume-denoising.hlsl").write_text("""/* Generated from Cycles' denoising_passes.h. */
+float3 guide_finite(float3 rgb)
+{
+  const uint3 exponent = __builtin_bit_cast(uint3, rgb) & 0x7f800000u;
+  return float3(exponent.x != 0x7f800000u ? rgb.x : 0.0f,
+                exponent.y != 0x7f800000u ? rgb.y : 0.0f,
+                exponent.z != 0x7f800000u ? rgb.z : 0.0f);
+}
+
+void accumulate_volume_features(float3 albedo, bool scatter, bool write_albedo,
+                                bool write_normal, inout float4 feature_throughput,
+                                inout float4 albedo_sum, inout float4 normal_sum)
+{
+  const float3 denoising_feature_throughput = feature_throughput.xyz;
+""" + policy + "\n}\n")

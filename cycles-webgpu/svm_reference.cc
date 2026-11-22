@@ -81,6 +81,7 @@ template<typename... Args> float4 kernel_image_interp(Args...)
 }  // namespace ccl
 #include "kernel/svm/sky.h"
 #include "kernel/util/image.h"
+#include "kernel/svm/image.h"
 #undef kernel_data_array
 #undef kernel_data_fetch
 #undef kernel_data
@@ -94,6 +95,7 @@ void cycles_svm_material(unsigned int shader,
                          float u,
                          float v,
                          unsigned int lane,
+                         unsigned int film_aov,
                          Float4 &base,
                          Float4 &specular,
                          Float4 &layers,
@@ -163,7 +165,8 @@ constexpr unsigned int first_view_shader = two_image_shader + 1;
 constexpr unsigned int first_view_coordinate = first_view_shader + 6;
 constexpr std::array view_coordinates{NODE_TEXCO_CAMERA, NODE_TEXCO_WINDOW,
                                       NODE_TEXCO_REFLECTION, NODE_TEXCO_OBJECT_WITH_TRANSFORM,
-                                      NODE_TEXCO_OBJECT, NODE_TEXCO_NORMAL};
+                                      NODE_TEXCO_OBJECT, NODE_TEXCO_NORMAL,
+                                      NODE_TEXCO_DUPLI_GENERATED, NODE_TEXCO_DUPLI_UV};
 constexpr unsigned int first_object_info_shader = first_view_coordinate + view_coordinates.size();
 constexpr unsigned int first_attribute_shader = first_object_info_shader + NODE_INFO_OB_RANDOM + 1;
 constexpr std::array attribute_outputs{NODE_ATTR_OUTPUT_FLOAT3, NODE_ATTR_OUTPUT_FLOAT,
@@ -306,7 +309,18 @@ std::vector<float> ies_table()
 constexpr unsigned int tangent_fixtures = 8;
 constexpr unsigned int first_holdout_shader = first_tangent_shader + tangent_fixtures;
 constexpr unsigned int first_emission_shader = first_holdout_shader + 3;
-constexpr unsigned int shader_count = first_emission_shader + 6;
+constexpr unsigned int first_image_box_shader = first_emission_shader + 6;
+constexpr unsigned int shader_count = first_image_box_shader + 3;
+constexpr uint8_t image_box_flags = NODE_IMAGE_COMPRESS_AS_SRGB | NODE_IMAGE_ALPHA_UNASSOCIATE;
+const float3 image_box_co = make_float3(0.125f, 0.75f, 0.25f);
+const std::array image_box_nodes{
+    SVMNodeTexImageBox{.id = 4, .blend = 0.0f, .flags = image_box_flags,
+                       .co = 20, .out_offset = 30, .alpha_offset = SVM_STACK_INVALID},
+    SVMNodeTexImageBox{.id = 4, .blend = 0.8f, .flags = image_box_flags,
+                       .co = 20, .out_offset = SVM_STACK_INVALID, .alpha_offset = 30},
+    SVMNodeTexImageBox{.id = 4, .blend = 0.8f, .flags = image_box_flags,
+                       .co = 20, .out_offset = 30, .alpha_offset = SVM_STACK_INVALID},
+};
 constexpr float indirect_clamp = 10.0f;
 /* XYZ to linear Rec. 709 rows, as synchronized in KernelFilm. */
 const std::array xyz_to_rgb_rows{make_float3(3.2404542f, -1.5371385f, -0.4985314f),
@@ -342,6 +356,8 @@ const std::array object_rows{fixture_object.x, fixture_object.y, fixture_object.
 constexpr uint material_pass = 3;
 constexpr float object_pass = 5.0f;
 constexpr float object_random = 0.125f;
+constexpr std::array<float, 3> object_dupli_generated_words{0.375f, 0.125f, 0.25f};
+constexpr std::array<float, 2> object_dupli_uv_words{0.375f, 0.625f};
 constexpr unsigned int header_words = 2;
 constexpr unsigned int jump_words = 1 + sizeof(SVMNodeShaderJump) / sizeof(unsigned int);
 std::vector<unsigned int> bytecode(header_words + shader_count * jump_words, 0);
@@ -543,6 +559,8 @@ unsigned int cycles_svm_word(unsigned int index)
   return bytecode.at(index);
 }
 
+void cycles_svm_write_aov(unsigned int, unsigned int, unsigned int, Float4) {}
+
 ContextWords cycles_svm_context(unsigned int lane, unsigned int field)
 {
   if (field < CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA) {
@@ -552,6 +570,14 @@ ContextWords cycles_svm_context(unsigned int lane, unsigned int field)
     const std::array rows{camera_to_world.x, camera_to_world.y, camera_to_world.z};
     const float4 row = rows.at(field - CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD);
     return std::bit_cast<ContextWords>(Float4{row.x, row.y, row.z, row.w});
+  }
+  if (field == CYCLES_WEBGPU_SVM_DUPLI_GENERATED) {
+    const auto [x, y, z] = object_dupli_generated_words;
+    return std::bit_cast<ContextWords>(Float4{x, y, z, 0});
+  }
+  if (field == CYCLES_WEBGPU_SVM_DUPLI_UV) {
+    const auto [x, y] = object_dupli_uv_words;
+    return std::bit_cast<ContextWords>(Float4{x, y, 0, 0});
   }
   if (field >= CYCLES_WEBGPU_SVM_OBJECT_INDEX) {
     const std::array values{object_pass, float(material_pass), object_random};
@@ -1541,6 +1567,18 @@ int main()
     push_node(NODE_CLOSURE_SET_WEIGHT, SVMNodeClosureSetWeight{.rgb = make_float3(1, 1, 1)});
     push_node(NODE_CLOSURE_HOLDOUT, SVMNodeClosureHoldout{.mix_weight_offset = SVM_STACK_INVALID});
   });
+  for (uint i = 0; i < image_box_nodes.size(); ++i) {
+    push_shader(first_image_box_shader + i, [&] {
+      push_node(NODE_VALUE_V, SVMNodeValueV{.out_offset = 20, .value = image_box_co});
+      push_node(NODE_TEX_IMAGE_BOX, image_box_nodes[i]);
+      if (stack_valid(image_box_nodes[i].alpha_offset)) {
+        push_node(NODE_CONVERT, SVMNodeConvert{.convert_type = NODE_CONVERT_FV,
+                                               .from_offset = 30, .to_offset = 30});
+      }
+      push_node(NODE_CLOSURE_WEIGHT, SVMNodeClosureWeight{.weight_offset = 30});
+      push_diffuse(0);
+    });
+  }
   bytecode[0] = bytecode.size() - header_words;
   bytecode[1] = shader_count;
   const std::array triangle_uv{0.0f, 0.0f, 2.0f, 0.0f, 0.0f, 2.0f,
@@ -1722,7 +1760,7 @@ int main()
     std::array<Float4, CYCLES_WEBGPU_MATERIAL_VECTORS> result{};
     if (surface == 1 || surface == 2) {
       cycles_svm_material(
-          shader, primitive, u, v, lane, result[0], result[1], result[2], result[3], result[4],
+          shader, primitive, u, v, lane, 0, result[0], result[1], result[2], result[3], result[4],
           result[5]);
     }
     else if (surface != 0) {
@@ -2056,6 +2094,9 @@ int main()
   std::array<KernelObject, 1> stock_objects{};
   stock_objects[0].tfm = fixture_object;
   stock_objects[0].itfm = fixture_object_inverse;
+  std::copy(object_dupli_generated_words.begin(), object_dupli_generated_words.end(),
+            stock_objects[0].dupli_generated);
+  std::copy(object_dupli_uv_words.begin(), object_dupli_uv_words.end(), stock_objects[0].dupli_uv);
   globals.objects = stock_objects.data();
   globals.data.cam.cameratoworld = camera_to_world;
   globals.data.film.xyz_to_r = make_float4(xyz_to_rgb_rows[0]);
@@ -2066,6 +2107,51 @@ int main()
   stock_sd.prim = 0;
   stock_sd.type = PRIMITIVE_TRIANGLE;
   stock_sd.object_flag = 0;
+  if (!check_view_vector(first_view_coordinate + 6, object_dupli_generated(&globals, 0)) ||
+      !check_view_vector(first_view_coordinate + 7, object_dupli_uv(&globals, 0)))
+  {
+    return 1;
+  }
+  {
+    KernelImageInfo info{};
+    info.data = uintptr_t(byte_pixels.data());
+    info.width = info.height = 2;
+    info.interpolation = INTERPOLATION_LINEAR;
+    info.extension = EXTENSION_REPEAT;
+    info.data_type = IMAGE_DATA_TYPE_BYTE4;
+    std::array<KernelImageTexture, 5> stock_textures{};
+    stock_textures[4].image_info_id = 0;
+    stock_textures[4].tile_descriptor_offset = KERNEL_TILE_LOAD_NONE;
+    SvmReferenceGlobals image_globals = globals;
+    image_globals.image_info = &info;
+    image_globals.image_textures = stock_textures.data();
+    const auto saved_normal = fixture[CYCLES_WEBGPU_SVM_NORMAL];
+    for (const float3 normal : {make_float3(1, 0, 0), make_float3(-1, 0, 0),
+                                make_float3(0, 1, 0), make_float3(0, -1, 0),
+                                make_float3(0, 0, 1), make_float3(0, 0, -1),
+                                safe_normalize(make_float3(1, 1, 0)),
+                                safe_normalize(make_float3(1, 1, 2))})
+    {
+      ShaderData image_sd = stock_sd;
+      image_sd.N = normal;
+      fixture[CYCLES_WEBGPU_SVM_NORMAL] = pack_xyz(normal.x, normal.y, normal.z);
+      for (uint i = 0; i < image_box_nodes.size(); ++i) {
+        float image_stack[SVM_STACK_SIZE];
+        stack_store_float3(image_stack, 20, image_box_co);
+        svm_node_tex_image_box<float3>(&image_globals, &image_sd, image_stack, image_box_nodes[i]);
+        const float3 color = stack_valid(image_box_nodes[i].alpha_offset) ?
+                                 make_float3(stack_load_float(image_stack, 30)) :
+                                 stack_load_float3(image_stack, 30);
+        const float tolerance = 3e-6f * max(1.0f, max(color.x, max(color.y, color.z)));
+        if (!check(1, first_image_box_shader + i, 0, 0, 0,
+                   {color.x, color.y, color.z, 1}, tolerance))
+        {
+          return 1;
+        }
+      }
+    }
+    fixture[CYCLES_WEBGPU_SVM_NORMAL] = saved_normal;
+  }
   /* The fixtures weight a diffuse closure, which closure_sample_weight()
    * clamps to non-negative values and drops below CLOSURE_WEIGHT_CUTOFF. */
   const auto closure_color = [](float3 color) {
@@ -2447,6 +2533,10 @@ int main()
   }
   metadata.insert(metadata.end(), {std::bit_cast<uint>(object_pass),
                                    std::bit_cast<uint>(object_random)});
+  const auto dupli_generated = cycles_svm_context(0, CYCLES_WEBGPU_SVM_DUPLI_GENERATED);
+  const auto uv = cycles_svm_context(0, CYCLES_WEBGPU_SVM_DUPLI_UV);
+  metadata.insert(metadata.end(), {dupli_generated.x, dupli_generated.y, dupli_generated.z,
+                                   uv.x, uv.y});
   metadata[CYCLES_WEBGPU_SURFACE_SHADER_PASS_OFFSET] = uint(metadata.size());
   for (uint shader = 0; shader < shader_count; ++shader) {
     metadata.push_back(shader >= first_object_info_shader ? material_pass : shader);

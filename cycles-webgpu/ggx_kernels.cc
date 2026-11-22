@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "ggx_closures.h"
+
+#include <type_traits>
 #include "../blender-platform/cycles-webgpu/material_layout.h"
 
 #ifdef __aarch64__
@@ -29,8 +31,18 @@ using KernelGlobals = const GgxGlobals *;
 #define kernel_data_fetch(name, index) cycles_ggx_lookup(index)
 #undef ccl_device
 #define ccl_device static inline __attribute__((always_inline))
+#include "kernel/closure/bsdf_diffuse.h"
+#include "kernel/closure/bsdf_transparent.h"
 #include "kernel/closure/bsdf_microfacet.h"
+#include "kernel/closure/bsdf_ashikhmin_shirley.h"
+#include "kernel/closure/bsdf_ashikhmin_velvet.h"
+#include "kernel/closure/bsdf_sheen.h"
+#include "kernel/closure/bsdf_toon.h"
 #include "cosine_hemisphere.h"
+#if !defined(CYCLES_WEBGPU_EXCLUDE_STANDALONE) && !defined(CYCLES_WEBGPU_EXCLUDE_HAIR)
+#  include "kernel/closure/bsdf_hair.h"
+#  include "kernel/closure/bsdf_principled_hair_huang.h"
+#endif
 
 namespace ccl {
 namespace {
@@ -114,6 +126,10 @@ ccl_device GgxFloat4 vector(const float3 v)
 {
   return {v.x, v.y, v.z, 0.0f};
 }
+
+#if !defined(CYCLES_WEBGPU_EXCLUDE_STANDALONE) && !defined(CYCLES_WEBGPU_EXCLUDE_HAIR)
+#  include "hair_closures.h"
+#endif
 
 ccl_device bool setup_glass(MicrofacetBsdf &bsdf,
                             FresnelGeneralizedSchlick &fresnel,
@@ -412,7 +428,8 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
                                                 GgxFloat4 specular_normal,
                                                 GgxFloat4 view,
                                                 GgxFloat4 light,
-                                                float blur_alpha)
+                                                float blur_alpha,
+                                                float transparent_sample_weight)
 {
   using namespace ccl;
   const float3 N = rgb(normal);
@@ -455,7 +472,7 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
   const float total = closures.metal_sample_weight +
                       (has_glass ? glass_bsdf.sample_weight : 0.0f) +
                       closures.specular_sample_weight + closures.subsurface_sample_weight +
-                      closures.diffuse_sample_weight;
+                      closures.diffuse_sample_weight + transparent_sample_weight;
   return {eval.x, eval.y, eval.z, total > 0.0f ? weighted_pdf / total : 0.0f};
 }
 
@@ -468,7 +485,10 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
                                                        GgxFloat4 specular_normal,
                                                        GgxFloat4 view,
                                                        GgxFloat4 random_seed,
+                                                       GgxFloat4 transparent,
                                                        float blur_alpha,
+                                                       bool ray_differentials,
+                                                       bool only_transparent,
                                                        GgxFloat4 &weight,
                                                        GgxFloat4 &out)
 {
@@ -479,6 +499,14 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
   const float3 specular_N = rgb(specular_normal);
   const float3 wi = rgb(view);
   const float3 Ng = rgb(geometric_normal);
+  const float transparent_weight = fabsf(transparent.w);
+  if (only_transparent) {
+    if (transparent_weight > 0.0f) {
+      weight = {transparent.x, transparent.y, transparent.z, 1e6f};
+      return LABEL_TRANSMIT | LABEL_TRANSPARENT;
+    }
+    return LABEL_NONE;
+  }
   const float cos_NI = dot(specular_N, wi);
   FresnelGeneralizedSchlick glass_fresnel{};
   MicrofacetBsdf glass_bsdf{.type = CLOSURE_BSDF_MICROFACET_GGX_GLASS_ID,
@@ -502,38 +530,70 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
   const float specular = closures.specular_sample_weight;
   const float diffuse = closures.diffuse_sample_weight;
   const float subsurface = closures.subsurface_sample_weight;
-  const float total = metal + glass_weight + specular + subsurface + diffuse;
+  const bool transparent_first = transparent.w < 0.0f;
+  const float prefix = transparent_first ? transparent_weight : 0.0f;
+  const float metal_end = prefix + metal;
+  const float glass_end = metal_end + glass_weight;
+  const float specular_end = glass_end + specular;
+  const float subsurface_end = specular_end + subsurface;
+  const float opaque_end = subsurface_end + diffuse;
+  const float total = opaque_end + (transparent_first ? 0.0f : transparent_weight);
   if (!(total > 0.0f)) {
     return LABEL_NONE;
+  }
+
+  const float r = random_seed.z * total;
+  if (transparent_weight > 0.0f &&
+      (transparent_first ? (r < prefix || r >= total) : (r >= opaque_end && r < total)))
+  {
+    Spectrum eval;
+    float3 direction;
+    float pdf;
+    const int label = bsdf_transparent_sample(nullptr, Ng, wi, &eval, &direction, &pdf);
+    eval *= rgb(transparent);
+    float weighted_pdf = pdf * transparent_weight;
+    const bool specular_eval = valid_specular_eval(N, specular_N, direction);
+    if (specular_eval && closures.has_metal) {
+      accumulate_lobe<Metal>(closures, specular_N, wi, direction, eval, weighted_pdf);
+    }
+    if (specular_eval && closures.has_specular) {
+      accumulate_lobe<Specular>(closures, specular_N, wi, direction, eval, weighted_pdf);
+    }
+    if (closures.has_diffuse) {
+      accumulate_lobe<Diffuse>(closures, N, wi, direction, eval, weighted_pdf);
+    }
+    const float mixed_pdf = weighted_pdf / total;
+    const Spectrum multiplier = eval / mixed_pdf;
+    weight = {multiplier.x, multiplier.y, multiplier.z, mixed_pdf};
+    return label;
   }
 
   /* Pick and remap from surface_shader_bsdf_bssrdf_pick(). */
   Lobe lobe = closures.has_metal ? Metal : has_glass ? Glass :
               closures.has_specular ? Specular : Diffuse;
   float3 random = rgb(random_seed);
-  const bool multiple = subsurface > 0.0f || (has_glass &&
+  const bool multiple = transparent_weight > 0.0f || subsurface > 0.0f || (has_glass &&
                          (closures.has_metal || closures.has_specular || closures.has_diffuse)) ||
                         (closures.has_metal && closures.has_specular) ||
                         (closures.has_diffuse && (closures.has_metal || closures.has_specular));
   if (multiple) {
-    const float r = random.z * total;
-    if (r < metal) {
+    if (r < metal_end) {
       lobe = Metal;
-      random.z = r / metal;
+      random.z = (r - prefix) / metal;
     }
-    else if (glass_enabled && r < metal + glass_weight) {
+    else if (glass_enabled && r < glass_end) {
       lobe = Glass;
-      random.z = (r - metal) / glass_weight;
+      random.z = (r - metal_end) / glass_weight;
     }
-    else if (r < metal + glass_weight + specular) {
+    else if (r < specular_end) {
       lobe = Specular;
-      random.z = (r - (metal + glass_weight)) / specular;
+      random.z = (r - glass_end) / specular;
     }
-    else if (subsurface > 0.0f && (r < metal + glass_weight + specular + subsurface ||
+    else if (subsurface > 0.0f && (r < subsurface_end ||
                                       diffuse == 0.0f)) {
       lobe = Subsurface;
     }
-    else if (r < total) {
+    else if (r < opaque_end) {
       lobe = Diffuse;
     }
   }
@@ -612,41 +672,384 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
     return LABEL_NONE;
   }
 
+  const float alpha_squared = sqr(closures.alpha);
+  const float glass_roughness_squared = glass_bsdf.alpha_x * glass_bsdf.alpha_y;
+  float roughness_squared = lobe == Diffuse ? 1.0f :
+                                lobe == Glass ? glass_roughness_squared : alpha_squared;
   /* The balance heuristic also evaluates the other lobes at the sampled
    * direction. The selected lobe is accumulated first, as in Cycles. */
   if (multiple && lobe != Subsurface) {
     float weighted_pdf = pdf * selected_weight;
-    float sum_weight = selected_weight + subsurface;
+    float roughness_pdf = weighted_pdf * roughness_squared;
+    float sum_weight = selected_weight + subsurface + prefix;
     const bool specular_eval = valid_specular_eval(N, specular_N, wo);
     if (closures.has_metal && lobe != Metal) {
       if (specular_eval) {
-        accumulate_lobe<Metal>(closures, specular_N, wi, wo, eval, weighted_pdf);
+        float other_pdf = 0.0f;
+        accumulate_lobe<Metal>(closures, specular_N, wi, wo, eval, other_pdf);
+        weighted_pdf += other_pdf;
+        if (ray_differentials) {
+          roughness_pdf += other_pdf * alpha_squared;
+        }
       }
       sum_weight += metal;
     }
     if (has_glass && lobe != Glass) {
       if (specular_eval) {
-        accumulate_glass(glass_bsdf, wi, wo, eval, weighted_pdf);
+        float other_pdf = 0.0f;
+        accumulate_glass(glass_bsdf, wi, wo, eval, other_pdf);
+        weighted_pdf += other_pdf;
+        if (ray_differentials) {
+          roughness_pdf += other_pdf * glass_roughness_squared;
+        }
       }
       sum_weight += glass_weight;
     }
     if (closures.has_specular && lobe != Specular) {
       if (specular_eval) {
-        accumulate_lobe<Specular>(closures, specular_N, wi, wo, eval, weighted_pdf);
+        float other_pdf = 0.0f;
+        accumulate_lobe<Specular>(closures, specular_N, wi, wo, eval, other_pdf);
+        weighted_pdf += other_pdf;
+        if (ray_differentials) {
+          roughness_pdf += other_pdf * alpha_squared;
+        }
       }
       sum_weight += specular;
     }
     if (closures.has_diffuse && lobe != Diffuse) {
-      accumulate_lobe<Diffuse>(closures, N, wi, wo, eval, weighted_pdf);
+      float other_pdf = 0.0f;
+      accumulate_lobe<Diffuse>(closures, N, wi, wo, eval, other_pdf);
+      weighted_pdf += other_pdf;
+      if (ray_differentials) {
+        roughness_pdf += other_pdf;
+      }
       sum_weight += diffuse;
     }
-    pdf = weighted_pdf / sum_weight;
+    if (ray_differentials) {
+      /* Match _surface_shader_bsdf_eval_mis() used by stock shade_surface. */
+      roughness_squared = weighted_pdf > 0.0f ? roughness_pdf / weighted_pdf : 0.0f;
+    }
+    pdf = weighted_pdf / (sum_weight + (transparent_first ? 0.0f : transparent_weight));
   }
   if (!(pdf > 0.0f) || is_zero(eval)) {
     return LABEL_NONE;
   }
 
   const Spectrum sample_weight = eval / pdf;
+  weight = {sample_weight.x, sample_weight.y, sample_weight.z, pdf};
+  out = vector(wo);
+  out.w = ray_differentials ? roughness_squared : 0.0f;
+  return label;
+}
+
+namespace {
+/* Keep the stock Fresnel storage live for the BSDF callback. Specializing each
+ * branch also keeps physical and F82 conductor parameters separately typed. */
+template<typename Evaluate>
+[[gnu::always_inline]] auto with_standalone_glossy(
+    GgxFloat4 material,
+    GgxFloat4 geometry,
+    GgxFloat4 primary,
+    GgxFloat4 secondary,
+    const ccl::float3 N,
+    const ccl::float3 wi,
+    const float blur_alpha,
+    const Evaluate evaluate)
+{
+  using namespace ccl;
+  const uint model = uint(secondary.w);
+  const ClosureType distribution = ClosureType(model & 0xffu);
+  const ClosureType fresnel_type = ClosureType(model >> 8u);
+  const bool multiscatter = distribution == CLOSURE_BSDF_MICROFACET_MULTI_GGX_ID;
+  MicrofacetBsdf bsdf{};
+  bsdf.N = N;
+  bsdf.T = rgb(geometry);
+  bsdf.alpha_x = geometry.w;
+  bsdf.alpha_y = primary.w;
+  bsdf.ior = 1.0f;
+  bsdf.weight = rgb(material);
+  bsdf.sample_weight = closure_sample_weight(0, bsdf.weight);
+  if (distribution == CLOSURE_BSDF_ASHIKHMIN_SHIRLEY_ID) {
+    bsdf_ashikhmin_shirley_setup(&bsdf);
+  }
+  else if (distribution == CLOSURE_BSDF_MICROFACET_BECKMANN_ID) {
+    bsdf_microfacet_beckmann_setup(&bsdf);
+  }
+  else {
+    bsdf_microfacet_ggx_setup(&bsdf);
+  }
+  if (fresnel_type == CLOSURE_BSDF_PHYSICAL_CONDUCTOR) {
+    FresnelConductor fresnel = {
+        .thin_film = {.thickness = 0.0f, .ior = 1.0f},
+        .ior = {max(rgb(primary), zero_spectrum()), max(rgb(secondary), zero_spectrum())}};
+    bsdf_microfacet_setup_fresnel_conductor(&energy_globals, &bsdf, wi, &fresnel, multiscatter);
+    bsdf_microfacet_blur(reinterpret_cast<ShaderClosure *>(&bsdf), blur_alpha);
+    return evaluate(bsdf);
+  }
+  if (fresnel_type == CLOSURE_BSDF_F82_CONDUCTOR) {
+    FresnelF82Tint fresnel = {
+        .thin_film = {.thickness = 0.0f, .ior = 1.0f}, .f0 = saturate(rgb(primary))};
+    bsdf_microfacet_setup_fresnel_f82_tint(
+        &energy_globals, &bsdf, wi, &fresnel, saturate(rgb(secondary)), multiscatter);
+    bsdf_microfacet_blur(reinterpret_cast<ShaderClosure *>(&bsdf), blur_alpha);
+    return evaluate(bsdf);
+  }
+  if (secondary.x != 0.0f) {
+    bsdf.T = rotate_around_axis(bsdf.T, N, secondary.x * M_2PI_F);
+  }
+  if (multiscatter) {
+    bsdf_microfacet_setup_fresnel_constant(&energy_globals, &bsdf, wi, rgb(primary));
+  }
+  auto *closure = reinterpret_cast<ShaderClosure *>(&bsdf);
+  if (distribution == CLOSURE_BSDF_ASHIKHMIN_SHIRLEY_ID) {
+    bsdf_ashikhmin_shirley_blur(closure, blur_alpha);
+  }
+  else {
+    bsdf_microfacet_blur(closure, blur_alpha);
+  }
+  return evaluate(bsdf);
+}
+
+}  // namespace
+
+[[gnu::always_inline]] GgxFloat4 cycles_standalone_eval(GgxFloat4 material,
+                                                       GgxFloat4 parameters,
+                                                       GgxFloat4 secondary,
+                                                       GgxFloat4 extra,
+                                                       GgxFloat4 hair,
+                                                       GgxFloat4 normal,
+                                                       GgxFloat4 geometric_normal,
+                                                       GgxFloat4 incoming,
+                                                       GgxFloat4 outgoing,
+                                                       float blur_alpha,
+                                                       unsigned int &lcg_state)
+{
+  using namespace ccl;
+  const float3 N = rgb(normal);
+  const float3 wi = rgb(incoming);
+  const float3 wo = rgb(outgoing);
+#if !defined(CYCLES_WEBGPU_EXCLUDE_STANDALONE) && !defined(CYCLES_WEBGPU_EXCLUDE_HAIR)
+  if (CYCLES_WEBGPU_MATERIAL_IS_HAIR(material.w)) {
+    return with_hair_closure(
+        material, parameters, secondary, extra, hair, N, rgb(geometric_normal), wi, blur_alpha,
+        [&](ShaderData &sd, const auto &bsdf, const int flags) __attribute__((always_inline)) {
+          if (!flags || dot(N, wo) * dot(N, bsdf.N) * dot(bsdf.N, wo) < 0.0f) {
+            return GgxFloat4{};
+          }
+          using Bsdf = std::remove_cvref_t<decltype(bsdf)>;
+          const auto *sc = reinterpret_cast<const ShaderClosure *>(&bsdf);
+          float pdf = 0.0f;
+          Spectrum eval;
+          if constexpr (std::is_same_v<Bsdf, ChiangHairBSDF>) {
+            GgxGlobals globals{};
+            globals.data.film.rgb_to_y = make_float4(hair.x, hair.y, hair.z, 0.0f);
+            eval = bsdf_hair_chiang_eval(&globals, &sd, sc, wo, &pdf);
+          }
+          else if constexpr (std::is_same_v<Bsdf, HuangHairBSDF>) {
+            eval = bsdf_hair_huang_eval(&energy_globals, &sd, sc, wo, &pdf);
+            lcg_state = sd.lcg_state;
+          }
+          else {
+            eval = bsdf.type == CLOSURE_BSDF_HAIR_REFLECTION_ID ?
+                       bsdf_hair_reflection_eval(sc, wi, wo, &pdf) :
+                       bsdf_hair_transmission_eval(sc, wi, wo, &pdf);
+          }
+          eval *= bsdf.weight;
+          return GgxFloat4{eval.x, eval.y, eval.z, pdf};
+        });
+  }
+#endif
+  if (material.w == CYCLES_WEBGPU_MATERIAL_GLOSSY) {
+    return with_standalone_glossy(
+        material, parameters, secondary, extra, N, wi, blur_alpha, [&](const MicrofacetBsdf &bsdf) {
+          float pdf = 0.0f;
+          Spectrum eval;
+          const auto *closure = reinterpret_cast<const ShaderClosure *>(&bsdf);
+          if (bsdf.type == CLOSURE_BSDF_ASHIKHMIN_SHIRLEY_ID) {
+            eval = bsdf_ashikhmin_shirley_eval(closure, wi, wo, &pdf);
+          }
+          else if (bsdf.type == CLOSURE_BSDF_MICROFACET_BECKMANN_ID) {
+            eval = bsdf_microfacet_beckmann_eval(&energy_globals, closure, wi, wo, &pdf);
+          }
+          else {
+            eval = bsdf_microfacet_ggx_eval(&energy_globals, closure, wi, wo, &pdf);
+          }
+          eval *= bsdf.weight;
+          return GgxFloat4{eval.x, eval.y, eval.z, pdf};
+        });
+  }
+  float pdf;
+  Spectrum eval;
+  if (material.w == CYCLES_WEBGPU_MATERIAL_TRANSLUCENT) {
+    const DiffuseBsdf bsdf{.N = N};
+    eval = bsdf_translucent_eval(reinterpret_cast<const ShaderClosure *>(&bsdf), wi, wo, &pdf);
+  }
+  else if (material.w == CYCLES_WEBGPU_MATERIAL_VELVET) {
+    VelvetBsdf bsdf{.N = N, .sigma = parameters.x};
+    bsdf_ashikhmin_velvet_setup(&bsdf);
+    eval = bsdf_ashikhmin_velvet_eval(
+        reinterpret_cast<const ShaderClosure *>(&bsdf), wi, wo, &pdf);
+  }
+  else if (material.w == CYCLES_WEBGPU_MATERIAL_SHEEN) {
+    SheenBsdf bsdf{.N = N, .transformA = parameters.x, .transformB = parameters.y};
+    make_orthonormals_safe_tangent(N, wi, &bsdf.T, &bsdf.B);
+    eval = bsdf_sheen_eval(reinterpret_cast<const ShaderClosure *>(&bsdf), wi, wo, &pdf);
+  }
+  else {
+    ToonBsdf bsdf{.N = N, .size = parameters.x, .smooth = parameters.y};
+    const auto *closure = reinterpret_cast<const ShaderClosure *>(&bsdf);
+    if (material.w == CYCLES_WEBGPU_MATERIAL_DIFFUSE_TOON) {
+      bsdf_diffuse_toon_setup(&bsdf);
+      eval = bsdf_diffuse_toon_eval(closure, wi, wo, &pdf);
+    }
+    else {
+      bsdf_glossy_toon_setup(&bsdf);
+      eval = bsdf_glossy_toon_eval(closure, wi, wo, &pdf);
+    }
+  }
+  eval *= rgb(material);
+  return {eval.x, eval.y, eval.z, pdf};
+}
+
+[[gnu::always_inline]] unsigned int cycles_standalone_sample(GgxFloat4 material,
+                                                             GgxFloat4 parameters,
+                                                             GgxFloat4 secondary,
+                                                             GgxFloat4 extra,
+                                                             GgxFloat4 hair,
+                                                             GgxFloat4 normal,
+                                                             GgxFloat4 geometric_normal,
+                                                             GgxFloat4 incoming,
+                                                             GgxFloat4 random,
+                                                             float blur_alpha,
+                                                             GgxFloat4 &weight,
+                                                             GgxFloat4 &out)
+{
+  using namespace ccl;
+  const float3 N = rgb(normal);
+  const float3 Ng = rgb(geometric_normal);
+  const float3 wi = rgb(incoming);
+  const float2 rand = make_float2(random.x, random.y);
+#if !defined(CYCLES_WEBGPU_EXCLUDE_STANDALONE) && !defined(CYCLES_WEBGPU_EXCLUDE_HAIR)
+  if (CYCLES_WEBGPU_MATERIAL_IS_HAIR(material.w)) {
+    return with_hair_closure(
+        material, parameters, secondary, extra, hair, N, Ng, wi, blur_alpha,
+        [&](ShaderData &sd, const auto &bsdf, const int flags) __attribute__((always_inline)) {
+          if (!flags) {
+            return int(LABEL_NONE);
+          }
+          using Bsdf = std::remove_cvref_t<decltype(bsdf)>;
+          const auto *sc = reinterpret_cast<const ShaderClosure *>(&bsdf);
+          float3 wo = zero_float3();
+          float2 sampled_roughness;
+          float pdf = 0.0f;
+          Spectrum eval = zero_spectrum();
+          int label;
+          if constexpr (std::is_same_v<Bsdf, ChiangHairBSDF>) {
+            GgxGlobals globals{};
+            globals.data.film.rgb_to_y = make_float4(hair.x, hair.y, hair.z, 0.0f);
+            label = bsdf_hair_chiang_sample(&globals, sc, &sd, rgb(random), &eval, &wo,
+                                          &pdf, &sampled_roughness);
+          }
+          else if constexpr (std::is_same_v<Bsdf, HuangHairBSDF>) {
+            label = bsdf_hair_huang_sample(&energy_globals, sc, &sd, rgb(random), &eval, &wo,
+                                          &pdf, &sampled_roughness);
+          }
+          else {
+            label = bsdf.type == CLOSURE_BSDF_HAIR_REFLECTION_ID ?
+                        bsdf_hair_reflection_sample(sc, Ng, wi, rand, &eval, &wo, &pdf,
+                                                    &sampled_roughness) :
+                        bsdf_hair_transmission_sample(sc, Ng, wi, rand, &eval, &wo, &pdf,
+                                                      &sampled_roughness);
+          }
+          eval *= bsdf.weight;
+          if (!(pdf > 0.0f) || is_zero(eval)) {
+            return int(LABEL_NONE);
+          }
+          const Spectrum sample_weight = eval / pdf;
+          weight = {sample_weight.x, sample_weight.y, sample_weight.z, pdf};
+          out = {wo.x, wo.y, wo.z, 1.0f};
+          return label;
+        });
+  }
+#endif
+  if (material.w == CYCLES_WEBGPU_MATERIAL_GLOSSY) {
+    struct Sample {
+      GgxFloat4 weight;
+      GgxFloat4 outgoing;
+      int label;
+    };
+    const Sample result = with_standalone_glossy(
+        material, parameters, secondary, extra, N, wi, blur_alpha,
+        [&](const MicrofacetBsdf &bsdf) __attribute__((always_inline)) {
+          float3 wo;
+          float2 sampled_roughness;
+          float pdf = 0.0f;
+          float eta;
+          Spectrum eval;
+          int label;
+          const auto *closure = reinterpret_cast<const ShaderClosure *>(&bsdf);
+          if (bsdf.type == CLOSURE_BSDF_ASHIKHMIN_SHIRLEY_ID) {
+            label = bsdf_ashikhmin_shirley_sample(
+                closure, Ng, wi, rand, &eval, &wo, &pdf, &sampled_roughness);
+          }
+          else if (bsdf.type == CLOSURE_BSDF_MICROFACET_BECKMANN_ID) {
+            label = bsdf_microfacet_beckmann_sample(
+                &energy_globals, closure, Ng, wi, rgb(random), &eval, &wo, &pdf, &sampled_roughness, &eta);
+          }
+          else {
+            label = bsdf_microfacet_ggx_sample(
+                &energy_globals, closure, Ng, wi, rgb(random), &eval, &wo, &pdf, &sampled_roughness, &eta);
+          }
+          eval *= bsdf.weight;
+          if (!(pdf > 0.0f) || is_zero(eval)) {
+            return Sample{};
+          }
+          const Spectrum sample_weight = eval / pdf;
+          return Sample{{sample_weight.x, sample_weight.y, sample_weight.z, pdf},
+                        {wo.x, wo.y, wo.z, bsdf.alpha_x * bsdf.alpha_y},
+                        label};
+        });
+    weight = result.weight;
+    out = result.outgoing;
+    return result.label;
+  }
+  float3 wo;
+  float pdf;
+  Spectrum eval;
+  int label;
+  if (material.w == CYCLES_WEBGPU_MATERIAL_TRANSLUCENT) {
+    const DiffuseBsdf bsdf{.N = N};
+    label = bsdf_translucent_sample(
+        reinterpret_cast<const ShaderClosure *>(&bsdf), Ng, wi, rand, &eval, &wo, &pdf);
+  }
+  else if (material.w == CYCLES_WEBGPU_MATERIAL_VELVET) {
+    VelvetBsdf bsdf{.N = N, .sigma = parameters.x};
+    bsdf_ashikhmin_velvet_setup(&bsdf);
+    label = bsdf_ashikhmin_velvet_sample(
+        reinterpret_cast<const ShaderClosure *>(&bsdf), Ng, wi, rand, &eval, &wo, &pdf);
+  }
+  else if (material.w == CYCLES_WEBGPU_MATERIAL_SHEEN) {
+    SheenBsdf bsdf{.N = N, .transformA = parameters.x, .transformB = parameters.y};
+    make_orthonormals_safe_tangent(N, wi, &bsdf.T, &bsdf.B);
+    label = bsdf_sheen_sample(
+        reinterpret_cast<const ShaderClosure *>(&bsdf), Ng, wi, rand, &eval, &wo, &pdf);
+  }
+  else {
+    ToonBsdf bsdf{.N = N, .size = parameters.x, .smooth = parameters.y};
+    const auto *closure = reinterpret_cast<const ShaderClosure *>(&bsdf);
+    if (material.w == CYCLES_WEBGPU_MATERIAL_DIFFUSE_TOON) {
+      bsdf_diffuse_toon_setup(&bsdf);
+      label = bsdf_diffuse_toon_sample(closure, Ng, wi, rand, &eval, &wo, &pdf);
+    }
+    else {
+      bsdf_glossy_toon_setup(&bsdf);
+      label = bsdf_glossy_toon_sample(closure, Ng, wi, rand, &eval, &wo, &pdf);
+    }
+  }
+  if (!(pdf > 0.0f) || is_zero(eval)) {
+    return LABEL_NONE;
+  }
+  const Spectrum sample_weight = rgb(material) * eval / pdf;
   weight = {sample_weight.x, sample_weight.y, sample_weight.z, pdf};
   out = vector(wo);
   return label;
@@ -658,8 +1061,10 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
     GgxFloat4 tint_alpha,
     GgxFloat4 weights,
     GgxFloat4 glass,
+    GgxFloat4 hair,
     GgxFloat4 normal,
     GgxFloat4 specular_normal,
+    GgxFloat4 geometric_normal,
     GgxFloat4 view,
     float blur_alpha,
     unsigned int options,
@@ -673,15 +1078,75 @@ ccl_device void accumulate_lobe(const ReflectiveClosures &closures,
   const float3 N = rgb(normal);
   const bool roughness_weighting = (options & DENOISING_PASS_USE_ALBEDO_ROUGHNESS_WEIGHTING) != 0;
 
-  if (material.w == 1.0f) {
+  if (material.w == CYCLES_WEBGPU_MATERIAL_TRANSPARENT) {
+    features.transparent_albedo = rgb(material);
+  }
+  else if (material.w == CYCLES_WEBGPU_MATERIAL_RAY_PORTAL) {
+    features.add(rgb(material), N, 0.0f, CLOSURE_BSDF_RAY_PORTAL_ID, roughness_weighting);
+  }
+  else if (material.w == 1.0f || material.w == CYCLES_WEBGPU_MATERIAL_MIXED_TRANSPARENT) {
+    if (material.w == CYCLES_WEBGPU_MATERIAL_MIXED_TRANSPARENT) {
+      features.transparent_albedo = rgb(tint_alpha);
+    }
     Spectrum diffuse = rgb(material);
     if (closure_sample_weight(0, diffuse) > 0.0f) {
       features.add(diffuse, N, 1.0f, CLOSURE_BSDF_DIFFUSE_ID, roughness_weighting);
     }
   }
+#ifndef CYCLES_WEBGPU_EXCLUDE_STANDALONE
+  else if (material.w == CYCLES_WEBGPU_MATERIAL_GLOSSY) {
+    const float3 wi = rgb(view);
+    const GgxFloat4 albedo_roughness = with_standalone_glossy(
+        material, tint_alpha, weights, glass, rgb(specular_normal), wi, blur_alpha,
+        [&](const MicrofacetBsdf &bsdf) __attribute__((always_inline)) {
+          const Spectrum estimate = bsdf_microfacet_estimate_albedo(
+              &energy_globals, wi, &bsdf, true, true);
+          const Spectrum albedo = bsdf.weight * estimate;
+          return GgxFloat4{albedo.x, albedo.y, albedo.z, sqrtf(bsdf.alpha_x * bsdf.alpha_y)};
+        });
+    features.add(rgb(albedo_roughness), rgb(specular_normal), albedo_roughness.w,
+                 CLOSURE_BSDF_MICROFACET_GGX_ID, roughness_weighting);
+  }
+  else if (CYCLES_WEBGPU_MATERIAL_IS_HAIR(material.w)) {
+    const float3 closure_normal = CYCLES_WEBGPU_MATERIAL_USES_SPECULAR_NORMAL(material.w) ?
+                                     rgb(specular_normal) : N;
+    with_hair_closure(material, tint_alpha, weights, glass, hair, closure_normal,
+        rgb(geometric_normal), rgb(view), blur_alpha,
+        [&](ShaderData &sd, const auto &bsdf, const int flags) __attribute__((always_inline)) {
+          if (!flags) {
+            features.transparent_albedo = bsdf.weight;
+            return 0;
+          }
+          using Bsdf = std::remove_cvref_t<decltype(bsdf)>;
+          const auto *sc = reinterpret_cast<const ShaderClosure *>(&bsdf);
+          Spectrum albedo = bsdf.weight;
+          if constexpr (std::is_same_v<Bsdf, ChiangHairBSDF>) {
+            albedo *= bsdf_hair_chiang_albedo(&sd, sc);
+          }
+          else if constexpr (std::is_same_v<Bsdf, HuangHairBSDF>) {
+            albedo *= bsdf_hair_huang_albedo(&sd, sc);
+          }
+          features.add(albedo, bsdf.N, 1.0f, bsdf.type, roughness_weighting);
+          return 0;
+        });
+  }
+  else if (CYCLES_WEBGPU_MATERIAL_IS_STANDALONE(material.w)) {
+    const bool translucent = material.w == CYCLES_WEBGPU_MATERIAL_TRANSLUCENT;
+    const ClosureType type = translucent ? CLOSURE_BSDF_TRANSLUCENT_ID :
+                             material.w == CYCLES_WEBGPU_MATERIAL_GLOSSY_TOON ?
+                                 CLOSURE_BSDF_GLOSSY_TOON_ID : CLOSURE_BSDF_DIFFUSE_ID;
+    Spectrum albedo = rgb(material);
+    if (closure_sample_weight(0, albedo) > 0.0f) {
+      features.add(albedo, translucent ? rgb(specular_normal) : N, 1.0f, type, roughness_weighting);
+    }
+  }
+#endif
   else if (material.w == CYCLES_WEBGPU_MATERIAL_GGX ||
            material.w == CYCLES_WEBGPU_MATERIAL_MULTISCATTER_GGX)
   {
+    if (glass.w == 0.0f && hair.w != 0.0f) {
+      features.transparent_albedo = rgb(hair);
+    }
     const float3 specular_N = rgb(specular_normal);
     const float3 wi = rgb(view);
     FresnelGeneralizedSchlick glass_fresnel{};

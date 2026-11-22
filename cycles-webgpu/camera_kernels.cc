@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "camera_kernels.hh"
+#include "../blender-platform/cycles-webgpu/material_layout.h"
+#include "../blender-platform/cycles-webgpu/path_state_layout.h"
 
 #include <bit>
 
@@ -87,7 +89,8 @@ static unsigned int path_settings_offset()
 
 unsigned int cycles_path_transparent_max_bounce()
 {
-  return cycles_camera_sample_word(path_settings_offset() + 8);
+  return cycles_camera_sample_word(path_settings_offset() + 8) &
+         CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK;
 }
 
 unsigned int cycles_film_transparent()
@@ -120,18 +123,22 @@ float cycles_denoise_blur_alpha(const float min_ray_pdf)
 
 #ifdef CYCLES_WEBGPU_PATH_UPDATE
 #  include "../blender-platform/cycles-webgpu/material_layout.h"
-#  include "../blender-platform/cycles-webgpu/path_state_layout.h"
 #  include "ggx_closures.h"
 
 #  include "kernel/sample/mapping.h"
+#  include "kernel/closure/bsdf_diffuse.h"
+#  include "kernel/closure/bsdf_transparent.h"
 #  include "cosine_hemisphere.h"
 #  include "kernel/integrator/path_state.h"
+#  include "transparent_ray_util.h"
 
 static_assert(CYCLES_WEBGPU_PATH_MIS_SKIP == ccl::PATH_RAY_MIS_SKIP);
 static_assert(CYCLES_WEBGPU_PATH_MIS_HAD_TRANSMISSION == ccl::PATH_RAY_MIS_HAD_TRANSMISSION);
 static_assert(CYCLES_WEBGPU_PATH_TRANSPARENT_BACKGROUND == ccl::PATH_RAY_TRANSPARENT_BACKGROUND);
 static_assert(CYCLES_WEBGPU_PATH_TERMINATE_AFTER_TRANSPARENT ==
               ccl::PATH_RAY_TERMINATE_AFTER_TRANSPARENT);
+static_assert(CYCLES_WEBGPU_PATH_TERMINATE_ON_NEXT_SURFACE ==
+              ccl::PATH_RAY_TERMINATE_ON_NEXT_SURFACE);
 
 UInt4 cycles_path_settings()
 {
@@ -151,6 +158,132 @@ UInt4 cycles_path_lobe_settings()
           cycles_camera_sample_word(offset + 7)};
 }
 
+[[gnu::always_inline]] UInt4 cycles_transparent_advance(UInt4 rng,
+                                                        UInt4 path,
+                                                        Float4 throughput,
+                                                        unsigned int portal)
+{
+  using namespace ccl;
+  CameraGlobals globals;
+  const uint settings = cycles_camera_sample_word(path_settings_offset() + 8);
+  auto &integrator = globals.data.integrator;
+  load_sampling(integrator,
+                cycles_camera_sample_word(0),
+                std::bit_cast<float>(cycles_path_settings().z));
+  integrator.transparent_max_bounce = settings & CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK;
+  integrator.transparent_min_bounce = settings >> 16;
+
+  IntegratorStateCPU state{};
+  state.path.rng_pixel = rng.x;
+  state.path.sample = int(rng.y);
+  state.path.rng_offset = rng.z * PRNG_BOUNCE_NUM;
+  state.path.flag = rng.w;
+  state.path.visibility = path.x;
+  state.path.transparent_bounce = path.y & CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK;
+  state.path.portal_bounce = path.y >> CYCLES_WEBGPU_PORTAL_BOUNCE_SHIFT;
+  state.path.throughput = PackedSpectrum(make_float3(throughput.x, throughput.y, throughput.z));
+
+  const int label = LABEL_TRANSMIT | (portal ? LABEL_RAY_PORTAL : LABEL_TRANSPARENT);
+  path_state_next(&globals, &state, label, portal ? SR_RAY_PORTAL : SR_TRANSPARENT);
+  const float p = path_state_continuation_probability(&globals, &state, state.path.flag);
+  float next_rr = 0.0f;
+  if (!(state.path.flag & PATH_RAY_TERMINATE_ON_NEXT_SURFACE) &&
+      (p == 1.0f ||
+       (p > 0.0f &&
+        path_rng_1D(&globals, rng.x, state.path.sample, state.path.rng_offset + PRNG_TERMINATE) < p)))
+  {
+    next_rr = 1.0f / p;
+  }
+  return {std::bit_cast<uint>(intersection_t_offset(std::bit_cast<float>(path.z))),
+          state.path.flag,
+          uint(state.path.transparent_bounce) |
+              (uint(state.path.portal_bounce) << CYCLES_WEBGPU_PORTAL_BOUNCE_SHIFT),
+          std::bit_cast<uint>(next_rr)};
+}
+
+[[gnu::always_inline]] Float4 cycles_sample_mixed_transparency(UInt4 rng,
+                                                             Float4 diffuse,
+                                                             Float4 transparent,
+                                                             Float4 weights,
+                                                             Float4 normal,
+                                                             Float4 ray)
+{
+  using namespace ccl;
+  if (!(transparent.w > 0.0f)) {
+    return {};
+  }
+  if (!(weights.x > 0.0f) || (rng.w & PATH_RAY_TERMINATE_AFTER_TRANSPARENT)) {
+    return {transparent.x, transparent.y, transparent.z, 1.0f};
+  }
+
+  CameraGlobals globals;
+  load_sampling(globals.data.integrator,
+                cycles_camera_sample_word(0),
+                std::bit_cast<float>(cycles_path_settings().z));
+  float3 random = path_rng_3D(
+      &globals, rng.x, int(rng.y), rng.z * PRNG_BOUNCE_NUM + PRNG_SURFACE_BSDF);
+  const int first = weights.y != 0.0f ? 0 : 1;
+  ShaderData sd{};
+  sd.num_closure = 2;
+  sd.closure[first].type = CLOSURE_BSDF_TRANSPARENT_ID;
+  sd.closure[first].sample_weight = transparent.w;
+  sd.closure[1 - first].type = CLOSURE_BSDF_DIFFUSE_ID;
+  sd.closure[1 - first].sample_weight = weights.x;
+  if (surface_shader_bsdf_bssrdf_pick(&sd, &random)->type != CLOSURE_BSDF_TRANSPARENT_ID) {
+    return {};
+  }
+
+  const float3 wi = -make_float3(ray.x, ray.y, ray.z);
+  Spectrum value;
+  float3 wo;
+  float pdf;
+  bsdf_transparent_sample(nullptr, zero_float3(), wi, &value, &wo, &pdf);
+  DiffuseBsdf lambert{};
+  lambert.N = make_float3(normal.x, normal.y, normal.z);
+  float diffuse_pdf;
+  const Spectrum diffuse_eval = bsdf_diffuse_eval(
+      reinterpret_cast<const ShaderClosure *>(&lambert), wi, wo, &diffuse_pdf);
+  const float mixed_pdf = (pdf * transparent.w + diffuse_pdf * weights.x) /
+                          (transparent.w + weights.x);
+  const Spectrum weight = (value * make_float3(transparent.x, transparent.y, transparent.z) +
+                           diffuse_eval * make_float3(diffuse.x, diffuse.y, diffuse.z)) /
+                          mixed_pdf;
+  return {weight.x, weight.y, weight.z, 1.0f};
+}
+
+using UInt2 = unsigned int __attribute__((ext_vector_type(2)));
+
+[[gnu::always_inline]] UInt2 cycles_absorption_bounce(UInt4 rng, UInt4 path, Float4 throughput)
+{
+  using namespace ccl;
+  CameraGlobals globals;
+  const UInt4 settings = cycles_path_settings();
+  load_sampling(globals.data.integrator, cycles_camera_sample_word(0),
+                std::bit_cast<float>(settings.z));
+  globals.data.integrator.min_bounce = int(settings.y);
+
+  IntegratorStateCPU state{};
+  state.path.bounce = path.x;
+  state.path.throughput = PackedSpectrum(make_float3(throughput.x, throughput.y, throughput.z));
+  const float probability = path_state_continuation_probability(&globals, &state, rng.w);
+  const bool accepted = probability == 1.0f ||
+                        (probability > 0.0f && path_rng_1D(&globals, rng.x, int(rng.y),
+                          rng.z * PRNG_BOUNCE_NUM + PRNG_TERMINATE) < probability);
+  return {std::bit_cast<uint>(intersection_t_offset(std::bit_cast<float>(path.y))),
+          std::bit_cast<uint>(accepted ? 1.0f / probability : 0.0f)};
+}
+
+[[gnu::always_inline]] Float4 cycles_advance_differential(Float4 ray,
+                                                        float filter,
+                                                        unsigned int portal)
+{
+  const float dP = ccl::differential_transfer_compact(ray.x, ccl::zero_float3(), ray.y, ray.z);
+  /* Match bsdf_widen_dD(). A portal carries the incoming angular differential. */
+  const float scale = filter == FLT_MAX ? 0.0f : ccl::min(1.0f, 1.0f / filter);
+  const float dD = portal ? ray.y : ccl::max(ray.y, scale * sqrtf(ray.w));
+  return {dP, dD, 0.0f, 0.0f};
+}
+
 [[gnu::always_inline]]
 unsigned int cycles_surface_bounce(unsigned int rng_pixel,
                                    unsigned int sample_index,
@@ -164,18 +297,21 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
                                    UInt4 path_counts,
                                    unsigned int bounce,
                                    unsigned int subsurface_steps,
+                                   unsigned int ray_differentials,
                                    float min_ray_pdf,
                                    Float4 material,
                                    Float4 specular,
                                    Float4 parameters,
                                    Float4 glass,
+                                   Float4 hair,
                                    Float4 throughput,
                                    Float4 &next_throughput,
                                    float &next_pdf,
                                    UInt4 &origin,
                                    UInt4 &direction,
                                    UInt4 &next_counts,
-                                   float &surface_rr)
+                                   float &surface_rr,
+                                   float &roughness_squared)
 {
   ccl::CameraGlobals globals;
   auto &integrator = globals.data.integrator;
@@ -191,6 +327,7 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
   const auto random = ccl::path_rng_3D(
       &globals, rng_pixel, sample, rng_offset + ccl::PRNG_SURFACE_BSDF);
   surface_rr = 0.0f;
+  roughness_squared = 1.0f;
   next_throughput = throughput;
   next_pdf = 0.0f;
   origin = {};
@@ -209,7 +346,38 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
   ccl::float3 D;
   float pdf;
   int label;
-  if (material.w == CYCLES_WEBGPU_MATERIAL_GGX ||
+  const bool standalone = CYCLES_WEBGPU_MATERIAL_IS_STANDALONE(material.w);
+  const bool translucent = standalone && material.w == CYCLES_WEBGPU_MATERIAL_TRANSLUCENT;
+  if (standalone) {
+    const auto closure_normal = CYCLES_WEBGPU_MATERIAL_USES_SPECULAR_NORMAL(material.w) ? Ns : N;
+    const Float4 wi{-std::bit_cast<float>(ray.x),
+                    -std::bit_cast<float>(ray.y),
+                    -std::bit_cast<float>(ray.z),
+                    0};
+    Float4 weight, wo;
+    label = cycles_standalone_sample(material,
+                                     specular,
+                                     parameters,
+                                     glass,
+                                     hair,
+                                     Float4{closure_normal.x, closure_normal.y, closure_normal.z, 0},
+                                     Float4{Ng.x, Ng.y, Ng.z, 0},
+                                     wi,
+                                     Float4{random.x, random.y, random.z, 0},
+                                     cycles_glossy_blur(std::bit_cast<float>(lobe_settings.w), min_ray_pdf),
+                                     weight,
+                                     wo);
+    if (label == ccl::LABEL_NONE) {
+      return 0;
+    }
+    D = ccl::make_float3(wo.x, wo.y, wo.z);
+    if (material.w == CYCLES_WEBGPU_MATERIAL_GLOSSY) {
+      roughness_squared = wo.w;
+    }
+    pdf = weight.w;
+    next_throughput *= weight;
+  }
+  else if (material.w == CYCLES_WEBGPU_MATERIAL_GGX ||
       material.w == CYCLES_WEBGPU_MATERIAL_MULTISCATTER_GGX)
   {
     const Float4 wi{-std::bit_cast<float>(ray.x),
@@ -226,15 +394,22 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
                               Float4{Ns.x, Ns.y, Ns.z, 0},
                               wi,
                               Float4{random.x, random.y, random.z, 0},
+                              glass.w == 0.0f ? hair : Float4{},
                               cycles_glossy_blur(std::bit_cast<float>(lobe_settings.w), min_ray_pdf),
+                              ray_differentials != 0,
+                              (path_counts.w & ccl::PATH_RAY_TERMINATE_AFTER_TRANSPARENT) != 0,
                               weight,
                               wo);
     if (label == 0) {
       return 0;
     }
     D = ccl::make_float3(wo.x, wo.y, wo.z);
+    roughness_squared = wo.w;
     pdf = weight.w;
     next_throughput *= weight;
+    if (label & ccl::LABEL_TRANSPARENT) {
+      return CYCLES_WEBGPU_MIXED_TRANSPARENT_PENDING;
+    }
     if (label == ccl::LABEL_SUBSURFACE_SCATTER) {
       return CYCLES_WEBGPU_PATH_SUBSURFACE_PENDING;
     }
@@ -243,6 +418,12 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
     ccl::webgpu_sample_cos_hemisphere(N, ccl::make_float2(random.x, random.y), &D, &pdf);
     if (!(pdf > 0.0f && ccl::dot(Ng, D) > 0.0f)) {
       return 0;
+    }
+    if (material.w == CYCLES_WEBGPU_MATERIAL_MIXED_TRANSPARENT) {
+      /* Transparent has zero directional density in the diffuse direction. */
+      const float diffuse_probability = parameters.x / (parameters.x + specular.w);
+      pdf *= diffuse_probability;
+      next_throughput /= diffuse_probability;
     }
     label = ccl::LABEL_REFLECT | ccl::LABEL_DIFFUSE;
   }
@@ -261,7 +442,11 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
   state.path.throughput = ccl::PackedSpectrum(
       ccl::make_float3(next_throughput.x, next_throughput.y, next_throughput.z));
   ccl::path_state_next(
-      &globals, &state, label, glass.x > 0.0f ? ccl::SR_BSDF_HAS_TRANSMISSION : 0);
+      &globals,
+      &state,
+      label,
+      (translucent || CYCLES_WEBGPU_MATERIAL_HAIR_TRANSMITS(material.w) ||
+       (!standalone && glass.x > 0.0f)) ? ccl::SR_BSDF_HAS_TRANSMISSION : 0);
   const unsigned int visibility = ccl::path_state_ray_visibility(&state);
   next_counts = {state.path.diffuse_bounce,
                  state.path.glossy_bounce,
@@ -306,7 +491,8 @@ void cycles_camera_ray(UInt4 pixel,
                        Float4 clip,
                        Float4 &origin,
                        Float4 &direction,
-                       unsigned int &rng_pixel)
+                       unsigned int &rng_pixel,
+                       float &dD)
 {
   ccl::CameraGlobals globals;
   ccl::KernelCamera &camera = globals.data.cam;
@@ -317,7 +503,19 @@ void cycles_camera_ray(UInt4 pixel,
   camera.cameratoworld = {camera_row(world_x), camera_row(world_y), camera_row(world_z)};
   camera.nearclip = clip.x;
   camera.cliplength = clip.y;
-  camera.differential_scale = 1.0f;
+  camera.differential_scale = clip.w;
+  if (clip.w != 0.0f) {
+    /* Same perspective raster steps as Camera::update(), in the synchronized
+     * camera-to-world frame used by the stock camera kernel. */
+    const auto &projection = camera.rastertocamera;
+    const auto center = ccl::transform_perspective(&projection, ccl::zero_float3());
+    camera.dx = ccl::make_float4(ccl::transform_direction(
+        &camera.cameratoworld,
+        ccl::transform_perspective(&projection, ccl::make_float3(1, 0, 0)) - center));
+    camera.dy = ccl::make_float4(ccl::transform_direction(
+        &camera.cameratoworld,
+        ccl::transform_perspective(&projection, ccl::make_float3(0, 1, 0)) - center));
+  }
 
   ccl::Ray ray{};
   rng_pixel = 0;
@@ -343,6 +541,7 @@ void cycles_camera_ray(UInt4 pixel,
   }
   origin = {ray.P.x, ray.P.y, ray.P.z, ray.tmin};
   direction = {ray.D.x, ray.D.y, ray.D.z, ray.tmax};
+  dD = ray.dD;
 }
 
 #undef kernel_data

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "material_layout.h"
+#include "path_state_layout.h"
 
 #include "kernel/svm/util.h"
 #include "util/projection.h"
@@ -78,15 +79,14 @@ ccl_device_inline int integrator_state_transmission_bounce(const WebGPUSvmPath &
 ccl_device_inline int integrator_state_transparent_bounce(const WebGPUSvmPath &state,
                                                            uint32_t /*flags*/)
 {
-  return int(state.transparent_bounce);
+  return int(state.transparent_bounce & CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK);
 }
 
 ccl_device_inline int integrator_state_portal_bounce(KernelGlobals /*kg*/,
-                                                     const WebGPUSvmPath & /*state*/,
+                                                     const WebGPUSvmPath &state,
                                                      uint32_t /*flags*/)
 {
-  /* Portal closures are outside the WebGPU surface subset. */
-  return 0;
+  return int(state.transparent_bounce >> CYCLES_WEBGPU_PORTAL_BOUNCE_SHIFT);
 }
 
 ccl_device_inline float3 webgpu_svm_context_xyz(const WebGPUSvmContextWords bits)

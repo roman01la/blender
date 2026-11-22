@@ -43,6 +43,10 @@ def stage(source: Path, destination: Path, port: Path) -> None:
         subprocess.run(["git", "-C", tree, "apply", patch], check=True)
         defaults = port / "blender-platform" / "cycles-defaults.patch"
         subprocess.run(["git", "-C", tree, "apply", defaults], check=True)
+        invariant_bump = port / "blender-platform" / "cycles-invariant-bump.patch"
+        subprocess.run(["git", "-C", tree, "apply", invariant_bump], check=True)
+        volume_auto_pass = port / "blender-platform" / "cycles-volume-auto-pass.patch"
+        subprocess.run(["git", "-C", tree, "apply", volume_auto_pass], check=True)
         for name, directory in files.items():
             shutil.copyfile(port / "blender-platform" / name, tree / directory / name)
         for name in ("channel_api.h", "shared_memory_api.h"):

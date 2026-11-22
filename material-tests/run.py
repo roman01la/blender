@@ -84,7 +84,12 @@ def parse_log(lines, engine, target):
             elif active:
                 evidence.append(line.strip())
         elif active and (CPU_FALLBACK.search(line) or TRACE_DEVICE.search(line) or
-                         "Cycles WebGPU stock scheduler completed" in line):
+                         "Cycles WebGPU stock scheduler completed" in line or
+                         "Denoising on:" in line or
+                         "Cycles WebGPU OIDN dispatched" in line or
+                         "Cycles WebGPU writing volume denoising guides" in line or
+                         "Cycles WebGPU resident film export" in line or
+                         line.startswith("VOLUME_WEBGPU_PROOF ")):
             evidence.append(line.strip())
     if active is not None:
         results[active] = incomplete()
@@ -200,8 +205,11 @@ def run_side(args, output, engine, side, device, start, batch):
         stem = f"{engine}-{start:05d}-{side}" + (f"-retry-{attempt}" if attempt else "")
         request = output / f"{stem}.json"
         log = output / f"{stem}.log"
-        dump(request, {"engine": engine, "device": device, "cases": remaining,
-                       "lighting": args.lighting, "image": str(output / f"{stem}.png")})
+        options = {"engine": engine, "device": device, "cases": remaining,
+                   "lighting": args.lighting, "image": str(output / f"{stem}.png")}
+        if grid := getattr(args, "volume_grid", None):
+            options["volume_grid"] = str(grid.resolve())
+        dump(request, options)
         command = native_command(args, request) if side == "native" else browser_command(args, request)
         code = run_logged(command, log, args.timeout + 85)
         with log.open() as stream:

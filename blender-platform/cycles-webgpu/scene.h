@@ -40,6 +40,7 @@ struct CyclesWebGPUScene {
   bool has_ggx = false;
   bool has_transmission = false;
   bool has_subsurface = false;
+  bool advanced_query_svm = false;
 };
 
 /* Read the synchronized host DeviceScene under the Scene mutex. Preserve the previous output

@@ -346,7 +346,10 @@ void PathTraceWorkWebGPU::cryptomatte_postproces()
 
 void PathTraceWorkWebGPU::denoise_volume_guiding_buffers()
 {
-  with_cpu_work([](CPUWork &work) { work.denoise_volume_guiding_buffers(); });
+  /* The homogeneous WebGPU integrator uses unguided distance sampling. */
+  if (use_cpu_ || !renderer_.uses_volume()) {
+    with_cpu_work([](CPUWork &work) { work.denoise_volume_guiding_buffers(); });
+  }
 }
 
 #if defined(WITH_PATH_GUIDING)

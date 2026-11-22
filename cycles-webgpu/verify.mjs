@@ -9,10 +9,10 @@ import { promisify } from 'node:util';
 
 const args = process.argv.slice(2);
 const experimentModes = ['--bvh2', '--primary', '--surface', '--lit', '--film', '--svm',
-  '--svm-compact', '--svm-core', '--subsurface', '--forward-lights'];
+  '--svm-compact', '--svm-core', '--subsurface', '--volume-reference', '--forward-lights'];
 const mode = experimentModes.includes(args[0]) ? args.shift().slice(2) : 'camera';
 const argCount = { camera: 2, bvh2: 4, primary: 5, surface: 7, lit: 10, film: 1, svm: 2,
-  'svm-compact': 2, 'svm-core': 2, subsurface: 2, 'forward-lights': 1 };
+  'svm-compact': 2, 'svm-core': 2, subsurface: 2, 'volume-reference': 2, 'forward-lights': 1 };
 if (args.length !== argCount[mode] && !(mode === 'film' && args.length === 2)) {
   throw Error(
     'Usage: node verify.mjs camera.wgsl reference.json\n' +
@@ -25,6 +25,7 @@ if (args.length !== argCount[mode] && !(mode === 'film' && args.length === 2)) {
     '       node verify.mjs --svm-compact svm-compact.wgsl svm-reference.json\n' +
     '       node verify.mjs --svm-core svm-compact-core.wgsl svm-reference.json\n' +
     '       node verify.mjs --subsurface subsurface.wgsl subsurface-reference.json\n' +
+    '       node verify.mjs --volume-reference volume.wgsl volume-reference.json\n' +
     '       node verify.mjs --forward-lights shade-background-tree.wgsl',
   );
 }
@@ -114,6 +115,8 @@ if (mode === 'primary' || mode === 'surface' || mode === 'lit') {
   payload.svm = JSON.parse(await readFile(args[1], 'utf8'));
 } else if (mode === 'subsurface') {
   payload.subsurface = JSON.parse(await readFile(args[1], 'utf8'));
+} else if (mode === 'volume-reference') {
+  payload.volume = JSON.parse(await readFile(args[1], 'utf8'));
 } else if (mode === 'camera') {
   payload.cases = JSON.parse(await readFile(args[1], 'utf8'));
 }
@@ -236,7 +239,7 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
 
   async function forwardLightsTest() {
     const descriptor = 12;
-    const lampBase = descriptor + 20;
+    const lampBase = descriptor + 30;
     const lights = new Uint32Array(lampBase + 2 * 24);
     const lightFloats = new Float32Array(lights.buffer);
     lights[1] = descriptor;
@@ -305,6 +308,26 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
       }
     }
     return { walksChecked: count, hits, maxAbsoluteError };
+  }
+
+  async function volumeTest({ entries, expected }) {
+    const count = entries[0];
+    if (!count || entries.length !== 4 + count * 36 || expected.length !== count * 20) {
+      throw Error('Volume fixture has inconsistent records');
+    }
+    const [result] = await dispatch([new Uint32Array(entries)],
+      [new Float32Array(expected.length)], Math.ceil(count / 32));
+    const actual = new Float32Array(result.buffer);
+    const reference = new Float32Array(new Uint32Array(expected).buffer);
+    let maxAbsoluteError = 0;
+    for (let i = 0; i < actual.length; ++i) {
+      const word = i % 20;
+      // Narrow Mie lobes amplify GPU/CPU differences in the sampled cosine.
+      const tolerance = word === 11 || word === 15 ? 4e-4 : 3e-5;
+      maxAbsoluteError = Math.max(maxAbsoluteError,
+        checkFloat(actual[i], reference[i], `Volume case ${Math.floor(i / 20)} word ${word}`, tolerance));
+    }
+    return { samplesChecked: count, maxAbsoluteError };
   }
 
   // The core shader leaves extended operations to the full shader. It may
@@ -747,6 +770,8 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
     result = await svmTest(payload.svm, payload.mode !== 'svm', payload.mode === 'svm-core');
   } else if (payload.mode === 'subsurface') {
     result = await subsurfaceTest(payload.subsurface);
+  } else if (payload.mode === 'volume-reference') {
+    result = await volumeTest(payload.volume);
   } else if (payload.mode === 'forward-lights') {
     result = await forwardLightsTest();
   } else {
@@ -806,6 +831,7 @@ try {
     'svm-compact': 'CYCLES_WEBGPU_SVM_COMPACT_PASS',
     'svm-core': 'CYCLES_WEBGPU_SVM_CORE_PASS',
     subsurface: 'CYCLES_WEBGPU_SUBSURFACE_PASS',
+    'volume-reference': 'CYCLES_WEBGPU_VOLUME_REFERENCE_PASS',
     'forward-lights': 'CYCLES_WEBGPU_FORWARD_LIGHTS_PASS',
   };
   console.log(resultTag[mode], JSON.stringify(result.value));

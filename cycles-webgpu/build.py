@@ -42,18 +42,26 @@ def retarget(source: Path, wrapper: Path, output: Path) -> None:
     shader_ir = re.sub(
         r"\b(call|declare) (?=(?:noundef )?i32 @_Z"
         r"(?:(?:17cycles_scene_word|19cycles_surface_word|17cycles_light_word|"
-        r"25cycles_camera_sample_word|15cycles_svm_word)j|23cycles_film_transparentv)\b)",
+        r"25cycles_camera_sample_word|15cycles_svm_word|18cycles_volume_word)j|23cycles_film_transparentv)\b)",
         r"\1 spir_func ",
         shader_ir,
     )
     # Direct lighting also calls the C++ traversal kernel defined in a separate module.
     shader_ir = re.sub(r"\b(call|declare) (?=void @_Z17cycles_bvh2_trace)", r"\1 spir_func ", shader_ir)
+    shader_ir = re.sub(r"\b(call|declare) (?=void @_Z\d+cycles_volume_light_sample)",
+                       r"\1 spir_func ", shader_ir)
+    shader_ir = re.sub(r"\b(call|declare) (?=<4 x float> @_Z\d+cycles_volume_shadow_transmittance)",
+                       r"\1 spir_func ", shader_ir)
     shader_ir = re.sub(r"\b(call|declare) (?=<4 x i32> @_Z18cycles_svm_contextjj)",
                        r"\1 spir_func ", shader_ir)
-    # GGX closures and their lookup accessor link across the BSDF and dispatch modules.
+    shader_ir = re.sub(r"\b(call|declare) (?=(?:noundef )?(?:float|void|<4 x float>) "
+                       r"@_Z\d+cycles_query_(?:ao|bevel|raycast))",
+                       r"\1 spir_func ", shader_ir)
+    # Surface closures and their lookup accessor link across the BSDF and dispatch modules.
     shader_ir = re.sub(
         r"\b(call|declare) (?=(?:noundef )?(?:float @_Z17cycles_ggx_lookupj\b|"
-        r"<4 x float> @_Z15cycles_ggx_eval|i32 @_Z17cycles_ggx_sample))",
+        r"<4 x float> @_Z(?:15cycles_ggx_eval|\d+cycles_standalone_eval)|"
+        r"i32 @_Z(?:17cycles_ggx_sample|\d+cycles_standalone_sample)))",
         r"\1 spir_func ",
         shader_ir,
     )
@@ -98,6 +106,10 @@ def normalize_spirv(code: bytes) -> bytes:
             added_types.append((opcode, (types[definition], *definition)))
         return types[definition]
 
+    private_pointer_types = {operands[0] for opcode, operands in instructions
+                             if opcode == 32 and operands[1] == 7}  # Function storage
+    private_pointers = {operands[1] for opcode, operands in instructions
+                        if opcode in {59, 65, 66} and operands[0] in private_pointer_types}
     integer_value_types = {}
     in_function = False
     for opcode, operands in instructions:
@@ -141,9 +153,21 @@ def normalize_spirv(code: bytes) -> bytes:
     normalized = []
     first_function = None
     for opcode, operands in instructions:
+        if (opcode == 62 and len(operands) > 2 and operands[0] in private_pointers and
+                operands[2] in {1, 3}):  # OpStore Volatile[|Aligned]
+            # This qualifier keeps LLVM's local struct accesses scalar. Naga's
+            # SPIR-V importer does not read the extra memory operands.
+            operands = operands[:2]
+        if (opcode == 61 and len(operands) > 3 and operands[2] in private_pointers and
+                operands[3] in {1, 3}):  # OpLoad Volatile[|Aligned]
+            operands = operands[:3]
         if byte_types:
             if (opcode == 21 and operands[0] in byte_types) or (opcode == 17 and operands == (39,)):
                 continue  # OpTypeInt and OpCapability Int8
+            if opcode == 28 and operands[1] in byte_types:  # OpTypeArray
+                # Private closure storage retains C++ padding as byte arrays.
+                # The shader addresses typed members and never reads the padding.
+                operands = (operands[0], uint_type, operands[2])
             if opcode == 113:  # OpUConvert
                 result_type, result, value = operands
                 if result_type in byte_types and integer_value_types[value] == uint_type:
@@ -156,8 +180,8 @@ def normalize_spirv(code: bytes) -> bytes:
                 widened = new_id()
                 normalized.append((opcode, (uint_type, widened, *arguments)))
                 opcode, operands = truncate_byte(result, widened)
-            elif opcode in {1, 43, 46, 83, 169, 197, 198, 199, 245} and operands[0] in byte_types:
-                # Undef, constant, null, copy, select, bitwise or/xor/and, and phi.
+            elif opcode in {1, 43, 46, 83, 169, 194, 197, 198, 199, 245} and operands[0] in byte_types:
+                # Undef, constant, null, copy, select, logical shift, bitwise ops, and phi.
                 operands = (uint_type, *operands[1:])
         # SPIR-V permits unsigned integer types in signed instructions. Naga
         # uses the type's signedness to emit WGSL, so make it explicit.
@@ -238,8 +262,8 @@ def lower_spirv(llvm: Path, work: Path, optimized: Path, plugin: Path,
     control_flow = ("structurizecfg" if structured_cfg else
                     "reg2mem,cycles-webgpu-dispatch-cfg,mem2reg")
     if canonicalize_loops:
-        # Give the fractal loops dedicated exits before structurizing them.
-        # A shared exit can turn the 3D Hybrid octave back edge into an exit.
+        # Give nested loops dedicated exits before structurizing them. Shared
+        # exits can swallow back edges in Noise octaves or volume shadow traversal.
         control_flow = f"loop-simplify,lcssa,{control_flow}"
     passes = (
         "function(cycles-webgpu-hoist-resources,cycles-webgpu-legalize-values,lower-switch,"
@@ -251,18 +275,28 @@ def lower_spirv(llvm: Path, work: Path, optimized: Path, plugin: Path,
 
 def build(options) -> None:
     options.output.mkdir(parents=True, exist_ok=True)
+    extended_queries = options.extended_queries or options.advanced_queries
     headers = options.emscripten_sysroot / "include"
     cxx_flags = ("-std=c++20", "-DNDEBUG", "-O2", "-fno-math-errno", "-I", CYCLES)
-    svm = options.svm or options.svm_compact
+    if options.volume_reference:
+        cxx_flags += ("-fno-strict-aliasing", "-D__MAX_CLOSURE__=2")
+    svm = (options.svm or options.svm_compact or options.sampled_emission or options.svm_query or
+           options.shadow_materials)
     if svm:
         # The stock procedural texture hash uses wrapping signed arithmetic.
         cxx_flags += ("-fwrapv",)
     light = options.direct_light or options.wavefront_light
-    surface = options.surface or options.surface_compact
+    volume_shadow = options.volume_scatter_shadow or options.volume_extinction_shadow
+    absorption_shadow = options.absorption_shadow or volume_shadow
+    absorption = options.absorption or absorption_shadow or options.volume_interval
+    volume = options.volume_reference or options.volume_scatter
+    intersect_shadow = options.intersect_shadow or options.transparent_shadow or absorption_shadow
+    surface = options.surface or options.surface_compact or options.surface_query
     compact = (options.bvh2_compact or options.surface_compact or options.svm_compact or
-               options.intersect_shadow or options.subsurface_compact)
+               options.sampled_emission or options.svm_query or options.surface_query or
+               intersect_shadow or options.subsurface_compact or absorption or options.volume_scatter)
     kernel = ("bvh2" if options.bvh2 or options.bvh2_compact or surface or light or
-              options.intersect_shadow else "camera")
+              intersect_shadow else "camera")
     dispatch = kernel
     adaptive = next((stage for stage, enabled in (
         ("check", options.adaptive_check),
@@ -279,8 +313,15 @@ def build(options) -> None:
         kernel, dispatch = "direct_light", "shade_background"
     elif options.denoise_surface:
         kernel, dispatch = "camera", "denoise_surface"
-    elif options.svm or options.svm_compact:
+    elif options.sampled_emission:
+        kernel, dispatch = "svm", "sampled_emission"
+    elif options.svm or options.svm_compact or options.svm_query:
         kernel = dispatch = "svm"
+    elif absorption:
+        kernel, dispatch = "bvh2", "absorption"
+    elif volume:
+        kernel = "volume"
+        dispatch = "volume_scatter" if options.volume_scatter else kernel
     elif options.subsurface or options.subsurface_compact:
         kernel, dispatch = "bvh2", "subsurface"
     elif adaptive:
@@ -294,6 +335,15 @@ def build(options) -> None:
     shader_name = f"{dispatch.replace('_', '-')}{'-compact' if compact else ''}.wgsl"
     if options.svm_core:
         shader_name = "svm-compact-core.wgsl"
+    if options.sampled_emission:
+        shader_name = "sampled-emission.wgsl"
+    if options.svm_query:
+        if options.advanced_queries:
+            shader_name = "svm-query-advanced.wgsl"
+        else:
+            shader_name = "svm-query-textures.wgsl" if extended_queries else "svm-query.wgsl"
+    if options.surface_query:
+        shader_name = "surface-query.wgsl"
     if adaptive:
         shader_name = f"adaptive-{adaptive}.wgsl"
     elif adaptive_camera:
@@ -308,8 +358,24 @@ def build(options) -> None:
     if options.defer_shadow:
         shader_name = ("wavefront-light-deferred-multi-point.wgsl" if options.point_distribution
                        else "wavefront-light-deferred.wgsl")
-    if options.intersect_shadow:
-        shader_name = "intersect-shadow.wgsl"
+    if intersect_shadow:
+        shader_name = ("intersect-shadow-transparent.wgsl" if options.transparent_shadow else
+                       "intersect-shadow.wgsl")
+    if absorption:
+        shader_name = "absorption-shadow.wgsl" if options.absorption_shadow else "absorption-compact.wgsl"
+    if options.volume_interval:
+        shader_name = "volume-interval.wgsl"
+    if options.volume_scatter:
+        shader_name = "volume-scatter.wgsl"
+    if volume_shadow:
+        shader_name = ("volume-scatter-shadow.wgsl" if options.volume_scatter_shadow else
+                       "volume-extinction-shadow.wgsl")
+    if options.volume_grid:
+        shader_name = shader_name.removesuffix(".wgsl") + "-grid.wgsl"
+    if options.volume_guides:
+        shader_name = shader_name.removesuffix(".wgsl") + "-guides.wgsl"
+    if options.shadow_materials:
+        shader_name = "intersect-shadow-transparent-materials.wgsl"
     if options.reflection_only:
         shader_name = shader_name.removesuffix(".wgsl") + "-reflection.wgsl"
 
@@ -318,23 +384,69 @@ def build(options) -> None:
 
     if options.denoise_background:
         shader_name = shader_name.removesuffix(".wgsl") + "-guides.wgsl"
+    if options.standalone_closures:
+        shader_name = shader_name.removesuffix(".wgsl") + "-closures.wgsl"
+    if options.hair_closures:
+        shader_name = shader_name.removesuffix(".wgsl") + "-hair.wgsl"
+    if options.volume_forward:
+        shader_name = shader_name.removesuffix(".wgsl") + "-volume.wgsl"
 
     shader_flags = []
-    if options.svm_core:
+    if options.volume_grid:
+        shader_flags.append("-DCYCLES_WEBGPU_VOLUME_GRID=1")
+    if options.volume_guides:
+        shader_flags.append("-DCYCLES_WEBGPU_VOLUME_GUIDES=1")
+    if options.volume_forward:
+        shader_flags.append("-DCYCLES_WEBGPU_VOLUME_FORWARD=1")
+    if (options.path_update or options.denoise_surface) and not options.standalone_closures:
+        shader_flags.append("-DCYCLES_WEBGPU_EXCLUDE_STANDALONE=1")
+    if (options.wavefront_light or options.shade_background) and not options.hair_closures:
+        shader_flags.append("-DCYCLES_WEBGPU_EXCLUDE_HAIR=1")
+    if options.svm_core or options.svm_query or options.shadow_materials:
         shader_flags.append("-DCYCLES_WEBGPU_SVM_CORE=1")
+    if extended_queries or options.shadow_materials:
+        shader_flags.append("-DCYCLES_WEBGPU_SVM_TEXTURES=1")
+    if extended_queries:
+        shader_flags.append("-DCYCLES_WEBGPU_SVM_PROJECTED_IMAGES=1")
+    if options.advanced_queries:
+        shader_flags.append("-DCYCLES_WEBGPU_SVM_ADVANCED_QUERIES=1")
+    if options.sampled_emission:
+        shader_flags.extend(("-DCYCLES_WEBGPU_SAMPLED_EMISSION=1", "-DCYCLES_WEBGPU_SURFACE=1"))
+    if options.svm_query:
+        shader_flags.extend(("-DCYCLES_WEBGPU_SCENE_QUERIES=1", "-DCYCLES_WEBGPU_SURFACE=1"))
+    if options.surface_query:
+        shader_flags.append("-DCYCLES_WEBGPU_QUERY_HITS=1")
     if options.denoise_background:
         shader_flags.append("-DCYCLES_WEBGPU_DENOISE_BACKGROUND=1")
     if options.denoise_surface:
         shader_flags.extend(("-DCYCLES_WEBGPU_DENOISE_SURFACE=1",
                              "-DCYCLES_WEBGPU_COMPACT_PATHS=1"))
-    if options.light_tree:
+    if options.light_tree or options.volume_scatter:
         shader_flags.append("-DCYCLES_WEBGPU_LIGHT_TREE=1")
     if options.point_distribution:
         shader_flags.append("-DCYCLES_WEBGPU_POINT_DISTRIBUTION=1")
     if options.defer_shadow:
         shader_flags.append("-DCYCLES_WEBGPU_DEFER_SHADOW=1")
-    if options.intersect_shadow:
+    if intersect_shadow:
         shader_flags.append("-DCYCLES_WEBGPU_INTERSECT_SHADOW=1")
+    if absorption:
+        shader_flags.append("-DCYCLES_WEBGPU_ABSORPTION=1")
+    if absorption_shadow:
+        shader_flags.append("-DCYCLES_WEBGPU_ABSORPTION_SHADOW=1")
+    if options.volume_interval:
+        shader_flags.append("-DCYCLES_WEBGPU_VOLUME_INTERVAL=1")
+    if volume_shadow:
+        shader_flags.append("-DCYCLES_WEBGPU_VOLUME_EXTINCTION_SHADOW=1")
+    if options.volume_scatter_shadow:
+        shader_flags.append("-DCYCLES_WEBGPU_VOLUME_SCATTER_SHADOW=1")
+    if options.volume_scatter:
+        shader_flags.extend(("-DCYCLES_WEBGPU_VOLUME_SCATTER=1",
+                             "-DCYCLES_WEBGPU_WAVEFRONT_LIGHT=1", "-DCYCLES_WEBGPU_DEFER_SHADOW=1",
+                             "-DCYCLES_WEBGPU_EXCLUDE_HAIR=1"))
+    if options.transparent_shadow:
+        shader_flags.append("-DCYCLES_WEBGPU_TRANSPARENT_SHADOW=1")
+    if options.shadow_materials:
+        shader_flags.extend(("-DCYCLES_WEBGPU_SHADOW_SVM=1", "-DCYCLES_WEBGPU_SURFACE=1"))
     if options.bvh2_compact:
         shader_flags.append("-DCYCLES_WEBGPU_OFFSET_CLOSEST=1")
     if options.subsurface or options.subsurface_compact:
@@ -369,11 +481,43 @@ def build(options) -> None:
         work = Path(temporary)
         wrapper_ir = work / "dispatch.ll"
         build_cxx_flags = cxx_flags
-        if options.light_tree:
+        if extended_queries or options.shadow_materials:
+            # Share the stock Perlin arithmetic across SVM call sites.
+            noise_path = Path("kernel/svm/noise.h")
+            stock_noise = (CYCLES / noise_path).read_text()
+            outlined, count = re.subn(r"ccl_device_noinline_cpu float perlin_[1-4]d\(",
+                                      r"__attribute__((noinline)) \g<0>", stock_noise)
+            if count < 4:
+                raise ValueError("Cannot find the four stock Perlin noise dimensions")
+            header = work / noise_path
+            header.parent.mkdir(parents=True, exist_ok=True)
+            header.write_text(outlined)
+            build_cxx_flags = ("-I", work, *build_cxx_flags)
+        if options.light_tree or options.volume_scatter:
             from light_tree_headers import prepare_light_tree_headers
 
             overlay = prepare_light_tree_headers(work, CYCLES)
             build_cxx_flags = ("-I", overlay, *cxx_flags)
+        if absorption:
+            from volume_headers import prepare_absorption_headers
+
+            prepare_absorption_headers(work, CYCLES)
+            build_cxx_flags = ("-I", work, *build_cxx_flags)
+        if options.volume_reference:
+            from volume_headers import prepare_volume_headers
+
+            prepare_volume_headers(work, CYCLES)
+            build_cxx_flags = ("-I", work, *build_cxx_flags)
+        if options.volume_scatter or volume_shadow:
+            from volume_headers import prepare_volume_headers
+
+            volume_overlay = work / "volume"
+            volume_overlay.mkdir()
+            prepare_volume_headers(volume_overlay, CYCLES, scattering=options.volume_scatter)
+            if options.volume_grid:
+                from volume_grid_headers import prepare_volume_grid_headers
+
+                prepare_volume_grid_headers(volume_overlay, CYCLES)
         if options.subsurface or options.subsurface_compact:
             from subsurface_headers import prepare_subsurface_headers
 
@@ -384,6 +528,37 @@ def build(options) -> None:
 
             overlay = prepare_denoising_header(work, CYCLES)
             build_cxx_flags = ("-I", overlay, *build_cxx_flags)
+        if options.volume_scatter_shadow and options.volume_guides:
+            from denoising_headers import prepare_volume_denoising_header
+
+            prepare_volume_denoising_header(work, CYCLES)
+        if options.path_update:
+            from transparent_headers import prepare_transparent_ray_header
+
+            prepare_transparent_ray_header(work, CYCLES)
+            build_cxx_flags = ("-I", work, *build_cxx_flags)
+        if options.path_update:
+            # A purely reflective Fresnel closure leaves cos_HO unused. Initialize
+            # it so LLVM cannot fold the unsampled refraction branch to a WGSL NaN.
+            microfacet_path = Path("kernel/closure/bsdf_microfacet.h")
+            source = (CYCLES / microfacet_path).read_text()
+            declaration = "  float cos_HO;"
+            if source.count(declaration) != 1:
+                raise ValueError("Expected one stock microfacet refraction cosine")
+            header = work / microfacet_path
+            header.parent.mkdir(parents=True, exist_ok=True)
+            header.write_text(source.replace(declaration, "  float cos_HO = 0.0f;"))
+            build_cxx_flags = ("-I", work, *build_cxx_flags)
+        if options.standalone_closures or options.wavefront_light:
+            from hair_headers import prepare_hair_headers
+
+            prepare_hair_headers(work, CYCLES)
+            build_cxx_flags = ("-I", work, *build_cxx_flags)
+        if options.svm_query:
+            from scene_query_headers import prepare_scene_query_headers
+
+            overlay = prepare_scene_query_headers(work, CYCLES, advanced=options.advanced_queries)
+            build_cxx_flags = ("-I", overlay, *build_cxx_flags)
         run(
             options.llvm_bin / "clang",
             "--no-default-config",
@@ -393,6 +568,7 @@ def build(options) -> None:
             *shader_flags,
             "-O2", "-S", "-emit-llvm",
             "-I", SOURCE,
+            "-I", work,
             SOURCE / ("subsurface_compact_dispatch.hlsl" if options.subsurface_compact
                       else f"{dispatch}_dispatch.hlsl"),
             "-o", wrapper_ir,
@@ -402,13 +578,28 @@ def build(options) -> None:
                    [kernel, dispatch] if light else [kernel])
         if options.shade_background:
             kernels.append("camera")
+        if options.volume_scatter:
+            kernels.append("direct_light")
+        if volume_shadow:
+            kernels.append("volume")
+        if options.sampled_emission or options.svm_query:
+            kernels.append("bvh2")
+        if options.shadow_materials:
+            kernels.append("svm")
         if options.wavefront_light or options.path_update or options.denoise_surface:
             kernels.append("ggx")
         # Keep scanline induction variables at 32 bits for the WebGPU backend.
-        adaptive_cxx_flags = ("-mllvm", "-indvars-widen-indvars=false") if adaptive else ()
+        hair_bsdf = options.standalone_closures or options.hair_closures
+        narrow_indvars = (adaptive or hair_bsdf or options.svm_query or options.transparent_shadow or
+                          options.subsurface_compact or volume or absorption)
+        narrow_cxx_flags = ("-mllvm", "-indvars-widen-indvars=false") if narrow_indvars else ()
         for name in kernels:
             cpp_ir = work / f"{name}-kernel.ll"
             shader_ir = work / f"{name}-shader.ll"
+            module_flags = build_cxx_flags
+            if (options.volume_scatter or volume_shadow) and name == "volume":
+                module_flags = ("-I", volume_overlay, "-fno-strict-aliasing",
+                                "-D__MAX_CLOSURE__=8", *module_flags)
             run(
                 options.llvm_bin / "clang++",
                 "--no-default-config",
@@ -418,8 +609,8 @@ def build(options) -> None:
                 "-isystem", headers,
                 "-D_POSIX_C_SOURCE=200809L",
                 "-fno-vectorize", "-fno-slp-vectorize",
-                *build_cxx_flags,
-                *adaptive_cxx_flags,
+                *module_flags,
+                *narrow_cxx_flags,
                 *shader_flags,
                 "-S", "-emit-llvm",
                 SOURCE / f"{name}_kernels.cc",
@@ -442,16 +633,22 @@ def build(options) -> None:
                 "-o", optimized,
             )
         else:
-            # Private C++ aggregates cannot cross function calls in WGSL. The
-            # lighting kernels share the SVM image sampler; an outlined copy
-            # would read a storage buffer handle from a private global, which
-            # the SPIR-V backend cannot store.
-            inline_all = svm or light or options.shade_background
+            # Keep storage handles and the private closure payloads within the entry point.
+            inline_all = (svm or light or options.shade_background or options.path_update or
+                          options.denoise_surface or options.transparent_shadow or
+                          options.subsurface_compact or volume or absorption)
             opt_plugin = (f"-load-pass-plugin={plugin}",) if inline_all else ()
             inline_helpers = "cycles-webgpu-inline-helpers,always-inline," if inline_all else ""
+            # SPIR-V cannot index a vector load widened from the scalar SVM stack.
+            scalar_stack = ("-vectorize-slp=false",) if (
+                svm or options.transparent_shadow or options.subsurface_compact or
+                volume or absorption) else ()
+            narrow_indices = ("-indvars-widen-indvars=false",) if narrow_indvars else ()
             run(
                 options.llvm_bin / "opt",
                 *opt_plugin,
+                *scalar_stack,
+                *narrow_indices,
                 "-internalize-public-api-list=main",
                 f"-passes=internalize,{inline_helpers}default<O2>,globaldce",
                 work / "linked.bc",
@@ -464,12 +661,13 @@ def build(options) -> None:
             # per-lane state live on Metal.
             shader = lower_spirv(options.llvm_bin, work, optimized, plugin,
                                  structured_cfg=(options.shade_background or options.adaptive_film or
-                                                 options.bvh2_compact or options.intersect_shadow or
-                                                 options.surface_compact or svm or
+                                                 options.bvh2_compact or intersect_shadow or
+                                                 options.surface_compact or options.surface_query or svm or
                                                  options.path_update or options.wavefront_light or
                                                  options.denoise_surface or options.subsurface or
-                                                 options.subsurface_compact),
-                                 canonicalize_loops=svm)
+                                                 options.subsurface_compact or
+                                                 volume or absorption),
+                                 canonicalize_loops=svm or volume_shadow)
         run(
             options.llvm_bin / "llc",
             "-O0" if structured_dispatch else "-O2", "-filetype=obj",
@@ -489,17 +687,85 @@ def build(options) -> None:
         )
         normalized = work / "normalized.spv"
         normalized.write_bytes(normalize_spirv((work / "optimized.spv").read_bytes()))
+        if options.svm_query:
+            from scene_query_headers import narrow_scene_query_indices
+
+            query = work / "query-indexing.spv"
+            query.write_bytes(narrow_scene_query_indices(normalized.read_bytes()))
+            run(options.spirv_bin / "spirv-opt", "--target-env=vulkan1.2",
+                "--eliminate-dead-code-aggressive", "--eliminate-dead-const", "--trim-capabilities",
+                query, "-o", normalized)
         run(options.spirv_bin / "spirv-val", "--target-env", "vulkan1.2", normalized)
         run("node", SOURCE / "translate.mjs", options.translator, normalized, work / shader_name)
+        if extended_queries:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU projected query images\n")
+        if options.advanced_queries:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU advanced procedural queries\n")
+        if svm and not (options.sampled_emission or options.shadow_materials):
+            shader_path = work / shader_name
+            shader_path.write_text("// Cycles WebGPU AOV output\n" + shader_path.read_text())
+        if options.sampled_emission:
+            # LLVM's SPIR-V backend emits writable storage even for HLSL StructuredBuffer.
+            # Match the explicit WebGPU bind group layout: only direct radiance is writable.
+            shader_path = work / shader_name
+            source = shader_path.read_text()
+            for binding in (0, 1, 2, 4, 5, 6, 7):
+                source, count = re.subn(
+                    rf"(@group\(0\)\s+@binding\({binding}\)\s+var<storage, )read_write(?=>)",
+                    r"\g<1>read", source,
+                )
+                if count != 1:
+                    raise ValueError(f"Expected one sampled emission declaration at binding {binding}")
+            shader_path.write_text(source)
         if (options.wavefront_light or options.path_update or options.shade_background or
-                options.intersect_shadow or options.denoise_surface):
+                intersect_shadow or options.denoise_surface or options.svm_query):
             shader_path = work / shader_name
             source = shader_path.read_text()
             coalesced = coalesce_loop_state(source)
             if options.light_tree:
-                coalesced = "// Cycles Light Tree finite point\n" + coalesced
+                textured = ("// Cycles Light Tree textured emitters\n"
+                            if options.wavefront_light else "")
+                coalesced = ("// Cycles Light Tree finite point\n"
+                             "// Cycles Light Tree triangle emitters\n" + textured + coalesced)
+            if intersect_shadow:
+                coalesced = "// Cycles WebGPU shadow targets\n" + coalesced
             if coalesced != source:
                 shader_path.write_text(coalesced)
+        if (svm and not options.shadow_materials or options.wavefront_light or
+                options.standalone_closures):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU standalone surface closures v2\n")
+        if svm or surface or options.hair_closures or options.standalone_closures:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU hair BSDFs\n")
+        if svm or options.subsurface_compact or options.path_update or options.denoise_surface:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU Christensen-Burley subsurface\n")
+        if options.path_update:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU homogeneous absorption bounds\n")
+        if options.surface_compact or options.surface_query or options.denoise_surface:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU volume guide surface hits\n")
+        if svm or options.path_update or options.denoise_surface or options.shade_background:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU constant transparent surface\n")
+        if svm or options.path_update or options.transparent_shadow:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU varying transparent surface\n")
+        if svm or options.path_update or options.wavefront_light or options.denoise_surface:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU mixed Transparent surface closures v2\n")
+        if (svm or options.path_update or options.denoise_surface or options.shade_background or
+                options.wavefront_light or options.transparent_shadow):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU ray portals\n")
+        if (svm and not options.shadow_materials or options.path_update or
+                options.stock_camera or options.adaptive_camera_rays):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU ray differentials\n")
         if (compact or options.surface or options.path_update or options.wavefront_light or
                 adaptive or adaptive_camera or options.adaptive_film or options.shade_background or
                 options.denoise_surface):
@@ -513,6 +779,10 @@ def build(options) -> None:
             reference = "svm-reference"
             reference_source = "svm_reference.cc"
             reference_flags = ()
+        elif options.volume_reference:
+            reference = "volume-reference"
+            reference_source = "volume_reference.cc"
+            reference_flags = ("-I", work)
         elif options.subsurface:
             reference = "subsurface-reference"
             reference_source = "subsurface_reference.cc"
@@ -541,7 +811,7 @@ def build(options) -> None:
                 with (work / sampled_reference).open("w") as output:
                     run(work / reference, "--sampled-primary", stdout=output)
                 shutil.move(work / sampled_reference, options.output / sampled_reference)
-        if options.svm or options.subsurface:
+        if options.svm or options.subsurface or options.volume_reference:
             reference_json = reference + ".json"
             with (work / reference_json).open("w") as output:
                 run(work / reference, stdout=output)
@@ -569,11 +839,15 @@ if __name__ == "__main__":
                         help="sample point lights using the stock Cycles light distribution")
     parser.add_argument("--denoise-background", action="store_true",
                         help="write denoising albedo for background and forward light hits")
+    parser.add_argument("--standalone-closures", action="store_true",
+                        help="include standalone surface closures in path update or denoising")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--denoise-surface", action="store_true",
                        help="compile Cycles' denoising guides for compact surfaces")
     modes.add_argument("--intersect-shadow", action="store_true",
                        help="build opaque shadow intersection for compact queued paths")
+    modes.add_argument("--transparent-shadow", action="store_true",
+                       help="build compact shadow traversal with constant RGB transparency")
     modes.add_argument("--bvh2", action="store_true", help="compile static triangle BVH2 traversal")
     modes.add_argument("--stock-camera", action="store_true",
                        help="build the camera kernel for stock Cycles work tiles")
@@ -585,21 +859,41 @@ if __name__ == "__main__":
                        help="compile BVH2 traversal over compacted paths")
     modes.add_argument("--surface-compact", action="store_true",
                        help="compile triangle surface setup over compacted paths")
+    modes.add_argument("--surface-query", action="store_true",
+                       help="compile compact surface setup with the SVM query intersection tail")
     modes.add_argument("--direct-light", action="store_true",
                        help="compile diffuse point lighting with opaque triangle shadows")
     modes.add_argument("--svm", action="store_true", help="compile the diffuse SVM subset")
     modes.add_argument("--svm-compact", action="store_true",
                        help="compile the SVM stage over compacted paths")
+    modes.add_argument("--svm-query", action="store_true",
+                       help="compile SVM with Cycles BVH ray queries over compacted paths")
+    modes.add_argument("--sampled-emission", action="store_true",
+                       help="shade sampled triangle emission with SVM")
     modes.add_argument("--wavefront-light", action="store_true",
                        help="compile direct lighting with per-path SVM materials")
     modes.add_argument("--shade-background", action="store_true",
                        help="compile environment and forward area emission for miss paths")
     modes.add_argument("--path-update", action="store_true",
                        help="compile diffuse continuation and radiance accumulation")
+    modes.add_argument("--absorption", action="store_true",
+                       help="track homogeneous volume absorption along compacted camera paths")
+    modes.add_argument("--absorption-shadow", action="store_true",
+                       help="integrate homogeneous volume absorption along shadow rays")
+    modes.add_argument("--volume-reference", action="store_true",
+                       help="verify stock homogeneous volume SVM and phase functions")
+    modes.add_argument("--volume-interval", action="store_true",
+                       help="track the homogeneous scattering volume boundary")
+    modes.add_argument("--volume-scatter", action="store_true",
+                       help="compile stock homogeneous volume scattering and Light Tree sampling")
+    modes.add_argument("--volume-scatter-shadow", action="store_true",
+                       help="integrate attenuation and accumulate direct volume lighting")
+    modes.add_argument("--volume-extinction-shadow", action="store_true",
+                       help="integrate homogeneous volume extinction along surface shadow rays")
     modes.add_argument("--subsurface", action="store_true",
                        help="compile the stock Random Walk subsurface kernel for static triangles")
     modes.add_argument("--subsurface-compact", action="store_true",
-                       help="compile Random Walk over queued subsurface paths")
+                       help="compile Random Walk and Christensen–Burley over queued subsurface paths")
     modes.add_argument("--adaptive-camera-slots", action="store_true",
                        help="compile adaptive camera slot candidate lookup")
     modes.add_argument("--adaptive-camera-rays", action="store_true",
@@ -612,9 +906,41 @@ if __name__ == "__main__":
                        help="compile Cycles' vertical convergence filter")
     modes.add_argument("--adaptive-film", action="store_true",
                        help="compile Cycles' adaptive film pass writers")
+    parser.add_argument("--extended-queries", action="store_true",
+                        help="include selected texture and color nodes with SVM ray queries")
+    parser.add_argument("--advanced-queries", action="store_true",
+                        help="include Gabor and advanced Voronoi with SVM ray queries")
+    parser.add_argument("--hair-closures", action="store_true",
+                        help="include stock Hair BSDFs in the deferred direct light shader")
+    parser.add_argument("--volume-forward", action="store_true",
+                        help="use stock volume Light Tree MIS for forward emission")
+    parser.add_argument("--volume-guides", action="store_true",
+                        help="write Cycles' volume albedo and normal guides")
+    parser.add_argument("--volume-grid", action="store_true",
+                        help="add NanoVDB grid attributes and stock heterogeneous transport")
+    parser.add_argument("--shadow-materials", action="store_true",
+                        help="evaluate SVM tint at transparent shadow hits")
     options = parser.parse_args()
+    if options.shadow_materials and not options.transparent_shadow:
+        parser.error("--shadow-materials requires --transparent-shadow")
+    if options.extended_queries and not options.svm_query:
+        parser.error("--extended-queries requires --svm-query")
+    if options.advanced_queries and not options.svm_query:
+        parser.error("--advanced-queries requires --svm-query")
+    if options.hair_closures and not (options.wavefront_light and options.defer_shadow):
+        parser.error("--hair-closures requires --wavefront-light --defer-shadow")
+    if options.volume_forward and not (options.light_tree and
+            (options.shade_background or (options.wavefront_light and options.defer_shadow))):
+        parser.error("--volume-forward requires Light Tree background or deferred lighting")
+    if options.volume_guides and not (options.volume_scatter or options.volume_scatter_shadow):
+        parser.error("--volume-guides requires --volume-scatter or --volume-scatter-shadow")
+    if options.volume_grid and not (options.volume_scatter or options.volume_scatter_shadow or
+                                    options.volume_extinction_shadow):
+        parser.error("--volume-grid requires a volume transport mode")
     if options.svm_core and not options.svm_compact:
         parser.error("--svm-core requires --svm-compact")
+    if options.standalone_closures and not (options.path_update or options.denoise_surface):
+        parser.error("--standalone-closures requires --path-update or --denoise-surface")
     if options.reflection_only and not (options.wavefront_light or options.path_update):
         parser.error("--reflection-only requires --wavefront-light or --path-update")
     if options.defer_shadow and not options.wavefront_light:

@@ -25,9 +25,11 @@ GgxFloat4 cycles_ggx_eval(GgxFloat4 material,
                          GgxFloat4 specular_normal,
                          GgxFloat4 wi,
                          GgxFloat4 wo,
-                         float blur_alpha);
+                         float blur_alpha,
+                         float transparent_sample_weight);
 
-/* The sample weight carries throughput in RGB and the BSDF PDF in w. */
+/* The sample weight carries throughput in RGB and the BSDF PDF in w.
+ * The outgoing vector carries the MIS-weighted roughness squared in w. */
 unsigned int cycles_ggx_sample(GgxFloat4 material,
                                GgxFloat4 tint_alpha,
                                GgxFloat4 weights,
@@ -37,6 +39,34 @@ unsigned int cycles_ggx_sample(GgxFloat4 material,
                                GgxFloat4 specular_normal,
                                GgxFloat4 wi,
                                GgxFloat4 random,
+                               GgxFloat4 transparent,
                                float blur_alpha,
+                               bool ray_differentials,
+                               bool only_transparent,
                                GgxFloat4 &weight,
                                GgxFloat4 &wo);
+
+GgxFloat4 cycles_standalone_eval(GgxFloat4 material,
+                                GgxFloat4 parameters,
+                                GgxFloat4 secondary,
+                                GgxFloat4 extra,
+                                GgxFloat4 hair,
+                                GgxFloat4 normal,
+                                GgxFloat4 geometric_normal,
+                                GgxFloat4 wi,
+                                GgxFloat4 wo,
+                                float blur_alpha,
+                                unsigned int &lcg_state);
+
+unsigned int cycles_standalone_sample(GgxFloat4 material,
+                                      GgxFloat4 parameters,
+                                      GgxFloat4 secondary,
+                                      GgxFloat4 extra,
+                                      GgxFloat4 hair,
+                                      GgxFloat4 normal,
+                                      GgxFloat4 geometric_normal,
+                                      GgxFloat4 wi,
+                                      GgxFloat4 random,
+                                      float blur_alpha,
+                                      GgxFloat4 &weight,
+                                      GgxFloat4 &wo);

@@ -1,0 +1,15 @@
+diff --git a/intern/cycles/scene/pass.h b/intern/cycles/scene/pass.h
+--- a/intern/cycles/scene/pass.h
++++ b/intern/cycles/scene/pass.h
+@@ -66,6 +66,11 @@
+    * pixels allocated to save memory. */
+   bool is_written() const;
+ 
++  bool is_auto() const
++  {
++    return is_auto_;
++  }
++
+  protected:
+   /* This has been created automatically as a requirement to various rendering functionality
+    * (such as adaptive sampling). */

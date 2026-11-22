@@ -1405,7 +1405,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
    full_params_ = full_params;
  
    /* NOTE: GPU display checks for buffer modification and avoids unnecessary re-allocation.
-@@ -655,6 +690,109 @@
+@@ -655,6 +690,111 @@
    });
  }
  
@@ -1438,7 +1438,9 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
 +    return nullptr;
 +  }
 +  for (const BufferPass &pass : full_params_.passes) {
-+    if (pass.mode == PassMode::DENOISED && pass.type != PASS_COMBINED && pass.type != PASS_NONE) {
++    if (pass.mode == PassMode::DENOISED && pass.type != PASS_COMBINED &&
++        pass.type != PASS_NONE && !is_volume_guiding_pass(pass.type))
++    {
 +      return nullptr;
 +    }
 +  }
@@ -1515,7 +1517,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
  void PathTrace::denoise(const RenderWork &render_work)
  {
    if (!render_work.tile.denoise) {
-@@ -669,6 +807,26 @@
+@@ -669,6 +809,26 @@
    LOG_DEBUG << "Perform denoising work.";
  
    const double start_time = time_dt();
@@ -1542,7 +1544,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
  
    RenderBuffers *buffer_to_denoise = nullptr;
    bool allow_inplace_modification = false;
-@@ -694,6 +852,14 @@
+@@ -694,6 +854,14 @@
    }
    else {
      DCHECK_EQ(path_trace_works_.size(), 1);
@@ -1557,7 +1559,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
  
      buffer_to_denoise = path_trace_works_.front()->get_render_buffers();
    }
-@@ -794,7 +960,11 @@
+@@ -794,7 +962,11 @@
  
    const double start_time = time_dt();
  
@@ -1570,7 +1572,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
      LOG_DEBUG << "Invoke buffer update callback.";
  
      const PathTraceTile tile(*this);
-@@ -929,6 +1099,23 @@
+@@ -929,6 +1101,23 @@
    /* Write tile to disk, so that the render work's render buffer can be re-used for the next tile.
     */
    else {
@@ -1594,7 +1596,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
      LOG_DEBUG << "Write tile result to disk.";
      tile_buffer_write_to_disk();
    }
-@@ -941,6 +1128,22 @@
+@@ -941,6 +1130,22 @@
    }
  
    LOG_DEBUG << "Handle full-frame render buffer work.";
@@ -1617,7 +1619,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
  
    if (!tile_manager_.has_written_tiles()) {
      LOG_DEBUG << "No tiles on disk.";
-@@ -1150,12 +1353,48 @@
+@@ -1150,12 +1355,48 @@
  
  void PathTrace::process_full_buffer_from_disk(string_view filename)
  {
@@ -1666,7 +1668,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
    DenoiseParams denoise_params;
    if (!tile_manager_.read_full_buffer_from_disk(filename, &full_frame_buffers, &denoise_params)) {
      const string error_message = "Error reading tiles from file";
-@@ -1169,12 +1408,18 @@
+@@ -1169,12 +1410,18 @@
      return;
    }
  
@@ -1685,7 +1687,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
  
      /* If GPU should be used is not based on file metadata. */
      denoise_params.use_gpu = render_scheduler_.is_denoiser_gpu_used();
-@@ -1190,6 +1435,9 @@
+@@ -1190,6 +1437,9 @@
      /* Number of samples doesn't matter too much, since the samples count pass will be used. */
      render_state_.has_denoised_result = denoiser_->denoise_buffer(
          full_frame_buffers.params, full_frame_buffers.params, &full_frame_buffers, 0, false);
@@ -1695,7 +1697,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
    }
  
    full_frame_state_.render_buffers = &full_frame_buffers;
-@@ -1198,7 +1446,13 @@
+@@ -1198,7 +1448,13 @@
  
    /* Write the full result pretending that there is a single tile.
     * Requires some state change, but allows to use same communication API with the software. */
@@ -1709,7 +1711,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
  
    full_frame_state_.render_buffers = nullptr;
  }
-@@ -1343,6 +1597,8 @@
+@@ -1343,6 +1599,8 @@
        return "Multi";
      case DEVICE_METAL:
        return "Metal";

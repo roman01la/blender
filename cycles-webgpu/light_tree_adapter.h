@@ -16,6 +16,100 @@ ccl_device_inline packed_float3 light_tree_word_vector(const uint word)
                      light_tree_word_float(word + 2));
 }
 
+ccl_device_inline float4 light_tree_word_float4(const uint word)
+{
+  return make_float4(light_tree_word_float(word),
+                     light_tree_word_float(word + 1),
+                     light_tree_word_float(word + 2),
+                     light_tree_word_float(word + 3));
+}
+
+ccl_device_inline uint light_tree_object_word(KernelGlobals kg, const uint object)
+{
+  return kg->tree_object_offset + object * CYCLES_WEBGPU_TREE_OBJECT_WORDS;
+}
+
+ccl_device_inline uint light_tree_triangle_index(KernelGlobals kg, const uint prim)
+{
+  return cycles_light_word(kg->tree_triangle_indices_offset + prim);
+}
+
+ccl_device_inline uint light_tree_shader_word(KernelGlobals kg, const uint shader)
+{
+  return kg->tree_shader_offset + shader * CYCLES_WEBGPU_TREE_SHADER_WORDS;
+}
+
+ccl_device_inline const KernelObject &light_fetch(KernelGlobals kg, objects_tag, const uint index)
+{
+  const uint word = light_tree_object_word(kg, index);
+  const uint transform = word + CYCLES_WEBGPU_TREE_OBJECT_TRANSFORM;
+  const uint inverse = word + CYCLES_WEBGPU_TREE_OBJECT_INVERSE_TRANSFORM;
+  KernelObject &object = kg->object;
+  object.tfm = {light_tree_word_float4(transform),
+                light_tree_word_float4(transform + 4),
+                light_tree_word_float4(transform + 8)};
+  object.itfm = {light_tree_word_float4(inverse),
+                 light_tree_word_float4(inverse + 4),
+                 light_tree_word_float4(inverse + 8)};
+  object.lightgroup = std::bit_cast<int>(
+      cycles_light_word(word + CYCLES_WEBGPU_TREE_OBJECT_LIGHTGROUP));
+  return object;
+}
+
+ccl_device_inline uint light_fetch(KernelGlobals kg, object_flag_tag, const uint object)
+{
+  return cycles_light_word(light_tree_object_word(kg, object) + CYCLES_WEBGPU_TREE_OBJECT_FLAGS);
+}
+
+ccl_device_inline uint light_fetch(KernelGlobals kg, object_prim_offset_tag, const uint object)
+{
+  return cycles_light_word(light_tree_object_word(kg, object) + CYCLES_WEBGPU_TREE_OBJECT_PRIM_OFFSET);
+}
+
+ccl_device_inline uint light_fetch(KernelGlobals kg, object_lookup_offset_tag, const uint object)
+{
+  return cycles_light_word(light_tree_object_word(kg, object) +
+                           CYCLES_WEBGPU_TREE_OBJECT_LOOKUP_OFFSET);
+}
+
+ccl_device_inline uint light_fetch(KernelGlobals kg, light_to_tree_tag, const uint object)
+{
+  return cycles_light_word(light_tree_object_word(kg, object) + CYCLES_WEBGPU_TREE_OBJECT_TO_TREE);
+}
+
+ccl_device_inline uint light_fetch(KernelGlobals kg, triangle_to_tree_tag, const uint index)
+{
+  return cycles_light_word(kg->tree_triangle_to_tree_offset + index);
+}
+
+ccl_device_inline packed_uint3 light_fetch(KernelGlobals kg, tri_vindex_tag, const uint prim)
+{
+  const uint vertex = 3 * light_tree_triangle_index(kg, prim);
+  return make_uint3(vertex, vertex + 1, vertex + 2);
+}
+
+ccl_device_inline packed_float3 light_fetch(KernelGlobals kg, tri_verts_tag, const uint index)
+{
+  return light_tree_word_vector(kg->tree_triangle_offset +
+                                (index / 3) * CYCLES_WEBGPU_TREE_TRIANGLE_WORDS +
+                                3 * (index % 3));
+}
+
+ccl_device_inline uint light_fetch(KernelGlobals kg, tri_shader_tag, const uint prim)
+{
+  const uint index = light_tree_triangle_index(kg, prim);
+  return cycles_light_word(kg->tree_triangle_offset + index * CYCLES_WEBGPU_TREE_TRIANGLE_WORDS +
+                           CYCLES_WEBGPU_TREE_TRIANGLE_SHADER);
+}
+
+ccl_device_inline KernelShader light_fetch(KernelGlobals kg, shaders_tag, const uint index)
+{
+  KernelShader shader{};
+  shader.flags = std::bit_cast<int>(
+      cycles_light_word(light_tree_shader_word(kg, index) + CYCLES_WEBGPU_TREE_SHADER_FLAGS));
+  return shader;
+}
+
 ccl_device_inline uint light_tree_lamp_word(KernelGlobals kg, const uint lamp)
 {
   return kg->tree_lamp_offset + lamp * CYCLES_WEBGPU_TREE_LAMP_WORDS;
@@ -83,8 +177,18 @@ ccl_device_inline KernelLightTreeEmitter light_fetch(KernelGlobals kg, light_tre
   emitter.theta_o = light_tree_word_float(word + CYCLES_WEBGPU_TREE_EMITTER_THETA_O);
   emitter.theta_e = light_tree_word_float(word + CYCLES_WEBGPU_TREE_EMITTER_THETA_E);
   emitter.energy = light_tree_word_float(word + CYCLES_WEBGPU_TREE_EMITTER_ENERGY);
-  emitter.light.id = std::bit_cast<int>(cycles_light_word(word + CYCLES_WEBGPU_TREE_EMITTER_LIGHT));
   emitter.object_id = std::bit_cast<int>(cycles_light_word(word + CYCLES_WEBGPU_TREE_EMITTER_OBJECT));
+  const int id = std::bit_cast<int>(cycles_light_word(word + CYCLES_WEBGPU_TREE_EMITTER_LIGHT));
+  const uint detail = cycles_light_word(word + CYCLES_WEBGPU_TREE_EMITTER_DETAIL);
+  if (id < 0) {
+    emitter.light.id = id;
+  }
+  else if (emitter.object_id == OBJECT_NONE) {
+    emitter.mesh = {id, std::bit_cast<int>(detail)};
+  }
+  else {
+    emitter.triangle = {id, EmissionSampling(detail)};
+  }
   emitter.visibility_flag = std::bit_cast<int>(
       cycles_light_word(word + CYCLES_WEBGPU_TREE_EMITTER_VISIBILITY));
   emitter.bit_trail = std::bit_cast<int>(cycles_light_word(word + CYCLES_WEBGPU_TREE_EMITTER_BIT_TRAIL));
@@ -93,10 +197,19 @@ ccl_device_inline KernelLightTreeEmitter light_fetch(KernelGlobals kg, light_tre
 
 ccl_device_inline void setup_light_tree(LightGlobals &globals, const uint descriptor)
 {
+  globals.data.kernel_features = 0;
   globals.data.integrator.use_direct_light = true;
+  globals.data.integrator.use_light_tree = true;
   globals.tree_lamp_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_LAMPS);
   globals.tree_node_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_NODES);
   globals.tree_emitter_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_EMITTERS);
+  globals.tree_object_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_OBJECTS);
+  globals.tree_triangle_indices_offset = cycles_light_word(descriptor +
+                                                            CYCLES_WEBGPU_TREE_TRIANGLE_INDICES);
+  globals.tree_triangle_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_TRIANGLES);
+  globals.tree_shader_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_SHADERS);
+  globals.tree_triangle_to_tree_offset = cycles_light_word(descriptor +
+                                                            CYCLES_WEBGPU_TREE_TRIANGLE_TO_TREE);
 }
 
 }  // namespace ccl
@@ -104,20 +217,6 @@ ccl_device_inline void setup_light_tree(LightGlobals &globals, const uint descri
 #include "kernel/light/tree.h"
 
 namespace ccl {
-
-ccl_device_inline bool webgpu_light_tree_select(KernelGlobals kg,
-                                     const float rand,
-                                     const float3 P,
-                                     const float3 N,
-                                     const int runtime_flags,
-                                     LightSample *light)
-{
-  if (!light_tree_sample<false>(kg, rand, P, N, 0.0f, OBJECT_NONE, runtime_flags, light)) {
-    return false;
-  }
-  light->prim = ~light_fetch(kg, light_tree_emitters_tag{}, light->emitter_id).light.id;
-  return true;
-}
 
 ccl_device_inline float webgpu_light_tree_pdf(KernelGlobals kg,
                                     const float3 P,

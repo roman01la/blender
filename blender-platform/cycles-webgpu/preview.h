@@ -29,6 +29,10 @@ class WebGPUPreview {
 
   void prepare(const Scene &scene, bool scene_changed);
   void reset();
+  bool uses_volume() const
+  {
+    return volume_;
+  }
   bool begin_batch(const BufferParams &params,
                    int start_sample,
                    int samples_num,
@@ -55,6 +59,7 @@ class WebGPUPreview {
   std::vector<uint32_t> sampling_;
   bool scene_checked_ = false;
   bool scene_supported_ = false;
+  bool volume_ = false;
   bool scene_pending_ = false;
   bool reset_pending_ = true;
   bool failed_ = false;

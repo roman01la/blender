@@ -58,17 +58,26 @@ void main(uint3 id : SV_DispatchThreadID)
   const float3 throughput = __builtin_bit_cast(
       float3, uint3(path_words[weight], path_words[weight + 1], path_words[weight + 2]));
   float4 world, area;
+  uint unused_hair_lcg;
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
   const uint mis_normal_word = path + CYCLES_WEBGPU_PATH_MIS_ORIGIN_N;
+  uint volume_segment_length = 0u;
+#  ifdef CYCLES_WEBGPU_VOLUME_FORWARD
+  if ((ray.w & CYCLES_WEBGPU_VOLUME_SCATTER_VISIBILITY) != 0u) {
+    volume_segment_length = ray_words[CYCLES_WEBGPU_RAY_VOLUME_MIS_LENGTH(ray_words[0], lane)];
+  }
+#  endif
   const uint4 mis_origin_normal = uint4(path_words[mis_normal_word],
                                        path_words[mis_normal_word + 1],
-                                       path_words[mis_normal_word + 2], 0);
+                                       path_words[mis_normal_word + 2], volume_segment_length);
 #endif
   cycles_wavefront_light(no_surface, no_surface, no_surface, no_surface, no_surface, no_surface,
                          closest, ray, origin, state,
-                         uint4(0, 0, 0, path_words[path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE]),
+                         uint4(0, 0, 0, path_words[path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE] &
+                                            CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK),
                          0u,
-                         no_material, no_material, no_material, no_material, world, area
+                         no_material, no_material, no_material, no_material, no_material,
+                         world, area, unused_hair_lcg
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
                          , mis_origin_normal, float4(throughput, 0.0f)
 #endif

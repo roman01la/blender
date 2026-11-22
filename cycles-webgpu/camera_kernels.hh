@@ -25,4 +25,5 @@ void cycles_camera_ray(UInt4 pixel,
                        Float4 clip,
                        Float4 &origin,
                        Float4 &direction,
-                       unsigned int &rng_pixel);
+                       unsigned int &rng_pixel,
+                       float &dD);

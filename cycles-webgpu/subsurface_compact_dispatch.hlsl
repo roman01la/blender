@@ -35,7 +35,8 @@ extern void cycles_subsurface_walk(float4 entry, float4 direction, float4 normal
                                    float4 albedo, float4 radius, float4 weight,
                                    uint4 rng, uint4 surface, out uint4 hit, out float4 coordinates,
                                    out float4 exit_direction, out float4 throughput,
-                                   float4 geometric, float4 shading_normal, out float4 exit_origin);
+                                   float4 geometric, uint backfacing, float4 shading_normal,
+                                   out float4 exit_origin, out uint exit_flags);
 
 float4 load_point(uint offset, float w)
 {
@@ -56,7 +57,7 @@ void main(uint3 id : SV_DispatchThreadID)
   const uint normals = 8 * ray_words[0] + surface;
   const uint path = lane * CYCLES_WEBGPU_PATH_WORDS;
   const uint weight = path + CYCLES_WEBGPU_PATH_THROUGHPUT;
-  const uint steps = path + CYCLES_WEBGPU_PATH_SUBSURFACE_STEPS;
+  const uint steps = path + CYCLES_WEBGPU_PATH_EXTRA_RNG_STEPS;
   const uint material = CYCLES_WEBGPU_MATERIAL_VECTORS * lane;
   const float4 base = materials[material];
   const float4 specular = materials[material + 1];
@@ -76,12 +77,13 @@ void main(uint3 id : SV_DispatchThreadID)
   const uint4 entry_hit = uint4(hit_words[surface + 1], hit_words[surface + 2], 0, 0);
   uint4 hit;
   float4 coordinates, direction, throughput, origin;
+  uint exit_flags;
   cycles_subsurface_walk(load_point(surface, 0.0f), incident,
                          load_point(normals + 4, glass.z),
                          float4(__builtin_elementwise_min(base.xyz, float3(1, 1, 1)), glass.y),
                          radius, input_throughput, rng, entry_hit, hit, coordinates, direction,
-                         throughput, load_point(normals, 0.0f), load_point(surface + 4, 0.0f),
-                         origin);
+                         throughput, load_point(normals, 0.0f), points[surface + 3] == 2u,
+                         load_point(surface + 4, 0.0f), origin, exit_flags);
 
   const uint queued = path + CYCLES_WEBGPU_PATH_QUEUED_KERNEL;
   if (hit.x == 0u) {
@@ -94,7 +96,7 @@ void main(uint3 id : SV_DispatchThreadID)
   path_words[weight + 1] = weight_bits.y;
   path_words[weight + 2] = weight_bits.z;
   path_words[steps] += 2u;
-  path_words[path + CYCLES_WEBGPU_PATH_FLAGS] |= CYCLES_WEBGPU_PATH_SUBSURFACE_RANDOM_WALK;
+  path_words[path + CYCLES_WEBGPU_PATH_FLAGS] |= exit_flags;
   path_words[path + CYCLES_WEBGPU_PATH_SURFACE_RR] = __builtin_bit_cast(uint, 1.0f);
   hit_words[surface] = hit.x;
   hit_words[surface + 1] = hit.y;
@@ -104,7 +106,7 @@ void main(uint3 id : SV_DispatchThreadID)
   hit_words[surface + 4] = coords.x;
   hit_words[surface + 5] = coords.y;
   hit_words[surface + 6] = coords.z;
-  hit_words[surface + 7] = 1u; // Subsurface exit.
+  hit_words[surface + CYCLES_WEBGPU_HIT_SPECIAL] = CYCLES_WEBGPU_HIT_SUBSURFACE_EXIT;
   const uint4 ray_origin = __builtin_bit_cast(uint4, origin);
   const uint4 ray_direction = __builtin_bit_cast(uint4, direction);
   ray_words[ray] = ray_origin.x;

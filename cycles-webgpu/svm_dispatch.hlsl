@@ -7,10 +7,16 @@ StructuredBuffer<uint> svm_words : register(t0);
 StructuredBuffer<uint> surface_words : register(t1);
 StructuredBuffer<uint> ray_words : register(t2);
 RWStructuredBuffer<float4> materials : register(u3);
+#ifdef CYCLES_WEBGPU_SCENE_QUERIES
+StructuredBuffer<uint> scene_words : register(t4);
+#else
 StructuredBuffer<uint> hit_words : register(t4);
+#endif
 StructuredBuffer<uint> path_words : register(t5);
 StructuredBuffer<uint> camera_words : register(t6);
 StructuredBuffer<uint> metadata_words : register(t7);
+
+#include "svm_context.hlsl"
 
 #ifdef CYCLES_WEBGPU_COMPACT_PATHS
 #include "wavefront_queue.hlsl"
@@ -21,10 +27,47 @@ uint cycles_svm_word(uint index)
   return svm_words[index];
 }
 
+#ifdef CYCLES_WEBGPU_SCENE_QUERIES
+uint cycles_scene_word(uint index)
+{
+  return scene_words[index];
+}
+
+uint cycles_surface_word(uint index)
+{
+  return metadata_words[index];
+}
+
+uint cycles_camera_sample_word(uint index)
+{
+  return camera_words[CYCLES_WEBGPU_QUERY_CAMERA_OFFSET + index];
+}
+#endif
+
+uint cycles_svm_hit_word(uint index)
+{
+#ifdef CYCLES_WEBGPU_SCENE_QUERIES
+  return surface_words[3 * CYCLES_WEBGPU_QUERY_HIT_WORDS * ray_words[0] + index];
+#else
+  return hit_words[index];
+#endif
+}
+
 extern void cycles_svm_material(uint shader, uint primitive, float u, float v,
-                                uint lane,
+                                uint lane, uint film_aov,
                                 out float4 base, out float4 specular, out float4 layers,
                                 out float4 glass, out float4 subsurface, out float4 emission);
+
+void cycles_svm_write_aov(uint lane, uint offset, uint color, float4 value)
+{
+  const uint colors = camera_words[CYCLES_WEBGPU_CAMERA_AOV_COLORS];
+  const uint values = camera_words[CYCLES_WEBGPU_CAMERA_AOV_VALUES];
+  const uint slot = color != 0 ? offset / 4 : offset;
+  if (slot < (color != 0 ? colors : values)) {
+    const uint base = CYCLES_WEBGPU_MATERIAL_VECTORS * ray_words[0] + lane * (colors + values);
+    materials[base + (color != 0 ? slot : colors + slot)] += value;
+  }
+}
 
 uint4 cycles_svm_context(uint lane, uint field)
 {
@@ -35,13 +78,15 @@ uint4 cycles_svm_context(uint lane, uint field)
     const uint base = field == CYCLES_WEBGPU_SVM_POSITION ? surface :
                       field == CYCLES_WEBGPU_SVM_NORMAL ? surface + 4 :
                                                           8 * ray_words[0] + surface;
-    return uint4(surface_words[base], surface_words[base + 1], surface_words[base + 2], 0);
+    return uint4(surface_words[base], surface_words[base + 1], surface_words[base + 2],
+                 field == CYCLES_WEBGPU_SVM_POSITION ? surface_words[base + 3] : 0);
   }
   if (field == CYCLES_WEBGPU_SVM_DIRECTION) {
     return uint4(ray_words[ray + 4], ray_words[ray + 5], ray_words[ray + 6], 0);
   }
   if (field == CYCLES_WEBGPU_SVM_INTERSECTION) {
-    return uint4(hit_words[surface + 4], hit_words[surface + 5], hit_words[surface + 6],
+    return uint4(cycles_svm_hit_word(surface + 4), cycles_svm_hit_word(surface + 5),
+                 cycles_svm_hit_word(surface + 6),
                  surface_words[surface + 3]);
   }
   if (field == CYCLES_WEBGPU_SVM_BOUNCES) {
@@ -50,36 +95,42 @@ uint4 cycles_svm_context(uint lane, uint field)
                  path_words[path + CYCLES_WEBGPU_PATH_GLOSSY_BOUNCE],
                  path_words[path + CYCLES_WEBGPU_PATH_TRANSMISSION_BOUNCE]);
   }
-  if (field >= CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA && field < CYCLES_WEBGPU_SVM_WORLD_TO_NDC_END) {
-    const uint row = CYCLES_WEBGPU_CAMERA_SVM_OFFSET + 4 * (field - CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA);
-    return uint4(camera_words[row], camera_words[row + 1], camera_words[row + 2], camera_words[row + 3]);
+  if (field == CYCLES_WEBGPU_SVM_DIFFERENTIAL) {
+    if ((svm_words[1] & CYCLES_WEBGPU_SVM_PIXEL_WIREFRAME) == 0) {
+      return uint4(0, 0, 0, 0);
+    }
+    const uint base = CYCLES_WEBGPU_RAY_DIFFERENTIAL_BASE(ray_words[0], lane);
+    return uint4(ray_words[base], ray_words[base + 1], 0, 0);
   }
-  if (field >= CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD && field < CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD_END) {
-    const uint row = CYCLES_WEBGPU_CAMERA_TO_WORLD_OFFSET + 4 * (field - CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD);
-    return uint4(camera_words[row], camera_words[row + 1], camera_words[row + 2], camera_words[row + 3]);
+#ifdef CYCLES_WEBGPU_SCENE_QUERIES
+  if (field == CYCLES_WEBGPU_QUERY_RNG) {
+    const uint bounce = path_words[path + CYCLES_WEBGPU_PATH_BOUNCE];
+    const uint steps = path_words[path + CYCLES_WEBGPU_PATH_EXTRA_RNG_STEPS];
+    return uint4(ray_words[ray + CYCLES_WEBGPU_RAY_RNG_PIXEL],
+                 (bounce + steps + 1) * CYCLES_WEBGPU_PRNG_BOUNCE_NUM,
+                 path_words[path + CYCLES_WEBGPU_PATH_PIXEL + 2],
+                 path_words[path + CYCLES_WEBGPU_PATH_MIN_RAY_PDF]);
   }
-  if (field >= CYCLES_WEBGPU_SVM_OBJECT_TRANSFORM) {
-    const uint object = hit_words[surface + 2];
-    if (field < CYCLES_WEBGPU_SVM_OBJECT_INVERSE) {
-      const uint row = metadata_words[0] + 13 * object + 1 +
-                       4 * (field - CYCLES_WEBGPU_SVM_OBJECT_TRANSFORM);
-      return uint4(metadata_words[row], metadata_words[row + 1],
-                   metadata_words[row + 2], metadata_words[row + 3]);
-    }
-    const uint base = metadata_words[CYCLES_WEBGPU_SURFACE_OBJECT_SVM_OFFSET] +
-                      CYCLES_WEBGPU_SURFACE_OBJECT_WORDS * object;
-    if (field <= CYCLES_WEBGPU_SVM_OBJECT_COLOR) {
-      const uint row = base + 4 * (field - CYCLES_WEBGPU_SVM_OBJECT_INVERSE);
-      return uint4(metadata_words[row], metadata_words[row + 1],
-                   metadata_words[row + 2], metadata_words[row + 3]);
-    }
-    if (field == CYCLES_WEBGPU_SVM_MATERIAL_INDEX) {
-      const uint shader = surface_words[surface + 7] & CYCLES_WEBGPU_SVM_SHADER_ID_MASK;
-      const uint shader_pass = metadata_words[CYCLES_WEBGPU_SURFACE_SHADER_PASS_OFFSET] + shader;
-      const int pass_id = __builtin_bit_cast(int, metadata_words[shader_pass]);
-      return uint4(0, 0, 0, __builtin_bit_cast(uint, float(pass_id)));
-    }
-    return uint4(0, 0, 0, metadata_words[base + (field == CYCLES_WEBGPU_SVM_OBJECT_INDEX ? 16 : 17)]);
+  if (field == CYCLES_WEBGPU_QUERY_HIT) {
+    return uint4(cycles_svm_hit_word(surface), cycles_svm_hit_word(surface + 1),
+                 cycles_svm_hit_word(surface + 2), cycles_svm_hit_word(surface + 3));
+  }
+#endif
+#ifdef CYCLES_WEBGPU_COMPACT_PATHS
+  if (field == CYCLES_WEBGPU_SVM_TRIANGLE_DPDU || field == CYCLES_WEBGPU_SVM_TRIANGLE_DPDV) {
+#  ifdef CYCLES_WEBGPU_SCENE_QUERIES
+    const uint tangent_block = 4 * 8 * ray_words[0];
+#  else
+    const uint tangent_block = 3 * 8 * ray_words[0];
+#  endif
+    const uint tangent = tangent_block + CYCLES_WEBGPU_SURFACE_HAIR_WORDS * lane +
+                         (field == CYCLES_WEBGPU_SVM_TRIANGLE_DPDV ? 4 : 0);
+    return uint4(surface_words[tangent], surface_words[tangent + 1], surface_words[tangent + 2], 0);
+  }
+#endif
+  if (field >= CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA) {
+    return cycles_svm_scene_context(field, cycles_svm_hit_word(surface + 2),
+                                   surface_words[surface + 7]);
   }
   return uint4(ray_words[ray + 8], path_words[path + CYCLES_WEBGPU_PATH_FLAGS],
                path_words[path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE], 0);
@@ -102,20 +153,36 @@ void main(uint3 id : SV_DispatchThreadID)
 
   const uint base = 8 * lane;
   const uint surface_status = surface_words[base + 3];
+  bool film_aov = false;
+  if ((svm_words[1] & CYCLES_WEBGPU_SVM_AOV) != 0) {
+    const uint path = CYCLES_WEBGPU_PATH_WORDS * lane;
+    const uint flags = path_words[path + CYCLES_WEBGPU_PATH_FLAGS];
+    const uint slots = camera_words[CYCLES_WEBGPU_CAMERA_AOV_COLORS] +
+                       camera_words[CYCLES_WEBGPU_CAMERA_AOV_VALUES];
+    film_aov = slots != 0 && path_words[path + CYCLES_WEBGPU_PATH_BOUNCE] == 0 &&
+               (flags & CYCLES_WEBGPU_PATH_TRANSPARENT_BACKGROUND) != 0;
+    if (film_aov) {
+      const uint aov = CYCLES_WEBGPU_MATERIAL_VECTORS * ray_words[0] + lane * slots;
+      for (uint i = 0; i < slots; ++i) {
+        materials[aov + i] = float4(0, 0, 0, 0);
+      }
+    }
+  }
   float4 result = float4(0, 0, 0, 0);
   float4 specular = float4(0, 0, 0, 0);
   float4 layers = float4(0, 0, 0, 0);
   float4 glass = float4(0, 0, 0, 0);
   float4 subsurface = float4(0, 0, 0, 0);
   float4 emission = float4(0, 0, 0, 0);
-  if (hit_words[base + 7] != 0) {
+  const uint special_hit = cycles_svm_hit_word(base + CYCLES_WEBGPU_HIT_SPECIAL);
+  if (special_hit == CYCLES_WEBGPU_HIT_SUBSURFACE_EXIT) {
     // Cycles replaces the entry material with white diffuse scattering at the exit.
     result = float4(1, 1, 1, 1);
   }
-  else if (surface_status == 1 || surface_status == 2) {
-    cycles_svm_material(surface_words[base + 7], hit_words[base + 1],
-                        __builtin_bit_cast(float, hit_words[base + 5]),
-                        __builtin_bit_cast(float, hit_words[base + 6]), lane,
+  else if (special_hit == 0u && (surface_status == 1 || surface_status == 2)) {
+    cycles_svm_material(surface_words[base + 7], cycles_svm_hit_word(base + 1),
+                        __builtin_bit_cast(float, cycles_svm_hit_word(base + 5)),
+                        __builtin_bit_cast(float, cycles_svm_hit_word(base + 6)), lane, uint(film_aov),
                         result, specular, layers, glass, subsurface, emission);
   }
   else if (surface_status != 0) {
@@ -127,5 +194,5 @@ void main(uint3 id : SV_DispatchThreadID)
   materials[material + 2] = layers;
   materials[material + 3] = glass;
   materials[material + 4] = subsurface;
-  materials[material + 5] = emission;
+  materials[material + CYCLES_WEBGPU_MATERIAL_EMISSION_SLOT] = emission;
 }

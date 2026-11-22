@@ -54,6 +54,59 @@ for Closest, Linear, Cubic, and Smart interpolation.
     python3 material-tests/check_udim.py --browser-build /path/to/browser/package \
       --native /path/to/Blender --output /tmp/udim-results
 
+Check Cycles Light Tree triangle lights against desktop CPU Cycles. The cases
+cover front and back sampling, a tree with no lamps, transformed shared meshes,
+and glossy emitter hits with and without multiple importance sampling.
+Textured cases exercise camera-hidden image and procedural emitters, flipped
+UVs, and transformed instances.
+
+    python3 material-tests/check_triangle_emitters.py --browser-build /path/to/browser/package \
+      --native /path/to/Blender --output /tmp/triangle-emitter-results
+
+Compare Cycles Ambient Occlusion, Bevel and Raycast with desktop Metal. The
+fixtures exercise occluded and unoccluded geometry, local rays, and both hits
+and misses. The tests combine queries with Noise, Gabor, advanced Voronoi, and
+projected images, including graphs with all three procedural textures. They
+check full-image error and confirm GPU execution.
+
+    python3 material-tests/check_scene_queries.py --browser-build /path/to/browser/package \
+      --native /path/to/Blender --output /tmp/scene-query-results
+
+Compare Cycles Transparent BSDF with desktop Metal. The cases cover image and
+procedural tint, film alpha, colored shadows, and secondary Ambient Occlusion.
+
+    python3 material-tests/check_transparency.py --browser-build /path/to/browser/package \
+      --native /path/to/Blender --output /tmp/transparency-results
+
+Check mixed Transparent BSDF closures against desktop CPU Cycles. The fixtures
+cover Lambert and metallic Principled, varying weights, film alpha, and shadows.
+
+    python3 material-tests/check_mixed_transparency.py --browser-build /path/to/browser/package \
+      --native /path/to/Blender --output /tmp/mixed-transparency-results
+
+Check six Hair modes and both Christensen–Burley nodes against desktop CPU
+Cycles with 128 samples and the mixed-light HDRI fixture.
+
+    python3 material-tests/check_surface_scattering.py --browser-build /path/to/browser/package \
+      --native /path/to/Blender --output /tmp/surface-scattering-results
+
+Check all five phases of Volume Scatter and Volume Coefficients plus
+Principled Volume against desktop CPU Cycles. The comparison defaults to
+512 samples and four volume bounces with an area light, a point light, and an
+importance-sampled HDRI.
+Pass `--lighting area-world` to use the default material audit lighting.
+
+    python3 material-tests/check_volume_scattering.py --browser-build /path/to/browser/package \
+      --native /path/to/Blender --output /tmp/volume-scattering-results
+
+Check intersecting homogeneous media, a camera inside two media, and a stock
+VDB smoke grid with linear and cubic filtering. The denoising cases compare
+with desktop CPU OIDN and observe the browser's GPU queue through tracing,
+albedo and normal prefiltering, denoising, and film export.
+
+    python3 material-tests/check_volume_transport.py --browser-build /path/to/browser/package \
+      --native /path/to/Blender --output /tmp/volume-transport-results
+
 The report includes a diffuse GPU control for each batch. Cycles records an actual
 scheduler completion or an explicit CPU fallback in the browser and a GPU path
 tracing device in desktop Blender. Eevee checks the graphics backend, shader errors,

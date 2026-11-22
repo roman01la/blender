@@ -16,7 +16,14 @@ RWStructuredBuffer<float4> samples : register(u5);
 #ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
 #  include "../blender-platform/cycles-webgpu/material_layout.h"
 #  include "../blender-platform/cycles-webgpu/path_state_layout.h"
+#  ifdef CYCLES_WEBGPU_LIGHT_TREE
+#    include "../blender-platform/cycles-webgpu/lighting_layout.h"
+#  endif
+#  if defined(CYCLES_WEBGPU_LIGHT_TREE) || !defined(CYCLES_WEBGPU_EXCLUDE_HAIR)
+RWStructuredBuffer<float4> materials : register(u6);
+#  else
 StructuredBuffer<float4> materials : register(t6);
+#  endif
 StructuredBuffer<uint> path_words : register(t7);
 #endif
 
@@ -34,6 +41,11 @@ uint cycles_light_word(uint index)
 
 #ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
 #  include "wavefront_light.hlsl"
+#  ifdef CYCLES_WEBGPU_LIGHT_TREE
+extern float cycles_triangle_hit_mis(uint4 hit, uint4 position, uint4 geometric,
+                                    uint4 ray, uint4 origin, uint4 path,
+                                    uint4 mis_origin_normal);
+#  endif
 #else
 extern uint cycles_direct_light(uint4 position, uint4 normal, uint4 primary_hit,
                                 out float4 result);
@@ -70,7 +82,8 @@ void main(uint3 id : SV_DispatchThreadID)
   const uint4 sampling = uint4(ray_words[ray_base + CYCLES_WEBGPU_RAY_RNG_PIXEL],
                                path_words[pixel_base + 2],
                                path_words[path_base + CYCLES_WEBGPU_PATH_SURFACE_RR],
-                               path_words[path_base + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE]);
+                               path_words[path_base + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE] &
+                                   CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK);
   const uint normal_base = 8 * ray_words[0] + base;
   const uint4 geometric = uint4(surface_words[normal_base], surface_words[normal_base + 1],
                                  surface_words[normal_base + 2], surface_words[normal_base + 3]);
@@ -85,26 +98,48 @@ void main(uint3 id : SV_DispatchThreadID)
   float4 area_result;
 #ifdef CYCLES_WEBGPU_DEFER_SHADOW
   uint4 shadow_origin, shadow_direction, shadow_options;
+#  ifdef CYCLES_WEBGPU_LIGHT_TREE
+  uint4 sampled_emission;
+#  endif
 #endif
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
   const uint mis_normal_word = path_base + CYCLES_WEBGPU_PATH_MIS_ORIGIN_N;
+  uint volume_segment_length = 0u;
+#  ifdef CYCLES_WEBGPU_VOLUME_FORWARD
+  if ((ray.w & CYCLES_WEBGPU_VOLUME_SCATTER_VISIBILITY) != 0u) {
+    volume_segment_length = ray_words[CYCLES_WEBGPU_RAY_VOLUME_MIS_LENGTH(ray_words[0], lane)];
+  }
+#  endif
   const uint4 mis_origin_normal = uint4(path_words[mis_normal_word],
                                        path_words[mis_normal_word + 1],
-                                       path_words[mis_normal_word + 2], 0);
+                                       path_words[mis_normal_word + 2], volume_segment_length);
   const uint weight = path_base + CYCLES_WEBGPU_PATH_THROUGHPUT;
   const float4 throughput = __builtin_bit_cast(
       float4, uint4(path_words[weight], path_words[weight + 1], path_words[weight + 2], 0));
+  const uint emission_slot = material + CYCLES_WEBGPU_MATERIAL_EMISSION_SLOT;
+  const float4 emission = materials[emission_slot];
+  if (closest.x != 0 && (position.w == 1 || position.w == 2) &&
+      (emission.x != 0.0f || emission.y != 0.0f || emission.z != 0.0f)) {
+    const float mis = cycles_triangle_hit_mis(closest, position, geometric, ray, origin, path,
+                                             mis_origin_normal);
+    materials[emission_slot] = float4(emission.xyz * mis, emission.w);
+  }
 #endif
+  uint hair_lcg;
+  const float4 hair = materials[material + 4];
   cycles_wavefront_light(position, normal, spec_normal, geometric, shadow_along, shadow_opposite,
                          closest, ray, origin, path, sampling,
-                         path_words[path_base + CYCLES_WEBGPU_PATH_SUBSURFACE_STEPS],
+                         path_words[path_base + CYCLES_WEBGPU_PATH_EXTRA_RNG_STEPS],
                          materials[material], materials[material + 1], materials[material + 2],
-                         materials[material + 3], result, area_result
+                         materials[material + 3], hair, result, area_result, hair_lcg
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
                          , mis_origin_normal, throughput
 #endif
 #ifdef CYCLES_WEBGPU_DEFER_SHADOW
                          , shadow_origin, shadow_direction, shadow_options
+#  ifdef CYCLES_WEBGPU_LIGHT_TREE
+                         , sampled_emission
+#  endif
 #endif
                          );
 #ifdef CYCLES_WEBGPU_DEFER_SHADOW
@@ -113,7 +148,21 @@ void main(uint3 id : SV_DispatchThreadID)
   shadow_words[shadow + 1] = shadow_direction;
   shadow_words[shadow + 2] = shadow_options;
   shadow_words[shadow + 3] = geometric;
+#  ifdef CYCLES_WEBGPU_LIGHT_TREE
+  const uint descriptor = light_words[CYCLES_WEBGPU_LIGHT_TREE_OFFSET];
+  if (light_words[descriptor + CYCLES_WEBGPU_TREE_TEXTURED_EMITTERS] != 0) {
+    /* The optional tail stores triangle ID, shader, and barycentrics for sampled SVM.
+     * Clear the primitive sentinel even when a path did not sample textured emission. */
+    shadow_words[4 * ray_words[0] + lane] = sampled_emission;
+  }
+#  endif
 #endif
+#  ifndef CYCLES_WEBGPU_EXCLUDE_HAIR
+  if (materials[material].w == CYCLES_WEBGPU_MATERIAL_HAIR_HUANG) {
+    materials[material + 4] = float4(hair.xy, float(hair_lcg & 0xffffu),
+                                     float(hair_lcg >> 16u));
+  }
+#  endif
   samples[ray_words[0] + lane] = area_result;
 #else
   cycles_direct_light(position, normal, hit, result);

@@ -16,13 +16,16 @@ uint cycles_forward_light_hits(float4 light)
   return light.w < 0.0f ? uint(-light.w) : uint(light.w > 0.0f);
 }
 
-#ifndef CYCLES_WEBGPU_DENOISE_SURFACE
+#if !defined(CYCLES_WEBGPU_DENOISE_SURFACE) && !defined(CYCLES_WEBGPU_TRANSPARENT_SHADOW)
 bool cycles_trace_past_area(uint path, uint hits)
 {
   /* Cycles counts a light hit as transparent without advancing the RNG. */
   const uint counter_word = path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE;
-  const uint transparent_bounce = path_words[counter_word] + hits;
-  path_words[counter_word] = transparent_bounce;
+  const uint packed = path_words[counter_word];
+  const uint transparent_bounce = (packed & CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK) + hits;
+  path_words[counter_word] = (packed & ~CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK) |
+                             __builtin_elementwise_min(
+                                 transparent_bounce, CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK);
   return cycles_trace_past_area_limit(transparent_bounce);
 }
 

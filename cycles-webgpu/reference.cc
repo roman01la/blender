@@ -164,8 +164,9 @@ int main(int argc, char **argv)
                                            index, camera[7].z);
       Float4 origin, direction;
       unsigned int rng_pixel;
+      float dD;
       cycles_camera_ray(pixel, camera[0], camera[1], camera[2], camera[3], camera[4], camera[5],
-                        camera[6], camera[7], origin, direction, rng_pixel);
+                        camera[6], camera[7], origin, direction, rng_pixel, dD);
       std::cout << '[';
       write_range(std::array{pixel.x, pixel.y, pixel.z, pixel.w});
       std::cout << ',';

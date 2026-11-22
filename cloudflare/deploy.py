@@ -18,6 +18,7 @@ WRANGLER = ["npx", "--yes", "wrangler@4.160.0"]
 R2_FILES = {
     "blender.wasm": ("application/wasm", "-6"),
     "blender-assets.data": ("application/octet-stream", "-3"),
+    "blender-cycles-webgpu.data": ("application/octet-stream", "-3"),
 }
 STATIC_LIMIT = 25 * 1024**2
 WRANGLER_R2_LIMIT = 300 * 1024**2

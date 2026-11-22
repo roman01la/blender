@@ -61,6 +61,50 @@ def package(installation: Path, output: Path, python_process: Path | None = None
         svm_core = cycles_webgpu.resolve() / "svm-compact-core.wgsl"
         if svm_core.is_file():
             shaders.append(svm_core)
+        query_shaders = [cycles_webgpu.resolve() / name for name in (
+            "svm-query.wgsl", "surface-query.wgsl",
+        )]
+        if all(shader.is_file() for shader in query_shaders):
+            shaders.extend(query_shaders)
+            for name in ("svm-query-textures.wgsl", "svm-query-advanced.wgsl"):
+                query = cycles_webgpu.resolve() / name
+                if query.is_file():
+                    shaders.append(query)
+        transparent_shadow = cycles_webgpu.resolve() / "intersect-shadow-transparent.wgsl"
+        if transparent_shadow.is_file():
+            shaders.append(transparent_shadow)
+        varying_shadow = cycles_webgpu.resolve() / "intersect-shadow-transparent-materials.wgsl"
+        if varying_shadow.is_file():
+            shaders.append(varying_shadow)
+        absorption_shaders = [cycles_webgpu.resolve() / name for name in (
+            "absorption-compact.wgsl", "absorption-shadow.wgsl",
+        )]
+        if all(shader.is_file() for shader in absorption_shaders):
+            shaders.extend(absorption_shaders)
+        volume_shaders = [cycles_webgpu.resolve() / name for name in (
+            "volume-interval.wgsl", "volume-scatter.wgsl", "volume-scatter-shadow.wgsl",
+            "volume-extinction-shadow.wgsl", "shade-background-tree-volume.wgsl",
+            "wavefront-light-deferred-reflection-tree-volume.wgsl",
+        )]
+        if all(shader.is_file() for shader in volume_shaders):
+            shaders.extend(volume_shaders)
+        volume_guide_shaders = [cycles_webgpu.resolve() / name for name in (
+            "volume-scatter-guides.wgsl", "volume-scatter-shadow-guides.wgsl",
+            "shade-background-tree-guides-volume.wgsl",
+        )]
+        if all(shader.is_file() for shader in volume_guide_shaders):
+            shaders.extend(volume_guide_shaders)
+        grid_shaders = [cycles_webgpu.resolve() / name for name in (
+            "volume-scatter-grid.wgsl", "volume-scatter-shadow-grid.wgsl",
+            "volume-extinction-shadow-grid.wgsl",
+        )]
+        if all(shader.is_file() for shader in grid_shaders):
+            shaders.extend(grid_shaders)
+        grid_guide_shaders = [cycles_webgpu.resolve() / name for name in (
+            "volume-scatter-grid-guides.wgsl", "volume-scatter-shadow-grid-guides.wgsl",
+        )]
+        if all(shader.is_file() for shader in grid_guide_shaders):
+            shaders.extend(grid_guide_shaders)
         shaders.extend(port / "cycles-webgpu" / name for name in (
             "film.wgsl", "path-state.wgsl", "wavefront-queue.wgsl",
         ))
@@ -82,9 +126,14 @@ def package(installation: Path, output: Path, python_process: Path | None = None
         deferred_lighting = [cycles_webgpu.resolve() / name for name in (
             "wavefront-light-deferred.wgsl", "wavefront-light-deferred-reflection.wgsl",
             "wavefront-light-deferred-multi-point.wgsl", "wavefront-light-deferred-tree.wgsl",
+            "wavefront-light-deferred-hair.wgsl", "wavefront-light-deferred-multi-point-hair.wgsl",
+            "wavefront-light-deferred-tree-hair.wgsl",
         )] + [multi_point]
         if want_light_tree:
             shaders.extend(light_tree)
+            sampled_emission = cycles_webgpu.resolve() / "sampled-emission.wgsl"
+            if sampled_emission.is_file():
+                shaders.append(sampled_emission)
         if want_light_tree or any(shader.exists() for shader in deferred_lighting):
             shaders.append(cycles_webgpu.resolve() / "intersect-shadow.wgsl")
             shaders.extend(shader for shader in deferred_lighting if shader.exists())
@@ -105,6 +154,11 @@ def package(installation: Path, output: Path, python_process: Path | None = None
                 shaders.append(cycles_webgpu.resolve() / "shade-background-guides.wgsl")
             if want_light_tree:
                 shaders.append(cycles_webgpu.resolve() / "shade-background-tree-guides.wgsl")
+        for name in ("path-update-closures.wgsl", "path-update-reflection-closures.wgsl",
+                     "denoise-surface-closures.wgsl"):
+            variant = cycles_webgpu.resolve() / name
+            if variant.is_file():
+                shaders.append(variant)
         for shader in shaders:
             if not shader.is_file() or not shader.stat().st_size:
                 raise ValueError(f"missing or empty Cycles WebGPU shader: {shader}")

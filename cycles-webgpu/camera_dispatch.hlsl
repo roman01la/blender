@@ -36,7 +36,8 @@ extern void cycles_camera_ray(uint4 pixel,
                               float4 clip,
                               out float4 origin,
                               out float4 direction,
-                              out uint rng_pixel);
+                              out uint rng_pixel,
+                              out float dD);
 
 #ifdef CYCLES_WEBGPU_ADAPTIVE_CAMERA_RAYS
 extern uint cycles_adaptive_sample_class(uint sample);
@@ -100,9 +101,10 @@ void main(uint3 id : SV_DispatchThreadID)
 #else
   float4 origin, direction;
   uint rng_pixel;
+  float dD;
   cycles_camera_ray(
       work_pixel, camera[0], camera[1], camera[2], camera[3],
-      camera[4], camera[5], camera[6], clip, origin, direction, rng_pixel);
+      camera[4], camera[5], camera[6], clip, origin, direction, rng_pixel, dD);
 
   pixel_samples[index] = work_pixel;
 #ifdef CYCLES_PRIMARY_RAY_QUEUE
@@ -132,6 +134,11 @@ void main(uint3 id : SV_DispatchThreadID)
   ray_words[base + 10] = 0xffffffffu;
 #  ifdef CYCLES_WEBGPU_STOCK_CAMERA
   ray_words[base + CYCLES_WEBGPU_RAY_RNG_PIXEL] = rng_pixel;
+  if (clip.w != 0.0f) {
+    const uint differential = CYCLES_WEBGPU_RAY_DIFFERENTIAL_BASE(ray_words[0], index);
+    ray_words[differential] = 0;
+    ray_words[differential + 1] = __builtin_bit_cast(uint, dD);
+  }
 #  else
   ray_words[base + CYCLES_WEBGPU_RAY_RNG_PIXEL] = 0u;
 #  endif

@@ -41,15 +41,25 @@ struct DenoisingParameters {
 }
 @group(0) @binding(10) var<storage, read> denoising_params: DenoisingParameters;
 
+struct AOVParameters {
+  color: vec2<u32>, // First film offset and number of color passes.
+  value: vec2<u32>, // First film offset and number of value passes.
+}
+@group(0) @binding(11) var<storage, read> aov_params: AOVParameters;
+
 const workgroup_size_x = 64u;
 const words_per_pixel = 5u;
 // Match path_state_layout.h and the compact ray queue layout.
 const path_words = 24u;
 const path_radiance = 3u;
 const path_queued_kernel = 7u;
+const path_bounce = 8u;
+const path_flags = 14u;
 const path_pixel = 18u;
 const path_terminated = 0u;
 const ray_words = 12u;
+const material_vectors = 6u;
+const transparent_background = 1u << 9u;
 const pass_unused = 0xffffffffu;
 
 fn add_component(index: u32, value: f32) {
@@ -131,32 +141,74 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>,
   resolved[pixel] = vec4<f32>(mean.rgb * params.exposure_multiplier, clamp(mean.a, 0.0, 1.0));
 }
 
-// The compact queue is kept until all newly terminated paths have retired.
-// Return the physical lane and the native Cycles film word for its pixel.
-fn retirement(index: u32) -> vec2<u32> {
+fn queued_lane(index: u32) -> u32 {
   let capacity = retire_rays[0];
   let queue_base = 1u + ray_words * capacity;
   if (index >= capacity || index >= retire_rays[queue_base]) {
-    return vec2<u32>(pass_unused);
+    return pass_unused;
   }
-
   let lane = retire_rays[queue_base + 1u + index];
-  let path = lane * path_words;
-  if (lane >= arrayLength(&completed_paths) / path_words ||
-      completed_paths[path + path_queued_kernel] != path_terminated) {
-    return vec2<u32>(pass_unused);
-  }
+  return select(lane, pass_unused, lane >= arrayLength(&completed_paths) / path_words);
+}
 
+fn film_pixel_offset(lane: u32) -> u32 {
+  let path = lane * path_words;
   let raster = vec2<u32>(completed_paths[path + path_pixel],
                          completed_paths[path + path_pixel + 1u]);
   let local_pixel = raster - render_buffer.bounds.xy;
   if (any(raster < render_buffer.bounds.xy) || any(local_pixel >= render_buffer.bounds.zw)) {
-    return vec2<u32>(pass_unused);
+    return pass_unused;
   }
 
   let pixel = render_buffer.placement.x + local_pixel.y * render_buffer.placement.y +
               local_pixel.x;
-  return vec2<u32>(lane, pixel * render_buffer.placement.z);
+  return pixel * render_buffer.placement.z;
+}
+
+// The compact queue is kept until all newly terminated paths have retired.
+// Return the physical lane and the native Cycles film word for its pixel.
+fn retirement(index: u32) -> vec2<u32> {
+  let lane = queued_lane(index);
+  if (lane == pass_unused ||
+      completed_paths[lane * path_words + path_queued_kernel] != path_terminated) {
+    return vec2<u32>(pass_unused);
+  }
+  let pixel = film_pixel_offset(lane);
+  return select(vec2<u32>(lane, pixel), vec2<u32>(pass_unused), pixel == pass_unused);
+}
+
+@compute @workgroup_size(workgroup_size_x)
+fn accumulate_aov(@builtin(global_invocation_id) id: vec3<u32>,
+                  @builtin(num_workgroups) groups: vec3<u32>) {
+  let lane = queued_lane(work_index(id, groups));
+  if (lane == pass_unused) {
+    return;
+  }
+  let path = lane * path_words;
+  if (completed_paths[path + path_bounce] != 0u ||
+      (completed_paths[path + path_flags] & transparent_background) == 0u) {
+    return;
+  }
+  let pixel = film_pixel_offset(lane);
+  if (pixel == pass_unused) {
+    return;
+  }
+  // Binding 1 is the SVM material buffer for this entry point.
+  let colors = aov_params.color.y;
+  let values = aov_params.value.y;
+  let first = material_vectors * retire_rays[0] + lane * (colors + values);
+  for (var i = 0u; i < colors; i++) {
+    let dest = pixel + aov_params.color.x + 4u * i;
+    let rgba = bitcast<vec4<f32>>(pixel_samples[first + i]);
+    add_component(dest, rgba.x);
+    add_component(dest + 1u, rgba.y);
+    add_component(dest + 2u, rgba.z);
+    add_component(dest + 3u, rgba.w);
+  }
+  for (var i = 0u; i < values; i++) {
+    let dest = pixel + aov_params.value.x + i;
+    add_component(dest, bitcast<f32>(pixel_samples[first + colors + i].x));
+  }
 }
 
 fn retired_contribution(lane: u32) -> vec4<f32> {
@@ -245,10 +297,14 @@ fn retire_guided_render_buffer(@builtin(global_invocation_id) id: vec3<u32>,
     add_rgb(retired.y + denoising_params.albedo_offset, denoising[feature + 1u].xyz);
   }
   if (denoising_params.normal_offset != pass_unused) {
-    let normal = denoising[feature + 2u].xyz;
+    // Surface features are in world space. Volume scatter contributes directly
+    // along camera Z, as in Cycles' film_write_denoising_features_volume.
+    let feature_normal = denoising[feature + 2u];
+    let normal = feature_normal.xyz;
     let camera_normal = vec3<f32>(dot(denoising_params.world_to_camera_x.xyz, normal),
                                   dot(denoising_params.world_to_camera_y.xyz, normal),
-                                  dot(denoising_params.world_to_camera_z.xyz, normal));
+                                  dot(denoising_params.world_to_camera_z.xyz, normal) +
+                                    feature_normal.w);
     add_rgb(retired.y + denoising_params.normal_offset, camera_normal);
   }
 }

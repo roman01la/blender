@@ -258,21 +258,49 @@ material evaluator in isolation.
 python3 web/cycles-webgpu/build.py --stock-camera TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --bvh2-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --surface-compact TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --surface-query TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-compact --svm-core TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --svm-query TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --svm-query --extended-queries TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --svm-query --advanced-queries TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --sampled-emission TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --subsurface-compact TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --absorption TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --absorption-shadow TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-interval TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-scatter TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-scatter-shadow TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-scatter --volume-guides TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-scatter-shadow --volume-guides TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-extinction-shadow TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-scatter --volume-grid TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-scatter-shadow --volume-grid TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-extinction-shadow --volume-grid TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-scatter --volume-grid --volume-guides TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-scatter-shadow --volume-grid --volume-guides TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --reflection-only --light-tree --volume-forward TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --shade-background --light-tree --volume-forward TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --shade-background --light-tree --volume-forward --denoise-background TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --shade-background TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --shade-background --light-tree TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --intersect-shadow TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --transparent-shadow TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --transparent-shadow --shadow-materials TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --reflection-only TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --reflection-only --point-distribution TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --reflection-only --light-tree TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --point-distribution TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --light-tree TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --hair-closures TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --point-distribution --hair-closures TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --light-tree --hair-closures TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --path-update TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --path-update --standalone-closures TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --path-update --reflection-only --standalone-closures TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light --reflection-only TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --path-update --reflection-only TOOLCHAIN_ARGUMENTS
 node web/cycles-webgpu/verify.mjs --svm \
@@ -313,17 +341,31 @@ A black world meets the point-light path's visibility requirements. The
 single rectangular area light path can use an unsampled equirectangular HDRI.
 
 The optional Light Tree shaders use the stock synchronized tree to sample
-normalized point lights, full-spread rectangular area lights, and an
-untransformed equirectangular HDRI with
-opaque surfaces. Enable Light Tree and choose Auto or Manual World sampling
+normalized point lights, full-spread rectangular area lights, static triangle
+meshes with constant or supported textured emission, and an untransformed
+equirectangular HDRI. Triangle emitters reuse Cycles' mesh subtrees, triangle
+sampler, and PDFs for direct samples and BSDF hits. The sampled-emission
+shader uses Cycles' triangle shading setup and SVM to evaluate emission at
+the light sample before shadow traversal.
+Enable Light Tree and choose Auto or Manual World sampling
 to use Cycles' world importance map. The shader uses the stock world-map CDF
 and applies the Light Tree selection PDF to direct lighting, forward light
 hits, and background misses. Forward hits are evaluated nearest first up to
 the transparent bounce limit. The supported world map uses no portals or
 separate sun sampling.
 
-The `--subsurface-compact` shader adds Cycles' Random Walk, Skin, and Legacy
-methods to the editor's stock wavefront scheduler. It supports opaque
+The compact query SVM runs Ambient Occlusion, Bevel and the five built-in
+Raycast outputs against the resident static triangle BVH2. It uses Cycles'
+stock ray queries, sampling sequences and triangle normals. Core material
+nodes can use it. The optional texture variant also supports Noise, color nodes,
+projected image textures, and cubic filtering. A separate shader adds Gabor
+and advanced Voronoi to the texture variant. It shares the stock Noise fractal
+functions across the output channels to reduce shader size.
+Dynamic Raycast attribute outputs, Raycast evaluated through Bump, and Bevel
+connected to a closure's Normal input also use CPU Cycles.
+
+The `--subsurface-compact` shader adds Cycles' Random Walk, Skin, Legacy, and
+Christensen–Burley methods to the editor's stock wavefront scheduler. It supports opaque
 Principled materials and the Subsurface Scattering node with uniform
 subsurface controls and three positive radii on static triangle meshes.
 The standalone `--subsurface` build can be compared with
@@ -347,6 +389,7 @@ guide variants into the same output directory as the other Cycles shaders.
 
 ```sh
 python3 web/cycles-webgpu/build.py --denoise-surface TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --denoise-surface --standalone-closures TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --shade-background --denoise-background TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --shade-background --denoise-background --light-tree TOOLCHAIN_ARGUMENTS
 ```
@@ -469,8 +512,8 @@ reuses Cycles' microfacet closures and regular and inverse-IOR energy tables.
 Transmission works with a single rectangular area light, the point-light
 distribution, and the supported Light Tree lights and world. Enable refractive
 caustics and transmission lighting on the lights. A black world satisfies the
-point distribution's world restrictions. Shadow caustics, transparent shadow
-casters, and volume absorption use CPU Cycles.
+point distribution's world restrictions. Shadow caustics and transmission
+combined with a scene volume use CPU Cycles.
 
 Each camera path occupies a free GPU slot until it retires into the film.
 A compute pass compacts slots for the kernel chosen by the stock scheduler. BVH traversal, surface
@@ -484,16 +527,20 @@ area-light intersections use the same adjusted continuation origin.
 Diffuse continuations use Cycles' concentric disk mapping and compute the
 hemisphere height from the disk radius before trigonometric rounding.
 Film accumulation uses the raster coordinates stored with each completed path.
+Color and Value AOVs use the stock SVM pass offsets and accumulate directly
+into the resident film on primary paths.
+True displacement uses Cycles' existing geometry preparation before uploading
+the displaced BVH for WebGPU tracing. Bump-only displacement can trace on
+WebGPU when Blender proves its three bump evaluations are identical.
 
-Image Texture supports Color and Alpha, Flat, Sphere and Tube projection,
+Image Texture supports Color and Alpha, Flat, Box, Sphere and Tube projection,
 Closest, Linear, Cubic and Smart filtering, and all four address modes.
 Environment Texture supports equirectangular and mirror ball projection in
 surface materials. The host packs RGB texels from four-channel float or byte
 images and adds an alpha plane when an output or color unassociation needs it.
 The SVM stage applies stock color unassociation and sRGB conversion after
 filtering. The extended shader handles projected images and cubic filtering.
-Box projection, tiled images and texture-driven Principled roughness use
-CPU Cycles.
+Tiled images and texture-driven Principled roughness use CPU Cycles.
 
 For surface materials, Light Path and Light Falloff evaluate the stock SVM
 instructions against the live ray and path. Geometry provides Position, Normal,
@@ -501,6 +548,28 @@ True Normal, Incoming, Parametric, and Backfacing. Camera Data, Fresnel,
 Layer Weight, Object Info and Texture Coordinate read the synchronized
 camera, object and path data. Mix Shader and Add Shader support diffuse
 Lambert closures sharing the surface normal.
+The standalone surface kernels support Translucent, Toon, Glossy, Metallic,
+and both Sheen distributions. Microfiber Sheen reads Blender's synchronized
+LTC lookup table. Cycles loads the corresponding continuation and denoising
+guide kernels when the scene uses those closures. Hair Reflection and
+Transmission and Principled Hair Chiang and Huang use Blender's closures on
+static triangle meshes. Huang uses the stock projected ellipse for surface
+transparency and shadow extinction.
+Transparent BSDF traces primary rays and colored shadows with Blender's
+transparent bounce limits. A varying tint evaluates SVM at each shadow hit.
+Mix and Add Shader can combine Transparent BSDF with Lambert or reflective
+Principled GGX. Spatially split BVHs and transparency with AOVs use CPU Cycles.
+Ray Portal uses Cycles' closure setup, path transition, and shadow rule.
+
+The optional volume shaders support overlapping bounded media with opaque
+surface materials, disjoint point and area lights, and world lighting. They
+reuse Cycles' homogeneous integration, phase functions, and segment-conditioned
+Light Tree sampling. Static OpenVDB media use named Principled Volume inputs,
+NanoVDB voxel data, and stock filtering and null-collision integration. Grid
+uploads must fit the scene buffer budget, and the path supports up to eight
+media. Guided Open Image Denoise uses volume albedo and normal and can retain
+the film on WebGPU through export. Build `--volume-reference` to compare
+volume coefficients and phase functions with the native reference.
 
 Geometry also provides Tangent, Pointiness and Random Per Island. Attribute,
 Color Attribute, Volume Info, Hair Info, Point Info and Particle Info follow
@@ -511,17 +580,20 @@ Missing inputs. Other attributes get one of up to 16 packed slots. Each slot
 stores a mode and type word and three float4 corners per triangle, converted
 as `attribute_data_fetch()` returns them. Byte colors are converted to the
 working color space. The shader interpolates the corners like
-`triangle_interpolate()` and applies the stock output conversions. Instanced
-triangles need matching per-object values. Particle Info reads Cycles' dummy
-particle and needs objects without particle instancing.
+`triangle_interpolate()` and applies the stock output conversions. Packed
+per-triangle attributes need matching per-object values for shared geometry.
+From Instancer reads the instance's synchronized UV and Generated values.
+Particle Info reads Cycles' dummy particle and needs objects without
+particle instancing.
 
 Normal Map supports all spaces, the DirectX convention and both bases. Tangent
 space reads the UV tangent and sign slots and a host-built slot of smooth
 object-space corner normals. Original base needs geometry without undisplaced
-normals. Tangent supports Radial and UV Map. Wireframe supports world-space
-size from host-built triangle positions. Pixel size needs ray differentials
-and uses CPU Cycles. Vector Transform, Wavelength and IES Texture use the
-stock code. The packed header carries the film's XYZ to RGB rows, the CIE
+normals. Tangent supports Radial and UV Map. Wireframe uses host-built triangle
+positions and tracks Cycles ray differentials for pixel size. Pixel-size
+Wireframe with subsurface scattering or sampled mesh emission uses CPU Cycles.
+Vector Transform, Wavelength and IES Texture use the stock code. The packed
+header carries the film's XYZ to RGB rows, the CIE
 color matching table and the synchronized IES table. Sky Texture supports
 Preetham, Hosek / Wilkie and both Nishita models in surface materials. The
 Nishita lookup table uses the packed image slots.

@@ -8,12 +8,21 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { observeVolumeGpu } from './volume_gpu_proof.mjs';
 
 const [buildPath, requestPath, catalogPath, timeout = '600'] = process.argv.slice(2);
 const build = resolve(buildPath);
 const request = JSON.parse(await readFile(requestPath, 'utf8'));
 const scriptPaths = ['catalog.py', 'probe.py'];
+if (request.cases?.some(test => test.triangle_emitter)) scriptPaths.push('triangle_fixture.py');
+if (request.cases?.some(test => test.transparent_fixture)) scriptPaths.push('transparent_fixture.py');
+if (request.cases?.some(test => test.query_fixture)) scriptPaths.push('scene_query_fixture.py');
+if (request.cases?.some(test => test.ray_transport_fixture)) scriptPaths.push('ray_transport_fixture.py');
+if (request.cases?.some(test => test.absorption_fixture)) scriptPaths.push('absorption_fixture.py');
+const volumeTransport = request.cases?.some(test => test.volume_transport);
+if (volumeTransport) scriptPaths.push('volume_transport_fixture.py');
 const files = await Promise.all(scriptPaths.map(name => readFile(new URL(name, import.meta.url), 'utf8')));
+const observer = volumeTransport ? `(${observeVolumeGpu.toString()})();\n` : '';
 const editor = await readFile(join(build, 'editor-worker.js'), 'utf8');
 const anchor = '    thisProgram: "/blender",';
 if (editor.split(anchor).length !== 2) throw Error('Cannot enable Cycles and GPU logging in this build');
@@ -31,7 +40,11 @@ const server = createServer(async (incoming, response) => {
     response.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
     response.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     response.setHeader('Content-Type', mime[extname(file)] ?? 'application/octet-stream');
-    if (path === '/editor-worker.js') response.end(testEditor);
+    if (path === '/editor-worker.js') {
+      response.end(observer ? testEditor.replace('"use strict";', '"use strict";\n' + observer) : testEditor);
+    } else if (observer && path === '/blender.js') {
+      response.end(observer + await readFile(file, 'utf8'));
+    }
     else {
       response.setHeader('Content-Length', info.size);
       const stream = createReadStream(file);
@@ -59,6 +72,9 @@ let input = '';
 let editorWorker;
 let outcome;
 let failure;
+let volumeCase;
+let volumeCaseStart;
+const volumeProof = 'VOLUME_WEBGPU_PROOF ';
 
 function send(method, params = {}, sessionId) {
   return new Promise((resolve, reject) => {
@@ -93,9 +109,24 @@ chrome.stdio[4].setEncoding('utf8').on('data', chunk => {
     } else if (event.method === 'Runtime.consoleAPICalled' || event.method === 'Log.entryAdded') {
       const message = event.params.entry?.text ??
         event.params.args.map(arg => arg.value ?? arg.description ?? '').join(' ');
-      console.log(message);
+      if (volumeTransport && message.startsWith(volumeProof)) {
+        const { submissions, otherFilmReads, ...result } = JSON.parse(message.slice(volumeProof.length));
+        const work = submissions.filter(record => record.time >= volumeCaseStart);
+        console.log(volumeProof + JSON.stringify({
+          ...result, caseId: volumeCase,
+          traceDispatches: work.reduce((sum, record) => sum + record.trace, 0),
+          denoiseDispatches: work.reduce((sum, record) => sum + record.oidn, 0),
+          otherFilmReads: otherFilmReads.filter(record => record.time >= volumeCaseStart),
+        }));
+      } else {
+        console.log(message);
+      }
       if (message.startsWith('MATERIAL_TEST ')) {
         const result = JSON.parse(message.slice('MATERIAL_TEST '.length));
+        if (volumeTransport && result.event === 'begin' && result.id !== volumeCase) {
+          volumeCase = result.id;
+          volumeCaseStart = event.params.timestamp ?? event.params.entry?.timestamp;
+        }
         if (['done', 'inventory', 'fatal'].includes(result.event)) outcome = result;
       }
     } else if (event.method === 'Inspector.targetCrashed') {
@@ -148,6 +179,11 @@ try {
     await evaluate(`FS.writeFile("/tmp/${filename}", ${JSON.stringify(files[i])}); true`, editorWorker);
   }
   const wire = { ...request, image: '/tmp/node-probe.png' };
+  if (volumeTransport && request.volume_grid) {
+    const asset = (await readFile(request.volume_grid)).toString('base64');
+    wire.volume_grid = '/tmp/material-test-density.vdb';
+    await evaluate(`FS.writeFile(${JSON.stringify(wire.volume_grid)}, Uint8Array.from(atob(${JSON.stringify(asset)}), c => c.charCodeAt(0))); true`, editorWorker);
+  }
   if (wire.inventory) wire.inventory = '/tmp/node-catalog.json';
   await evaluate(`FS.writeFile("/tmp/matrix-request.json", ${JSON.stringify(JSON.stringify(wire))}); true`, editorWorker);
 

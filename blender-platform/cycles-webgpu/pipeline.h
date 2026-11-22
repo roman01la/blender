@@ -49,7 +49,8 @@ class WebGPURenderPipeline {
                     std::span<const uint32_t> light,
                     std::span<const uint32_t> svm,
                     std::span<const uint32_t> sampling,
-                    bool has_subsurface);
+                    bool has_subsurface,
+                    bool advanced_query_svm);
   /** Reset the GPU film and return the allocated capacity for the stock path scheduler. */
   bool reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WORDS> camera,
              std::span<const uint32_t, 16> denoising_config,

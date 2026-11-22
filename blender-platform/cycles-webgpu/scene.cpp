@@ -8,6 +8,9 @@
 #include "device/webgpu/material_layout.h"
 #include "device/webgpu/pipeline.h"
 #include "device/webgpu/svm_materials.h"
+#include "device/webgpu/volume_grids.h"
+#include "device/webgpu/volume_layout.h"
+#include "scene/object.h"
 #include "scene/scene.h"
 #include "scene/shader.h"
 #include "scene/shader_nodes.h"
@@ -93,7 +96,7 @@ const char *scene_incompatibility(const Scene &scene)
   const DeviceScene &dscene = scene.dscene;
   const KernelBVH &bvh = dscene.data.bvh;
   if (bvh.bvh_layout != BVH_LAYOUT_BVH2 || bvh.have_motion || bvh.have_curves || bvh.have_points ||
-      bvh.have_volumes || scene.params.shadingsystem != SHADINGSYSTEM_SVM)
+      scene.params.shadingsystem != SHADINGSYSTEM_SVM)
   {
     return "WebGPU Cycles needs a static triangle BVH2 and SVM materials";
   }
@@ -200,6 +203,9 @@ bool uses_stock_light_tree(const DeviceScene &scene)
   if (!integrator.use_light_tree) {
     return false;
   }
+  if (scene.light_tree_emitters.size() > scene.lights.size()) {
+    return true;
+  }
   if (integrator.num_lights > 1 || integrator.num_background_lights > 0) {
     return true;
   }
@@ -220,16 +226,21 @@ bool uses_stock_light_tree(const DeviceScene &scene)
          (emission.x != 0.0f || emission.y != 0.0f || emission.z != 0.0f);
 }
 
-const char *encode_lighting(const Scene &scene, std::vector<uint32_t> &lighting)
+const char *encode_lighting(const Scene &scene,
+                            const bool light_tree,
+                            std::vector<uint32_t> &lighting)
 {
   const DeviceScene &dscene = scene.dscene;
   const KernelIntegrator &integrator = dscene.data.integrator;
   const auto lights = host_data(dscene.lights);
-  const bool light_tree = uses_stock_light_tree(dscene);
-  if (lights.empty() || lights.size() != size_t(integrator.num_lights) || integrator.num_portals ||
-      (integrator.num_background_lights && !light_tree) || !integrator.use_direct_light)
+  if ((!light_tree && lights.empty()) || lights.size() != size_t(integrator.num_lights) ||
+      integrator.num_portals || (integrator.num_background_lights && !light_tree) ||
+      !integrator.use_direct_light)
   {
     return "WebGPU Cycles needs supported lights without portals, and Light Tree for sampled worlds";
+  }
+  if (!integrator.use_light_tree && dscene.light_distribution.size() > lights.size() + 1) {
+    return "WebGPU Cycles needs the Light Tree to sample emissive meshes";
   }
   lighting.assign(CYCLES_WEBGPU_LIGHT_HEADER_WORDS, 0);
   lighting[3] = float_word(integrator.sample_clamp_indirect);
@@ -528,6 +539,15 @@ bool pack_light_tree_nodes(const std::span<const KernelLightTreeNode> nodes,
       }
       record[CYCLES_WEBGPU_TREE_NODE_LEFT_OR_FIRST] = uint32_t(first);
     }
+    else if (node.type == LIGHT_TREE_INSTANCE) {
+      const size_t reference = size_t(node.instance.reference);
+      if (reference >= index ||
+          (nodes[reference].type != LIGHT_TREE_INNER && nodes[reference].type != LIGHT_TREE_LEAF))
+      {
+        return false;
+      }
+      record[CYCLES_WEBGPU_TREE_NODE_LEFT_OR_FIRST] = uint32_t(reference);
+    }
     else {
       return false;
     }
@@ -553,7 +573,7 @@ const char *pack_light_tree_lamps(const DeviceScene &dscene,
     if (emitter_index >= emitters.size() || emitters[emitter_index].light.id != ~int(index) ||
         emitters[emitter_index].object_id != light.object_id)
     {
-      return "WebGPU Cycles needs a Light Tree without emissive meshes";
+      return "WebGPU Cycles needs synchronized Light Tree lamp emitters";
     }
 
     uint32_t *record = words.data() + index * CYCLES_WEBGPU_TREE_LAMP_WORDS;
@@ -619,6 +639,153 @@ const char *pack_light_tree_lamps(const DeviceScene &dscene,
   return nullptr;
 }
 
+const char *pack_light_tree_meshes(const DeviceScene &dscene,
+                                   const std::span<const KernelLightTreeNode> nodes,
+                                   const std::span<const KernelLightTreeEmitter> emitters,
+                                   uint32_t *header,
+                                   const std::span<uint32_t> lighting)
+{
+  const auto objects = host_data(dscene.objects);
+  const auto object_flags = host_data(dscene.object_flag);
+  const auto object_to_tree = host_data(dscene.light_to_tree);
+  const auto object_prims = host_data(dscene.object_prim_offset);
+  const auto object_lookup = host_data(dscene.object_lookup_offset);
+  const auto triangle_to_tree = host_data(dscene.triangle_to_tree);
+  if (object_to_tree.size() != objects.size() || object_prims.size() != objects.size() ||
+      object_lookup.size() != objects.size() || triangle_to_tree.empty())
+  {
+    return "WebGPU Cycles needs synchronized Light Tree mesh lookups";
+  }
+
+  const auto object_records = lighting.subspan(header[CYCLES_WEBGPU_TREE_OBJECTS],
+                                               objects.size() * CYCLES_WEBGPU_TREE_OBJECT_WORDS);
+  const auto triangle_indices = lighting.subspan(header[CYCLES_WEBGPU_TREE_TRIANGLE_INDICES],
+                                                 header[CYCLES_WEBGPU_TREE_TRIANGLE_INDEX_COUNT]);
+  const auto lookup_records = lighting.subspan(header[CYCLES_WEBGPU_TREE_TRIANGLE_TO_TREE],
+                                               triangle_to_tree.size());
+  std::ranges::fill(triangle_indices, CYCLES_WEBGPU_TREE_NO_LAMP);
+  std::ranges::fill(lookup_records, CYCLES_WEBGPU_TREE_NO_LAMP);
+  for (size_t i = 0; i < objects.size(); ++i) {
+    object_records[i * CYCLES_WEBGPU_TREE_OBJECT_WORDS + CYCLES_WEBGPU_TREE_OBJECT_TO_TREE] =
+        CYCLES_WEBGPU_TREE_NO_LAMP;
+  }
+
+  /* Fill only mapped mesh objects. Blender's lookup arrays do not initialize
+   * non-emissive objects and non-emissive faces. */
+  for (size_t i = 0; i < emitters.size(); ++i) {
+    const KernelLightTreeEmitter &emitter = emitters[i];
+    if (emitter.light.id < 0 || emitter.object_id != OBJECT_NONE) {
+      continue;
+    }
+    const size_t object_index = size_t(emitter.mesh.object_id);
+    if (object_index >= objects.size() || size_t(emitter.mesh.node_id) >= nodes.size() ||
+        object_to_tree[object_index] != i ||
+        object_lookup[object_index] >= triangle_to_tree.size())
+    {
+      return "WebGPU Cycles needs synchronized Light Tree mesh emitters";
+    }
+    const KernelObject &object = objects[object_index];
+    uint32_t *record = object_records.data() + object_index * CYCLES_WEBGPU_TREE_OBJECT_WORDS;
+    record[CYCLES_WEBGPU_TREE_OBJECT_FLAGS] = object_flags[object_index];
+    record[CYCLES_WEBGPU_TREE_OBJECT_TO_TREE] = uint32_t(i);
+    record[CYCLES_WEBGPU_TREE_OBJECT_PRIM_OFFSET] = object_prims[object_index];
+    record[CYCLES_WEBGPU_TREE_OBJECT_LOOKUP_OFFSET] = object_lookup[object_index];
+    record[CYCLES_WEBGPU_TREE_OBJECT_LIGHTGROUP] = uint32_t(object.lightgroup);
+    const auto write_transform = [](const Transform &transform, uint32_t *data) {
+      for (const float4 row : {transform.x, transform.y, transform.z}) {
+        if (!finite_rgb(make_float3(row)) || !std::isfinite(row.w)) {
+          return false;
+        }
+        write_rgb(data, make_float3(row));
+        data[3] = float_word(row.w);
+        data += 4;
+      }
+      return true;
+    };
+    if (!write_transform(object.tfm, record + CYCLES_WEBGPU_TREE_OBJECT_TRANSFORM) ||
+        !write_transform(object.itfm, record + CYCLES_WEBGPU_TREE_OBJECT_INVERSE_TRANSFORM))
+    {
+      return "WebGPU Cycles needs finite Light Tree mesh transforms";
+    }
+  }
+
+  const auto indices = host_data(dscene.tri_vindex);
+  const auto vertices = host_data(dscene.tri_verts);
+  const auto triangle_shaders = host_data(dscene.tri_shader);
+  const auto shaders = host_data(dscene.shaders);
+  uint32_t *shader_records = lighting.data() + header[CYCLES_WEBGPU_TREE_SHADERS];
+  for (size_t i = 0; i < shaders.size(); ++i) {
+    shader_records[i * CYCLES_WEBGPU_TREE_SHADER_WORDS + CYCLES_WEBGPU_TREE_SHADER_FLAGS] =
+        uint32_t(shaders[i].flags);
+  }
+
+  uint32_t compact_index = 0;
+  for (size_t i = 0; i < emitters.size(); ++i) {
+    const KernelLightTreeEmitter &emitter = emitters[i];
+    if (emitter.light.id < 0 || emitter.object_id == OBJECT_NONE) {
+      continue;
+    }
+    const size_t object_index = size_t(emitter.object_id);
+    const size_t prim = size_t(emitter.triangle.id);
+    if (object_index >= objects.size() || prim >= indices.size() ||
+        triangle_indices[prim] != CYCLES_WEBGPU_TREE_NO_LAMP ||
+        object_records[object_index * CYCLES_WEBGPU_TREE_OBJECT_WORDS +
+                       CYCLES_WEBGPU_TREE_OBJECT_TO_TREE] == CYCLES_WEBGPU_TREE_NO_LAMP ||
+        prim < object_prims[object_index])
+    {
+      return "WebGPU Cycles needs synchronized Light Tree triangle emitters";
+    }
+    const size_t lookup = prim - object_prims[object_index] + object_lookup[object_index];
+    if (lookup >= triangle_to_tree.size() || triangle_to_tree[lookup] != i) {
+      return "WebGPU Cycles needs the stock Light Tree triangle lookup";
+    }
+    if (emitter.visibility_flag &
+        (SHADER_EXCLUDE_DIFFUSE | SHADER_EXCLUDE_GLOSSY | SHADER_EXCLUDE_TRANSMIT))
+    {
+      return "WebGPU Cycles needs diffuse, glossy and transmission lighting on emissive meshes";
+    }
+    const uint32_t shader = triangle_shaders[prim];
+    const uint32_t shader_id = shader & SHADER_MASK;
+    if (shader_id >= shaders.size()) {
+      return "WebGPU Cycles needs a shader for each Light Tree triangle emitter";
+    }
+    if (shaders[shader_id].flags & SD_HAS_CONSTANT_EMISSION) {
+      float3 emission;
+      if (!constant_emission(dscene, shader, emission)) {
+        return "WebGPU Cycles needs finite constant emission on mesh lights";
+      }
+      write_rgb(shader_records + size_t(shader_id) * CYCLES_WEBGPU_TREE_SHADER_WORDS +
+                    CYCLES_WEBGPU_TREE_SHADER_EMISSION,
+                emission);
+    }
+    else {
+      ++header[CYCLES_WEBGPU_TREE_TEXTURED_EMITTERS];
+    }
+
+    lookup_records[lookup] = uint32_t(i);
+    triangle_indices[prim] = compact_index;
+    uint32_t *record = lighting.data() + header[CYCLES_WEBGPU_TREE_TRIANGLES] +
+                       size_t(compact_index) * CYCLES_WEBGPU_TREE_TRIANGLE_WORDS;
+    ++compact_index;
+    record[CYCLES_WEBGPU_TREE_TRIANGLE_SHADER] = shader;
+    uint32_t *positions = record + CYCLES_WEBGPU_TREE_TRIANGLE_VERTICES;
+    const size_t position_offset = size_t(objects[object_index].position_offset);
+    const packed_uint3 index = indices[prim];
+    for (const uint vertex : {index.x, index.y, index.z}) {
+      if (position_offset >= vertices.size() || vertex >= vertices.size() - position_offset) {
+        return "WebGPU Cycles needs synchronized Light Tree vertex positions";
+      }
+      const float3 position = make_float3(vertices[position_offset + vertex]);
+      if (!finite_rgb(position)) {
+        return "WebGPU Cycles needs finite Light Tree vertex positions";
+      }
+      write_rgb(positions, position);
+      positions += 3;
+    }
+  }
+  return nullptr;
+}
+
 const char *encode_stock_light_tree(const Scene &scene,
                                    const size_t remaining_words,
                                    std::vector<uint32_t> &lighting)
@@ -629,11 +796,17 @@ const char *encode_stock_light_tree(const Scene &scene,
   const auto lights = host_data(dscene.lights);
   const auto nodes = host_data(dscene.light_tree_nodes);
   const auto emitters = host_data(dscene.light_tree_emitters);
-  if (nodes.empty() || lights.size() != emitters.size() || integrator.num_background_lights > 1 ||
+  const size_t triangle_count = std::ranges::count_if(
+      emitters, [](const KernelLightTreeEmitter &e) {
+        return e.light.id >= 0 && e.object_id != OBJECT_NONE;
+      });
+  if (nodes.empty() || emitters.empty() || emitters.size() < lights.size() ||
+      (triangle_count == 0 && lights.size() != emitters.size()) ||
+      integrator.num_background_lights > 1 ||
       integrator.direct_light_sampling_type != DIRECT_LIGHT_SAMPLING_MIS ||
       (dscene.data.kernel_features & KERNEL_FEATURE_MNEE))
   {
-    return "WebGPU Cycles needs a Light Tree of supported lights with MIS and no emissive meshes";
+    return "WebGPU Cycles needs a Light Tree of supported lights with MIS";
   }
 
   const bool sampled_world = integrator.num_background_lights != 0;
@@ -662,11 +835,19 @@ const char *encode_stock_light_tree(const Scene &scene,
   const uint64_t lamp_words = uint64_t(lights.size()) * CYCLES_WEBGPU_TREE_LAMP_WORDS;
   const uint64_t node_words = uint64_t(nodes.size()) * CYCLES_WEBGPU_TREE_NODE_WORDS;
   const uint64_t emitter_words = uint64_t(emitters.size()) * CYCLES_WEBGPU_TREE_EMITTER_WORDS;
+  const uint64_t object_count = triangle_count ? dscene.objects.size() : 0;
+  const uint64_t triangle_index_count = triangle_count ? dscene.tri_shader.size() : 0;
+  const uint64_t shader_count = triangle_count ? dscene.shaders.size() : 0;
+  const uint64_t triangle_lookup_count = triangle_count ? dscene.triangle_to_tree.size() : 0;
+  const uint64_t object_words = object_count * CYCLES_WEBGPU_TREE_OBJECT_WORDS;
+  const uint64_t triangle_words = uint64_t(triangle_count) * CYCLES_WEBGPU_TREE_TRIANGLE_WORDS;
+  const uint64_t shader_words = shader_count * CYCLES_WEBGPU_TREE_SHADER_WORDS;
   const uint64_t texel_words = 3 * uint64_t(image.width) * image.height;
   const uint64_t total_words = CYCLES_WEBGPU_TREE_DESCRIPTOR_WORDS + lamp_words + node_words +
-                               emitter_words + 2 * uint64_t(marginal.size()) +
-                               2 * uint64_t(conditional.size()) + texel_words +
-                               CYCLES_WEBGPU_LIGHT_SAMPLING_WORDS + lut.size();
+                               emitter_words + object_words + triangle_index_count +
+                               triangle_words + shader_words + triangle_lookup_count +
+                               2 * uint64_t(marginal.size()) + 2 * uint64_t(conditional.size()) +
+                               texel_words + CYCLES_WEBGPU_LIGHT_SAMPLING_WORDS + lut.size();
   if (total_words > remaining_words) {
     return "WebGPU Cycles Light Tree and world map exceed the scene upload budget";
   }
@@ -675,7 +856,12 @@ const char *encode_stock_light_tree(const Scene &scene,
   const size_t lamp_offset = descriptor + CYCLES_WEBGPU_TREE_DESCRIPTOR_WORDS;
   const size_t node_offset = lamp_offset + size_t(lamp_words);
   const size_t emitter_offset = node_offset + size_t(node_words);
-  const size_t marginal_offset = emitter_offset + size_t(emitter_words);
+  const size_t object_offset = emitter_offset + size_t(emitter_words);
+  const size_t triangle_index_offset = object_offset + size_t(object_words);
+  const size_t triangle_offset = triangle_index_offset + size_t(triangle_index_count);
+  const size_t shader_offset = triangle_offset + size_t(triangle_words);
+  const size_t triangle_lookup_offset = shader_offset + size_t(shader_words);
+  const size_t marginal_offset = triangle_lookup_offset + size_t(triangle_lookup_count);
   const size_t conditional_offset = marginal_offset + 2 * marginal.size();
   const size_t world_offset = conditional_offset + 2 * conditional.size();
   const size_t sampling_offset = world_offset + size_t(texel_words);
@@ -693,6 +879,17 @@ const char *encode_stock_light_tree(const Scene &scene,
   header[CYCLES_WEBGPU_TREE_NODES] = uint32_t(node_offset);
   header[CYCLES_WEBGPU_TREE_EMITTER_COUNT] = uint32_t(emitters.size());
   header[CYCLES_WEBGPU_TREE_EMITTERS] = uint32_t(emitter_offset);
+  header[CYCLES_WEBGPU_TREE_OBJECT_COUNT] = uint32_t(object_count);
+  header[CYCLES_WEBGPU_TREE_OBJECTS] = uint32_t(object_offset);
+  header[CYCLES_WEBGPU_TREE_TRIANGLE_INDEX_COUNT] = uint32_t(triangle_index_count);
+  header[CYCLES_WEBGPU_TREE_TRIANGLE_INDICES] = uint32_t(triangle_index_offset);
+  header[CYCLES_WEBGPU_TREE_TRIANGLE_COUNT] = uint32_t(triangle_count);
+  header[CYCLES_WEBGPU_TREE_TEXTURED_EMITTERS] = 0;
+  header[CYCLES_WEBGPU_TREE_TRIANGLES] = uint32_t(triangle_offset);
+  header[CYCLES_WEBGPU_TREE_SHADER_COUNT] = uint32_t(shader_count);
+  header[CYCLES_WEBGPU_TREE_SHADERS] = uint32_t(shader_offset);
+  header[CYCLES_WEBGPU_TREE_TRIANGLE_TO_TREE_COUNT] = uint32_t(triangle_lookup_count);
+  header[CYCLES_WEBGPU_TREE_TRIANGLE_TO_TREE] = uint32_t(triangle_lookup_offset);
   header[CYCLES_WEBGPU_TREE_FIRST_FORWARD_LAMP] = CYCLES_WEBGPU_TREE_NO_LAMP;
   header[CYCLES_WEBGPU_TREE_TRANSPARENT_MAX_BOUNCE] = uint32_t(integrator.transparent_max_bounce);
   header[CYCLES_WEBGPU_TREE_WORLD_LAMP] = CYCLES_WEBGPU_TREE_NO_LAMP;
@@ -732,9 +929,19 @@ const char *encode_stock_light_tree(const Scene &scene,
     record[CYCLES_WEBGPU_TREE_EMITTER_THETA_E] = float_word(emitter.theta_e);
     record[CYCLES_WEBGPU_TREE_EMITTER_ENERGY] = float_word(emitter.energy);
     record[CYCLES_WEBGPU_TREE_EMITTER_LIGHT] = uint32_t(emitter.light.id);
+    if (emitter.light.id >= 0) {
+      record[CYCLES_WEBGPU_TREE_EMITTER_DETAIL] = emitter.object_id == OBJECT_NONE ?
+                                                      uint32_t(emitter.mesh.node_id) :
+                                                      uint32_t(emitter.triangle.emission_sampling);
+    }
     record[CYCLES_WEBGPU_TREE_EMITTER_OBJECT] = uint32_t(emitter.object_id);
     record[CYCLES_WEBGPU_TREE_EMITTER_VISIBILITY] = uint32_t(emitter.visibility_flag);
     record[CYCLES_WEBGPU_TREE_EMITTER_BIT_TRAIL] = uint32_t(emitter.bit_trail);
+  }
+  if (triangle_count) {
+    if (const char *error = pack_light_tree_meshes(dscene, nodes, emitters, header, lighting)) {
+      return error;
+    }
   }
 
   for (const auto cdf : {marginal, conditional}) {
@@ -753,7 +960,7 @@ const char *encode_stock_light_tree(const Scene &scene,
   return nullptr;
 }
 
-const char *ggx_transmission_incompatibility(const DeviceScene &scene)
+const char *ggx_transmission_incompatibility(const DeviceScene &scene, const bool transparent_shadows)
 {
   const KernelIntegrator &integrator = scene.data.integrator;
   if (!integrator.caustics_refractive ||
@@ -782,9 +989,11 @@ const char *ggx_transmission_incompatibility(const DeviceScene &scene)
              "disabled";
     }
   }
-  for (const uint packed_shader : host_data(scene.tri_shader)) {
-    if (scene.shaders.data()[packed_shader & SHADER_MASK].flags & SD_HAS_TRANSPARENT_SHADOW) {
-      return "WebGPU Cycles glass needs opaque shadow casters";
+  if (!transparent_shadows) {
+    for (const uint packed_shader : host_data(scene.tri_shader)) {
+      if (scene.shaders.data()[packed_shader & SHADER_MASK].flags & SD_HAS_TRANSPARENT_SHADOW) {
+        return "WebGPU Cycles glass needs supported shadow casters";
+      }
     }
   }
   return nullptr;
@@ -792,6 +1001,7 @@ const char *ggx_transmission_incompatibility(const DeviceScene &scene)
 
 const char *encode_ggx_tables(const DeviceScene &scene,
                               const bool has_transmission,
+                              const bool transparent_shadows,
                               std::vector<uint32_t> &lighting)
 {
   const KernelIntegrator &integrator = scene.data.integrator;
@@ -822,7 +1032,7 @@ const char *encode_ggx_tables(const DeviceScene &scene,
     }
   }
   if (has_transmission) {
-    if (const char *error = ggx_transmission_incompatibility(scene)) {
+    if (const char *error = ggx_transmission_incompatibility(scene, transparent_shadows)) {
       return error;
     }
   }
@@ -848,6 +1058,135 @@ const char *encode_ggx_tables(const DeviceScene &scene,
     }
     for (const float value : table_words.subspan(size_t(offset), table_size)) {
       lighting.push_back(float_word(value));
+    }
+  }
+  return nullptr;
+}
+
+using VolumeWords = std::array<uint32_t, CYCLES_WEBGPU_VOLUME_SCATTER_WORDS>;
+
+struct VolumeMedium {
+  VolumeWords words{};
+  std::vector<uint32_t> grids;
+  bool absorption = false;
+};
+
+const char *encode_volumes(const Scene &scene,
+                           const size_t grid_budget,
+                           std::vector<uint> &shaders,
+                           std::vector<VolumeMedium> &media)
+{
+  const DeviceScene &dscene = scene.dscene;
+  if (scene.params.use_bvh_spatial_split ||
+      dscene.light_tree_emitters.size() > dscene.lights.size())
+  {
+    return "WebGPU Cycles volumes need a BVH without spatial splits and analytic lighting";
+  }
+  uint total_phase_slots = 0;
+  size_t total_grid_words = 0;
+  for (const Object *object : scene.objects) {
+    const uint index = uint(object->get_device_index());
+    if (index >= dscene.objects.size()) {
+      return "WebGPU Cycles needs a synchronized volume object";
+    }
+    if (!(dscene.object_flag.data()[index] & SD_OBJECT_HAS_VOLUME)) {
+      continue;
+    }
+    const Geometry *geometry = object->get_geometry();
+    if (media.size() >= CYCLES_WEBGPU_MAX_VOLUME_MEDIA) {
+      return "WebGPU Cycles volume count exceeds its active-stack capacity";
+    }
+    if (!geometry || (!geometry->is_mesh() && !geometry->is_volume()) ||
+        geometry->get_used_shaders().size() != 1 ||
+        !object->bounds.valid() ||
+        (object->visibility_for_tracing() & PATH_RAY_VISIBILITY_OBJECT_ALL) !=
+            PATH_RAY_VISIBILITY_OBJECT_ALL)
+    {
+      return "WebGPU Cycles needs closed volume bounds with one material and full ray visibility";
+    }
+    const uint shader = static_cast<const Shader *>(geometry->get_used_shaders()[0])->id;
+    if (shader >= dscene.shaders.size()) {
+      return "WebGPU Cycles needs a synchronized volume shader";
+    }
+    const uint flags = uint(dscene.shaders.data()[shader].flags);
+    if (!(flags & SD_HAS_ONLY_VOLUME)) {
+      return "WebGPU Cycles volume boundaries need a volume-only material";
+    }
+
+    /* The independent analytic-light forward pass must never finish inside
+     * a medium. Compare the world-space bounds of the synchronized emitters. */
+    BoundBox medium_bounds = object->bounds;
+    for (const KernelLight &light : host_data(dscene.lights)) {
+      if (light.type == LIGHT_BACKGROUND) {
+        continue;
+      }
+      if (light.type != LIGHT_POINT && light.type != LIGHT_AREA) {
+        return "WebGPU Cycles volumes need supported point, area, or world lighting";
+      }
+      const float3 center = make_float3(light.co);
+      const float3 extent =
+          light.type == LIGHT_AREA ?
+              0.5f * (fabs(make_float3(light.area.axis_u)) * light.area.len_u +
+                      fabs(make_float3(light.area.axis_v)) * light.area.len_v) :
+              make_float3(light.spot.radius);
+      const BoundBox emitter(center - extent, center + extent);
+      if (!emitter.valid() || medium_bounds.intersects(emitter)) {
+        return "WebGPU Cycles needs analytic emitters outside the volume bounds";
+      }
+    }
+
+    VolumeMedium medium;
+    bool has_voxels = false;
+    uint phase_slots = 0;
+    const float density = dscene.objects.data()[index].mesh_volume.volume_density;
+    const bool can_read_grids = (dscene.object_flag.data()[index] &
+                                 SD_OBJECT_HAS_VOLUME_ATTRIBUTES) != 0;
+    if (!std::isfinite(density) || density < 0.0f ||
+        !webgpu_svm_literal_volume(dscene,
+                                  shader,
+                                  int(index),
+                                  medium.words.data(),
+                                  medium.absorption,
+                                  has_voxels,
+                                  phase_slots,
+                                  can_read_grids) ||
+        ((flags & SD_HETEROGENEOUS_VOLUME) && !has_voxels))
+    {
+      return "WebGPU Cycles needs supported volume closures and grid attribute inputs";
+    }
+    total_phase_slots += phase_slots;
+    if (total_phase_slots > MAX_VOLUME_CLOSURE) {
+      return "WebGPU Cycles volume phase closures exceed the supported stack capacity";
+    }
+    medium.words[CYCLES_WEBGPU_ABSORPTION_OBJECT] = index;
+    medium.words[CYCLES_WEBGPU_ABSORPTION_OBJECT_DENSITY] = float_word(density);
+    medium.words[CYCLES_WEBGPU_VOLUME_SHADER_FLAGS] = flags;
+    if (has_voxels) {
+      if (const char *error = webgpu_pack_volume_grids(
+              scene, *object, medium.words, grid_budget - total_grid_words, medium.grids))
+      {
+        return error;
+      }
+    }
+    total_grid_words += medium.grids.size();
+    shaders.push_back(shader);
+    media.push_back(std::move(medium));
+  }
+
+  if (media.empty()) {
+    return "WebGPU Cycles could not find a synchronized volume";
+  }
+  if (media.size() != 1 || !media.front().absorption) {
+    const auto &integrator = dscene.data.integrator;
+    if (!integrator.use_light_tree || dscene.light_tree_nodes.size() == 0 ||
+        dscene.data.background.transparent ||
+        integrator.max_volume_bounce < 0 || integrator.max_volume_bounce > 65535)
+    {
+      return "WebGPU Cycles volume scattering needs Light Tree, opaque film, and valid bounce settings";
+    }
+    for (VolumeMedium &medium : media) {
+      medium.words[CYCLES_WEBGPU_VOLUME_INDIRECT_CLAMP] = float_word(integrator.sample_clamp_indirect);
+      medium.words[CYCLES_WEBGPU_VOLUME_MAX_BOUNCES] = uint32_t(integrator.max_volume_bounce);
     }
   }
   return nullptr;
@@ -886,6 +1225,9 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
   }
   const DeviceScene &dscene = scene.dscene;
 
+  const bool volume = std::ranges::any_of(host_data(dscene.object_flag), [](const uint flag) {
+    return (flag & SD_OBJECT_HAS_VOLUME) != 0;
+  });
   /* Check the upload budget before allocating the packed buffers. */
   const uint64_t bvh_words = 10 + 4 * uint64_t(dscene.bvh_nodes.size()) +
                              4 * uint64_t(dscene.bvh_leaf_nodes.size()) +
@@ -911,6 +1253,24 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
     return false;
   }
   const size_t extra_words = WebGPURenderPipeline::max_scene_words - size_t(base_words);
+  std::vector<uint> volume_shaders;
+  std::vector<VolumeMedium> volume_media;
+  if (const char *error = volume ? encode_volumes(scene, extra_words, volume_shaders,
+                                                volume_media) : nullptr)
+  {
+    reason = error;
+    return false;
+  }
+  const bool volume_scattering = volume &&
+                                 (volume_media.size() != 1 || !volume_media.front().absorption);
+  size_t volume_record_words = volume_scattering ?
+                                   volume_media.size() * CYCLES_WEBGPU_VOLUME_SCATTER_WORDS :
+                                   CYCLES_WEBGPU_ABSORPTION_WORDS;
+  for (const VolumeMedium &medium : volume_media) {
+    volume_record_words += medium.grids.size();
+  }
+  /* Live volume sampling uses the stock segment-conditioned Light Tree. */
+  const bool light_tree = volume_scattering || uses_stock_light_tree(dscene);
   const auto &integrator = dscene.data.integrator;
   const int depth = integrator.max_bounce;
 
@@ -923,17 +1283,66 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
     reason = "WebGPU Cycles needs valid bounce settings and path guiding turned off";
     return false;
   }
-  if (const char *error = encode_lighting(scene, encoded.lighting)) {
+  if (const char *error = encode_lighting(scene, light_tree, encoded.lighting)) {
     reason = error;
     return false;
   }
-  if (!cycles_webgpu_encode_svm_materials(
-          scene, encoded.svm, encoded.has_ggx, encoded.has_transmission, encoded.has_subsurface,
-          reason, extra_words))
+  std::vector<uint32_t> transparent_shadows;
+  bool varying_transparency = false;
+  if (!cycles_webgpu_encode_svm_materials(scene,
+                                         encoded.svm,
+                                         transparent_shadows,
+                                         varying_transparency,
+                                         encoded.has_ggx,
+                                         encoded.has_transmission,
+                                         encoded.has_subsurface,
+                                         encoded.advanced_query_svm,
+                                         volume_shaders,
+                                         reason,
+                                         extra_words))
   {
     return false;
   }
-  const bool light_tree = uses_stock_light_tree(dscene);
+  const bool transparent = !transparent_shadows.empty();
+  const size_t hair_words = (encoded.svm[1] & CYCLES_WEBGPU_SVM_HAIR) ?
+                               CYCLES_WEBGPU_SURFACE_HAIR_HEADER_WORDS : 0;
+  const bool pixel_wireframe = encoded.svm[1] & CYCLES_WEBGPU_SVM_PIXEL_WIREFRAME;
+  const uint unhandled_volume_materials = CYCLES_WEBGPU_SVM_AOV | CYCLES_WEBGPU_SVM_QUERIES |
+                                          CYCLES_WEBGPU_SVM_PIXEL_WIREFRAME;
+  if (volume &&
+      (transparent || hair_words || encoded.has_subsurface || encoded.has_transmission ||
+       (encoded.svm[1] & unhandled_volume_materials)))
+  {
+    reason = "WebGPU Cycles homogeneous volumes need opaque surface shaders and Combined film";
+    return false;
+  }
+  const size_t volume_words = volume ? CYCLES_WEBGPU_SURFACE_ABSORPTION_OFFSETS -
+                                          CYCLES_WEBGPU_SURFACE_OFFSETS + volume_record_words : 0;
+  if (pixel_wireframe && varying_transparency) {
+    reason = "WebGPU Cycles needs ray differentials in varying transparent shadows for pixel Wireframe";
+    return false;
+  }
+  if (pixel_wireframe && encoded.has_subsurface) {
+    reason = "WebGPU Cycles needs ray differentials through subsurface scattering for pixel Wireframe";
+    return false;
+  }
+  if (transparent && (encoded.svm[1] & CYCLES_WEBGPU_SVM_AOV)) {
+    reason = "WebGPU Cycles needs transparent film data pass accumulation for AOVs";
+    return false;
+  }
+  const size_t transparent_words = transparent ?
+                                       1 + CYCLES_WEBGPU_TRANSPARENT_SHADOW_HEADER_WORDS +
+                                           transparent_shadows.size() :
+                                       0;
+  if (transparent &&
+      (scene.params.use_bvh_spatial_split || integrator.transparent_min_bounce < 0 ||
+       integrator.transparent_max_bounce < 0 ||
+       uint(integrator.transparent_min_bounce) > CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK ||
+       uint(integrator.transparent_max_bounce) > CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK))
+  {
+    reason = "WebGPU Cycles constant transparent shadows need a BVH without spatial splitting and valid bounce limits";
+    return false;
+  }
   const bool multiple_points = !light_tree && dscene.lights.size() > 1;
   const bool area = !light_tree && !multiple_points &&
                     dscene.lights.data()[0].type == LIGHT_AREA;
@@ -945,14 +1354,20 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
       reason = "WebGPU Cycles GGX lookup tables exceed the scene upload budget";
       return false;
     }
-    if (const char *error = encode_ggx_tables(dscene, encoded.has_transmission, encoded.lighting))
+    if (const char *error = encode_ggx_tables(
+            dscene, encoded.has_transmission, transparent, encoded.lighting))
     {
       reason = error;
       return false;
     }
   }
   const size_t used = encoded.svm.size() + encoded.lighting.size() -
-                      CYCLES_WEBGPU_LIGHT_HEADER_WORDS;
+                      CYCLES_WEBGPU_LIGHT_HEADER_WORDS + transparent_words + hair_words +
+                      volume_words;
+  if (used > extra_words) {
+    reason = "WebGPU Cycles scene metadata exceeds the upload budget";
+    return false;
+  }
   const char *lighting_error = nullptr;
   if (light_tree) {
     lighting_error = encode_stock_light_tree(scene, extra_words - used, encoded.lighting);
@@ -1001,8 +1416,10 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
   }
 
   PackedWords surface;
-  surface.words.reserve(size_t(surface_words));
-  surface.words.resize(CYCLES_WEBGPU_SURFACE_OFFSETS);
+  surface.words.reserve(size_t(surface_words) + transparent_words + hair_words + volume_words);
+  surface.words.resize(volume ? CYCLES_WEBGPU_SURFACE_ABSORPTION_OFFSETS :
+                                    (transparent ? CYCLES_WEBGPU_SURFACE_TRANSPARENT_OFFSETS :
+                                                   CYCLES_WEBGPU_SURFACE_OFFSETS) + hair_words);
   surface.words[0] = uint32_t(surface.words.size());
   for (size_t index = 0; index < dscene.objects.size(); ++index) {
     surface.words.push_back(dscene.object_flag.data()[index]);
@@ -1028,14 +1445,59 @@ bool cycles_webgpu_encode_scene(const Scene &scene, CyclesWebGPUScene &out, std:
   surface.words[CYCLES_WEBGPU_SURFACE_OBJECT_SVM_OFFSET] = uint32_t(surface.words.size());
   for (const KernelObject &object : host_data(dscene.objects)) {
     surface.append(object.itfm);
-    for (const float value : {object.color[0], object.color[1], object.color[2], object.alpha,
-                              object.pass_id, object.random_number}) {
+    for (const float value : {object.color[0],
+                              object.color[1],
+                              object.color[2],
+                              object.alpha,
+                              object.pass_id,
+                              object.random_number,
+                              object.dupli_generated[0],
+                              object.dupli_generated[1],
+                              object.dupli_generated[2],
+                              object.dupli_uv[0],
+                              object.dupli_uv[1]})
+    {
       surface.words.push_back(float_word(value));
     }
   }
   surface.words[CYCLES_WEBGPU_SURFACE_SHADER_PASS_OFFSET] = uint32_t(surface.words.size());
   for (const KernelShader &shader : host_data(dscene.shaders)) {
     surface.words.push_back(uint32_t(shader.pass_id));
+  }
+  if (transparent) {
+    surface.words[CYCLES_WEBGPU_SURFACE_TRANSPARENT_OFFSET] = uint32_t(surface.words.size());
+    surface.words.push_back(uint32_t(integrator.transparent_max_bounce));
+    const uint32_t shadow_flags = (integrator.transparent_shadows ?
+                                       CYCLES_WEBGPU_TRANSPARENT_SHADOW_ENABLE :
+                                       0) |
+                                  (varying_transparency ?
+                                       CYCLES_WEBGPU_TRANSPARENT_SHADOW_VARYING :
+                                       0);
+    surface.words.push_back(shadow_flags);
+    surface.words.insert(surface.words.end(), transparent_shadows.begin(), transparent_shadows.end());
+  }
+
+  if (volume) {
+    const size_t offset = surface.words.size();
+    surface.words[CYCLES_WEBGPU_SURFACE_ABSORPTION_OFFSET] = uint32_t(offset);
+    if (volume_scattering) {
+      surface.words[CYCLES_WEBGPU_SURFACE_VOLUME_COUNT] = uint32_t(volume_media.size());
+      size_t grid_offset = offset + volume_media.size() * CYCLES_WEBGPU_VOLUME_SCATTER_WORDS;
+      for (VolumeMedium &medium : volume_media) {
+        if (!medium.grids.empty()) {
+          medium.words[CYCLES_WEBGPU_VOLUME_GRID_OFFSET] = uint32_t(grid_offset);
+          grid_offset += medium.grids.size();
+        }
+        surface.words.insert(surface.words.end(), medium.words.begin(), medium.words.end());
+      }
+      for (const VolumeMedium &medium : volume_media) {
+        surface.words.insert(surface.words.end(), medium.grids.begin(), medium.grids.end());
+      }
+    }
+    else {
+      const VolumeWords &words = volume_media.front().words;
+      surface.words.insert(surface.words.end(), words.begin(), words.begin() + CYCLES_WEBGPU_ABSORPTION_WORDS);
+    }
   }
 
   encoded.bvh = std::move(bvh.words);

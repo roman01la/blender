@@ -17,85 +17,39 @@ def _remove_between(source, start, end, replacement=""):
 
 
 def _light_tree_header(source):
-    # Static analytic lamps need no triangle geometry, local mesh-light transforms,
-    # or link-specific roots. Keep the importance, selection and PDF code intact.
-    for name in ("spot", "sun", "triangle"):
+    # The synchronized scene admits points, areas, the world map and triangles.
+    # Keep stock mesh-instance traversal, bounds and PDF evaluation.
+    for name in ("spot", "sun"):
         source = _replace(source, f'#include "kernel/light/{name}.h"\n')
-    source = _remove_between(
-        source, "ccl_device_inline bool is_light", "ccl_device_inline bool is_leaf")
-    source = _remove_between(
-        source,
-        "template<bool in_volume_segment>\nccl_device void light_tree_to_local_space",
-        "/* This is the general function")
-    source = _remove_between(
-        source, "  if (is_light(kemitter)) {", "  return true;\n}", """  const KernelLight lamp = kernel_data_fetch(lights, ~kemitter->light.id);
-  centroid = lamp.co;
-  switch (lamp.type) {
-    case LIGHT_POINT:
-      dir = safe_normalize(P - centroid);
-      break;
-    case LIGHT_AREA:
-      dir = lamp.area.dir;
-      break;
-    case LIGHT_BACKGROUND:
-      centroid = make_float3(0.0f, 0.0f, 1.0f);
-      dir = make_float3(0.0f, 0.0f, -1.0f);
-      break;
-    default:
-      return false;
-  }
+    source = _replace(source, """      case LIGHT_SPOT:
+        dir = klight->spot.dir;
+        break;
 """)
-    source = _remove_between(source, "  if (is_mesh(kemitter)) {", "  KernelBoundingCone bcone;")
-    source = _remove_between(
-        source, "  if (is_triangle(kemitter)) {", "  is_visible |= has_transmission;", """  const KernelLight lamp = kernel_data_fetch(lights, ~kemitter->light.id);
-  switch (lamp.type) {
-    case LIGHT_POINT:
-      is_visible = point_light_tree_parameters<in_volume_segment>(
-          &lamp, centroid, P_c, cos_theta_u, distance, point_to_centroid);
-      bcone.theta_o = 0.0f;
-      break;
-    case LIGHT_AREA:
-      is_visible = area_light_tree_parameters<in_volume_segment>(
-          &lamp, centroid, P_c, N_or_D, bcone.axis, cos_theta_u, distance, point_to_centroid);
-      break;
-    case LIGHT_BACKGROUND:
-      is_visible = background_light_tree_parameters<in_volume_segment>(
-          centroid, t, cos_theta_u, distance, point_to_centroid, theta_d);
-      break;
-    default:
-      return;
-  }
-
+    source = _replace(source, """      case LIGHT_SUN:
+        dir = centroid;
+        break;
 """)
-    source = _remove_between(
-        source, "  if (in_volume_segment) {\n    /* Vector that forms", "  light_tree_importance",
-        """  if (in_volume_segment) {
-    point_to_centroid = -compute_v(centroid, P, N_or_D, bcone.axis, t);
-  }
-
+    source = _replace(source, """      case LIGHT_SPOT:
+        is_visible = spot_light_tree_parameters<in_volume_segment>(
+            klight, centroid, P_c, bcone, cos_theta_u, distance, point_to_centroid, energy);
+        break;
 """)
-    source = _remove_between(
-        source, "  const ccl_global KernelLightTreeEmitter *kemitter = &kernel_data_fetch(light_tree_emitters,\n                                                                         selected_index);",
-        "  return selected_index;")
+    source = _replace(source, """      case LIGHT_SUN:
+        is_visible = sun_light_tree_parameters<in_volume_segment>(
+            centroid, bcone.theta_e, t, cos_theta_u, distance, point_to_centroid, theta_d);
+        break;
+""")
     source = _remove_between(
         source,
         "  if (kernel_data.kernel_features & KERNEL_FEATURE_LIGHT_LINKING) {",
         "  return 0;")
-    source = _remove_between(
-        source, "      if (node_index < 0) {", "    }\n\n    /* Inner node. */", "      break;\n")
-    source = _remove_between(
-        source, "  int subtree_root_index;", "  float pdf = 1.0f;",
-        "  uint bit_trail = kemitter->bit_trail;\n\n")
-    source = _replace(source, "if (emitter == target_emitter)", "if (emitter == index_emitter)")
-    source = _remove_between(
-        source, "      if (subtree_root_index != -1) {", "      return pdf;")
     source = _remove_between(
         source, "/* If the function is called in volume", "CCL_NAMESPACE_END")
 
     # Stock devices can take an address in a contiguous array. In the WebGPU
     # shaders, extend the lifetime of the record decoded from storage instead.
     pattern = (
-        r"const ccl_global (KernelLightTreeNode|KernelLightTreeEmitter) \*(\w+) = "
+        r"const ccl_global (KernelLight|KernelLightTreeNode|KernelLightTreeEmitter) \*(\w+) = "
         r"&kernel_data_fetch\((.*?)\);"
     )
     source, count = re.subn(
@@ -107,13 +61,13 @@ def _light_tree_header(source):
         source,
         flags=re.DOTALL,
     )
-    if count != 7:
+    if count != 15:
         raise ValueError(f"Unexpected number of stock Light Tree pointer loads: {count}")
     return source
 
 
 def prepare_light_tree_headers(work, cycles):
-    """Shadow stock headers only in analytic Light Tree shader compilations."""
+    """Shadow stock headers only in Light Tree shader compilations."""
     overlay = work / "stock-light-tree"
     light = overlay / "kernel" / "light"
     light.mkdir(parents=True)

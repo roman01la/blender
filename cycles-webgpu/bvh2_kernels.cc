@@ -16,13 +16,19 @@
 
 /* The triangle traversal variant does not implement shadow linking. */
 #undef __SHADOW_LINKING__
+#ifdef CYCLES_WEBGPU_ABSORPTION
+#  undef __OBJECT_MOTION__
+#endif
 
 __attribute__((pure)) unsigned int cycles_scene_word(unsigned int index);
+#ifdef CYCLES_WEBGPU_ABSORPTION
+__attribute__((pure)) unsigned int cycles_volume_word(unsigned int index);
+#endif
 #if defined(CYCLES_WEBGPU_SURFACE) || defined(CYCLES_WEBGPU_OFFSET_CLOSEST) || \
-    defined(CYCLES_WEBGPU_SUBSURFACE)
+    defined(CYCLES_WEBGPU_SUBSURFACE) || defined(CYCLES_WEBGPU_TRANSPARENT_SHADOW)
 __attribute__((pure)) unsigned int cycles_surface_word(unsigned int index);
 #endif
-#ifdef CYCLES_WEBGPU_SUBSURFACE
+#if defined(CYCLES_WEBGPU_SUBSURFACE) || defined(CYCLES_WEBGPU_SCENE_QUERIES)
 __attribute__((pure)) unsigned int cycles_camera_sample_word(unsigned int index);
 #endif
 
@@ -47,14 +53,28 @@ enum SceneOffset : uint {
 };
 
 struct TraversalGlobals {
+#ifdef CYCLES_WEBGPU_ABSORPTION
+  KernelData data;
+#else
   KernelData data{};
+#endif
   uint offsets[SceneOffsetCount];
   /* Stock object helpers sometimes take the address of a fetched record.
    * The static triangle variant reads one object per fetch and keeps no references. */
+#ifdef CYCLES_WEBGPU_ABSORPTION
+  mutable KernelObject object;
+#else
   mutable KernelObject object{};
+#endif
 };
 
 using KernelGlobals = const TraversalGlobals *;
+
+#ifdef CYCLES_WEBGPU_SHADOW_SVM
+static float3 cycles_shadow_surface_transparency(KernelGlobals kg,
+                                                  const Intersection &hit,
+                                                  const float3 direction);
+#endif
 
 #define KERNEL_DATA_ARRAY(type, name) \
   struct name##_tag { \
@@ -138,7 +158,9 @@ ccl_device_inline const KernelObject &scene_fetch(KernelGlobals kg, objects_tag,
 {
   const uint word = kg->offsets[SceneObjects] + 13 * index;
   kg->object.position_offset = std::bit_cast<int>(cycles_scene_word(word));
+#ifndef CYCLES_WEBGPU_ABSORPTION
   kg->object.itfm = {scene_float4(word + 1), scene_float4(word + 5), scene_float4(word + 9)};
+#endif
 #ifdef CYCLES_WEBGPU_SURFACE
   const uint surface = cycles_surface_word(0) + 13 * index + 1;
   kg->object.tfm = {surface_float4(surface),
@@ -151,6 +173,14 @@ ccl_device_inline const KernelObject &scene_fetch(KernelGlobals kg, objects_tag,
 #endif
   return kg->object;
 }
+
+#ifdef CYCLES_WEBGPU_ABSORPTION
+ccl_device_inline Transform absorption_inverse_transform(KernelGlobals kg, const uint index)
+{
+  const uint word = kg->offsets[SceneObjects] + 13 * index;
+  return {scene_float4(word + 1), scene_float4(word + 5), scene_float4(word + 9)};
+}
+#endif
 
 ccl_device_inline uint3 scene_fetch(KernelGlobals kg, tri_vindex_tag, uint index)
 {
@@ -165,7 +195,12 @@ ccl_device_inline float3 scene_fetch(KernelGlobals kg, tri_verts_tag, uint index
   return make_float3(scene_float(word), scene_float(word + 1), scene_float(word + 2));
 }
 
-#ifdef CYCLES_WEBGPU_SUBSURFACE
+#ifdef CYCLES_WEBGPU_ABSORPTION
+ccl_device_inline uint scene_fetch(KernelGlobals, object_flag_tag, uint index)
+{
+  return cycles_volume_word(cycles_volume_word(0) + 13 * index);
+}
+#elif defined(CYCLES_WEBGPU_SUBSURFACE) || defined(CYCLES_WEBGPU_SCENE_QUERIES)
 ccl_device_inline uint scene_fetch(KernelGlobals, object_flag_tag, uint index)
 {
   return cycles_surface_word(cycles_surface_word(0) + 13 * index);
@@ -253,12 +288,74 @@ ccl_device_inline void triangle_terminator_offsets(KernelGlobals kg,
 #define BVH_FUNCTION_FEATURES 0
 #include "kernel/bvh/traversal.h"
 
-#ifdef CYCLES_WEBGPU_SUBSURFACE
+#ifdef CYCLES_WEBGPU_TRANSPARENT_SHADOW
+#  include "../blender-platform/cycles-webgpu/material_layout.h"
+
+struct ConstantTransparentShadow {
+  struct {
+    uint ray_visibility;
+    RaySelfPrimitives ray_self;
+  } base;
+  int state;
+  uint remaining;
+  uint transparency;
+  float3 throughput;
+#  ifdef CYCLES_WEBGPU_SHADOW_SVM
+  float3 direction;
+#  endif
+};
+
+/* The stock shadow traversal already handles both endpoint exclusions. These
+ * materials can multiply their precomputed extinction immediately instead of
+ * recording and shading intersections. The host excludes spatial splits. */
+template<int>
+ccl_device_inline bool constant_shadow_filter(KernelGlobals kg,
+                                               int,
+                                               ConstantTransparentShadow &payload,
+                                               const RaySelfPrimitives &,
+                                               uint,
+                                               const Intersection isect)
+{
+  if (payload.remaining == 0) {
+    payload.throughput = zero_spectrum();
+    return false;
+  }
+  --payload.remaining;
+  const uint shader = cycles_surface_word(cycles_surface_word(1) + isect.prim) & SHADER_MASK;
+  const uint offset = payload.transparency + CYCLES_WEBGPU_TRANSPARENT_SHADOW_HEADER_WORDS +
+                      3 * shader;
+  const uint red = cycles_surface_word(offset);
+#  ifdef CYCLES_WEBGPU_SHADOW_SVM
+  if (red == CYCLES_WEBGPU_TRANSPARENT_SHADOW_EVAL) {
+    payload.throughput *= cycles_shadow_surface_transparency(kg, isect, payload.direction);
+  }
+  else
+#  endif
+  {
+    payload.throughput *= make_float3(__uint_as_float(red),
+                                       __uint_as_float(cycles_surface_word(offset + 1)),
+                                       __uint_as_float(cycles_surface_word(offset + 2)));
+  }
+  return !is_zero(payload.throughput);
+}
+
+#  define BVHShadowAllPayload ConstantTransparentShadow
+#  define ISECT_TEST_NONE 0
+#  define bvh_shadow_all_anyhit_filter constant_shadow_filter
+#  define BVH_FUNCTION_NAME bvh_intersect_constant_transparent_shadows
+#  define BVH_FUNCTION_FEATURES 0
+#  include "kernel/bvh/shadow_all.h"
+#  undef bvh_shadow_all_anyhit_filter
+#  undef ISECT_TEST_NONE
+#  undef BVHShadowAllPayload
+#endif
+
+#if defined(CYCLES_WEBGPU_SUBSURFACE) || defined(CYCLES_WEBGPU_SCENE_QUERIES)
 #  define BVH_FUNCTION_NAME bvh_intersect_local_static_triangles
 #  define BVH_FUNCTION_FEATURES 0
 #  include "kernel/bvh/local.h"
 
-template<bool single_hit>
+template<bool single_hit = false>
 ccl_device_inline bool scene_intersect_local(KernelGlobals kg,
                                               const Ray *ray,
                                               LocalIntersection *isect,
@@ -267,7 +364,9 @@ ccl_device_inline bool scene_intersect_local(KernelGlobals kg,
                                               const int max_hits)
 {
   if (!intersection_ray_valid(ray)) {
-    isect->num_hits = 0;
+    if (isect != nullptr) {
+      isect->num_hits = 0;
+    }
     return false;
   }
   return bvh_intersect_local_static_triangles(kg, ray, isect, object, lcg_state, max_hits);
@@ -277,6 +376,10 @@ ccl_device_inline bool scene_intersect_local(KernelGlobals kg,
 
 using UInt4 = unsigned int __attribute__((ext_vector_type(4)));
 
+#ifdef CYCLES_WEBGPU_SCENE_QUERIES
+#  include "scene_query_kernels.h"
+#endif
+
 #ifdef CYCLES_WEBGPU_SUBSURFACE
 #  undef ccl_device
 #  define ccl_device static inline __attribute__((always_inline))
@@ -284,6 +387,9 @@ using UInt4 = unsigned int __attribute__((ext_vector_type(4)));
 #  include "kernel/integrator/subsurface_random_walk.h"
 #  include "kernel/closure/bssrdf.h"
 #  include "kernel/integrator/subsurface_entry.h"
+#  ifdef CYCLES_WEBGPU_COMPACT_PATHS
+#    include "kernel/integrator/subsurface_disk.h"
+#  endif
 
 using Float4 = float __attribute__((ext_vector_type(4)));
 
@@ -307,8 +413,10 @@ using Float4 = float __attribute__((ext_vector_type(4)));
                                                   Float4 &throughput
 #ifdef CYCLES_WEBGPU_COMPACT_PATHS
                                                   , const Float4 geometric,
+                                                  const unsigned int backfacing,
                                                   const Float4 shading_normal,
-                                                  Float4 &exit_origin
+                                                  Float4 &exit_origin,
+                                                  unsigned int &exit_flags
 #endif
                                                   )
 {
@@ -376,14 +484,30 @@ using Float4 = float __attribute__((ext_vector_type(4)));
 #else
   const float3 Ng = bssrdf.N;
 #endif
-  float3 outgoing = zero_float3();
-  const bool entered = subsurface_entry_bounce(&globals, &bssrdf, &sd, &rng_state, &outgoing);
-  state.ray.D = outgoing;
   Ray ray{};
-  LocalIntersection local{};
-  if (entered && dot(Ng, outgoing) < 0.0f &&
-      subsurface_random_walk(&globals, &state, rng_state, ray, local))
+  LocalIntersection local;
+  bool scattered;
+#ifdef CYCLES_WEBGPU_COMPACT_PATHS
+  exit_flags = backfacing ? PATH_RAY_SUBSURFACE_BACKFACING : 0u;
+  if (bssrdf.type == CLOSURE_BSSRDF_BURLEY_ID) {
+    exit_flags |= PATH_RAY_SUBSURFACE_DISK;
+    state.path.flag = exit_flags;
+    state.subsurface.N = Ng;
+    scattered = subsurface_disk(&globals, &state, rng_state, ray, local);
+  }
+  else
+#endif
   {
+#ifdef CYCLES_WEBGPU_COMPACT_PATHS
+    exit_flags |= PATH_RAY_SUBSURFACE_RANDOM_WALK;
+#endif
+    float3 outgoing = zero_float3();
+    const bool entered = subsurface_entry_bounce(&globals, &bssrdf, &sd, &rng_state, &outgoing);
+    state.ray.D = outgoing;
+    scattered = entered && dot(Ng, outgoing) < 0.0f &&
+                subsurface_random_walk(&globals, &state, rng_state, ray, local);
+  }
+  if (scattered) {
     const Intersection &exit = local.hits[0];
     hit = {1, uint(exit.prim), uint(exit.object), uint(exit.type)};
     coordinates = {exit.t, exit.u, exit.v, 0.0f};
@@ -411,7 +535,148 @@ using Float4 = float __attribute__((ext_vector_type(4)));
 #endif
 
 #ifdef CYCLES_WEBGPU_SURFACE
+static bool setup_triangle_shading(ccl::KernelGlobals globals,
+                                   ccl::ShaderData &sd,
+                                   UInt4 hit,
+                                   UInt4 coordinates,
+                                   UInt4 direction)
+{
+  sd.prim = std::bit_cast<int>(hit.y);
+  sd.object = std::bit_cast<int>(hit.z);
+  sd.type = ccl::PRIMITIVE_TRIANGLE;
+  sd.object_flag = cycles_surface_word(cycles_surface_word(0) + 13 * hit.z);
+  sd.u = std::bit_cast<float>(coordinates.y);
+  sd.v = std::bit_cast<float>(coordinates.z);
+  ccl::triangle_shader_setup(globals, &sd);
+  if (!(sd.object_flag & ccl::SD_OBJECT_TRANSFORM_APPLIED)) {
+    ccl::object_normal_transform(globals, &sd, &sd.Ng);
 #  ifdef CYCLES_WEBGPU_COMPACT_PATHS
+    ccl::object_normal_transform(globals, &sd, &sd.N);
+#  endif
+  }
+  const ccl::float3 ray_direction = ccl::make_float3(std::bit_cast<float>(direction.x),
+                                                    std::bit_cast<float>(direction.y),
+                                                    std::bit_cast<float>(direction.z));
+  sd.wi = -ray_direction;
+  const bool backface = ccl::dot(sd.Ng, ray_direction) > 0;
+  if (backface) {
+    sd.Ng = -sd.Ng;
+    sd.N = -sd.N;
+  }
+  return backface;
+}
+
+static void load_triangle_shading_offsets(ccl::TraversalGlobals &globals)
+{
+  for (unsigned int slot = 1; slot < ccl::SceneOffsetCount; ++slot) {
+    globals.offsets[slot] = cycles_scene_word(slot);
+  }
+}
+
+#  ifdef CYCLES_WEBGPU_SHADOW_SVM
+using ShadowFloat4 = float __attribute__((ext_vector_type(4)));
+
+ShadowFloat4 cycles_svm_shadow_transparency(UInt4 hit,
+                                            UInt4 direction,
+                                            UInt4 position,
+                                            UInt4 normal,
+                                            UInt4 geometric,
+                                            UInt4 dpdu,
+                                            unsigned int object);
+
+namespace ccl {
+static float3 cycles_shadow_surface_transparency(KernelGlobals kg,
+                                                  const Intersection &hit,
+                                                  const float3 direction)
+{
+  const auto encode = [](const float3 value, const uint w) -> UInt4 {
+    return {__float_as_uint(value.x), __float_as_uint(value.y), __float_as_uint(value.z), w};
+  };
+  ShaderData sd{};
+  const UInt4 ray_direction = encode(direction, __float_as_uint(hit.t));
+  const UInt4 intersection = {1, uint(hit.prim), uint(hit.object), uint(hit.type)};
+  const bool backface = setup_triangle_shading(
+      kg, sd, intersection, UInt4{ray_direction.w, __float_as_uint(hit.u),
+                                  __float_as_uint(hit.v), 0}, ray_direction);
+  float3 dpdu = zero_float3();
+  if (CYCLES_WEBGPU_SURFACE_HAS_HAIR(cycles_surface_word(0))) {
+    float3 dpdv;
+    triangle_dPdudv(kg, sd.object, sd.prim, &dpdu, &dpdv);
+    if (!(sd.object_flag & SD_OBJECT_TRANSFORM_APPLIED)) {
+      object_dir_transform(kg, &sd, &dpdu);
+    }
+    if (backface) {
+      dpdu = -dpdu;
+    }
+  }
+  const auto transparency = cycles_svm_shadow_transparency(
+      UInt4{uint(hit.prim), uint(hit.object), __float_as_uint(hit.u), __float_as_uint(hit.v)},
+      ray_direction,
+      encode(sd.P, backface ? 2u : 1u),
+      encode(sd.N, uint(sd.shader)),
+      encode(sd.Ng, sd.object_flag),
+      encode(dpdu, 0),
+      uint(hit.object));
+  return make_float3(transparency.x, transparency.y, transparency.z);
+}
+}  // namespace ccl
+#  endif
+
+#  ifdef CYCLES_WEBGPU_SAMPLED_EMISSION
+void cycles_triangle_sample_surface(UInt4 sample,
+                                    unsigned int object,
+                                    UInt4 direction,
+                                    UInt4 &position,
+                                    UInt4 &normal,
+                                    UInt4 &geometric)
+{
+  ccl::TraversalGlobals globals;
+  ccl::ShaderData sd{};
+  const UInt4 hit = {1, sample.x - 1, object, ccl::PRIMITIVE_TRIANGLE};
+  const UInt4 coordinates = {direction.w, sample.z, sample.w, 0};
+  load_triangle_shading_offsets(globals);
+  const bool backface = setup_triangle_shading(&globals, sd, hit, coordinates, direction);
+  position = {std::bit_cast<unsigned int>(sd.P.x),
+              std::bit_cast<unsigned int>(sd.P.y),
+              std::bit_cast<unsigned int>(sd.P.z),
+              backface ? 2u : 1u};
+  normal = {std::bit_cast<unsigned int>(sd.N.x),
+            std::bit_cast<unsigned int>(sd.N.y),
+            std::bit_cast<unsigned int>(sd.N.z),
+            static_cast<unsigned int>(sd.shader)};
+  geometric = {std::bit_cast<unsigned int>(sd.Ng.x),
+               std::bit_cast<unsigned int>(sd.Ng.y),
+               std::bit_cast<unsigned int>(sd.Ng.z),
+               sd.object_flag};
+}
+#  elif defined(CYCLES_WEBGPU_COMPACT_PATHS)
+[[gnu::always_inline]] void cycles_triangle_derivatives(const UInt4 hit,
+                                                         const unsigned int backfacing,
+                                                         UInt4 &dpdu,
+                                                         UInt4 &dpdv)
+{
+  using namespace ccl;
+  TraversalGlobals globals;
+  for (uint slot = 1; slot < SceneOffsetCount; ++slot) {
+    globals.offsets[slot] = cycles_scene_word(slot);
+  }
+  ShaderData sd{};
+  sd.object = int(hit.z);
+  sd.object_flag = cycles_surface_word(cycles_surface_word(0) + 13 * hit.z);
+  float3 dPdu, dPdv;
+  triangle_dPdudv(&globals, sd.object, int(hit.y), &dPdu, &dPdv);
+  if (!(sd.object_flag & SD_OBJECT_TRANSFORM_APPLIED)) {
+    object_dir_transform(&globals, &sd, &dPdu);
+    object_dir_transform(&globals, &sd, &dPdv);
+  }
+  if (backfacing) {
+    dPdu = -dPdu;
+    dPdv = -dPdv;
+  }
+  dpdu = {__float_as_uint(dPdu.x), __float_as_uint(dPdu.y), __float_as_uint(dPdu.z), 0};
+  dpdv = {__float_as_uint(dPdv.x), __float_as_uint(dPdv.y), __float_as_uint(dPdv.z), 0};
+}
+
 [[gnu::always_inline]] void cycles_triangle_surface(UInt4 hit,
                                                      UInt4 coordinates,
                                                      UInt4 direction,
@@ -425,6 +690,7 @@ using Float4 = float __attribute__((ext_vector_type(4)));
 void cycles_triangle_surface(UInt4 hit, UInt4 coordinates, UInt4 direction,
                              UInt4 &position, UInt4 &normal)
 #  endif
+#  ifndef CYCLES_WEBGPU_SAMPLED_EMISSION
 {
   position = {0, 0, 0, 0};
   normal = {0, 0, 0, 0xffffffffu};
@@ -448,34 +714,11 @@ void cycles_triangle_surface(UInt4 hit, UInt4 coordinates, UInt4 direction,
   }
 
   ccl::TraversalGlobals globals;
-  for (unsigned int slot = 1; slot < ccl::SceneOffsetCount; ++slot) {
-    globals.offsets[slot] = cycles_scene_word(slot);
-  }
   ccl::ShaderData sd{};
-  sd.prim = std::bit_cast<int>(hit.y);
-  sd.object = std::bit_cast<int>(hit.z);
-  sd.type = ccl::PRIMITIVE_TRIANGLE;
-  sd.object_flag = cycles_surface_word(cycles_surface_word(0) + 13 * hit.z);
-  sd.u = std::bit_cast<float>(coordinates.y);
-  sd.v = std::bit_cast<float>(coordinates.z);
-  ccl::triangle_shader_setup(&globals, &sd);
-  if (!(sd.object_flag & ccl::SD_OBJECT_TRANSFORM_APPLIED)) {
-    ccl::object_normal_transform(&globals, &sd, &sd.Ng);
-#  ifdef CYCLES_WEBGPU_COMPACT_PATHS
-    ccl::object_normal_transform(&globals, &sd, &sd.N);
-#  endif
-  }
-  const ccl::float3 ray_direction = ccl::make_float3(std::bit_cast<float>(direction.x),
-                                                    std::bit_cast<float>(direction.y),
-                                                    std::bit_cast<float>(direction.z));
-  const bool backface = ccl::dot(sd.Ng, ray_direction) > 0;
-  if (backface) {
-    sd.Ng = -sd.Ng;
-    sd.N = -sd.N;
-  }
+  load_triangle_shading_offsets(globals);
+  const bool backface = setup_triangle_shading(&globals, sd, hit, coordinates, direction);
 
 #  ifdef CYCLES_WEBGPU_COMPACT_PATHS
-  sd.wi = -ray_direction;
   if (sd.shader & ccl::SHADER_SMOOTH_NORMAL) {
     sd.shader_flag = cycles_surface_word(cycles_surface_word(4) + (sd.shader & ccl::SHADER_MASK));
     const uint32_t cutoff = cycles_surface_word(cycles_surface_word(2) + 2 * hit.z + 1);
@@ -514,6 +757,7 @@ void cycles_triangle_surface(UInt4 hit, UInt4 coordinates, UInt4 direction,
             std::bit_cast<unsigned int>(sd.N.z),
             static_cast<unsigned int>(sd.shader)};
 }
+#  endif
 #endif
 
 #if defined(CYCLES_WEBGPU_OFFSET_CLOSEST) || defined(CYCLES_WEBGPU_INTERSECT_SHADOW) || \
@@ -571,12 +815,18 @@ void cycles_bvh2_trace(UInt4 origin,
   ray.D = ccl::make_float3(std::bit_cast<float>(direction.x),
                            std::bit_cast<float>(direction.y),
                            std::bit_cast<float>(direction.z));
-  ray.tmin = std::bit_cast<float>(origin.w);
   ray.tmax = std::bit_cast<float>(direction.w);
   ray.self.object = std::bit_cast<int>(options.y);
   ray.self.prim = std::bit_cast<int>(options.z);
+#if defined(CYCLES_WEBGPU_INTERSECT_SHADOW) || defined(CYCLES_WEBGPU_WAVEFRONT_LIGHT)
+  ray.tmin = 0.0f;
+  ray.self.light_object = origin.w ? std::bit_cast<int>(options.w) : OBJECT_NONE;
+  ray.self.light_prim = origin.w ? std::bit_cast<int>(origin.w - 1) : PRIM_NONE;
+#else
+  ray.tmin = std::bit_cast<float>(origin.w);
   ray.self.light_object = OBJECT_NONE;
   ray.self.light_prim = PRIM_NONE;
+#endif
 
 #ifdef CYCLES_WEBGPU_OFFSET_CLOSEST
   adjusted_origin = origin;
@@ -618,3 +868,63 @@ void cycles_bvh2_trace(UInt4 origin,
                  std::bit_cast<unsigned int>(intersection.v),
                  0};
 }
+
+#ifdef CYCLES_WEBGPU_TRANSPARENT_SHADOW
+using ShadowFloat4 = float __attribute__((ext_vector_type(4)));
+
+[[gnu::always_inline]] ShadowFloat4 cycles_bvh2_transparent_shadow(UInt4 origin,
+                                                                  UInt4 direction,
+                                                                  UInt4 options,
+                                                                  UInt4 geometric,
+                                                                  unsigned int transparent_bounce)
+{
+  using namespace ccl;
+  TraversalGlobals globals;
+  globals.data.bvh.root = std::bit_cast<int>(cycles_scene_word(0));
+  for (uint slot = 1; slot < SceneOffsetCount; ++slot) {
+    globals.offsets[slot] = cycles_scene_word(slot);
+  }
+  Ray ray{};
+  ray.P = make_float3(__uint_as_float(origin.x), __uint_as_float(origin.y),
+                       __uint_as_float(origin.z));
+  ray.D = make_float3(__uint_as_float(direction.x), __uint_as_float(direction.y),
+                       __uint_as_float(direction.z));
+  ray.tmax = __uint_as_float(direction.w);
+  ray.self.object = std::bit_cast<int>(options.y);
+  ray.self.prim = std::bit_cast<int>(options.z);
+  ray.self.light_object = origin.w ? std::bit_cast<int>(options.w) : OBJECT_NONE;
+  ray.self.light_prim = origin.w ? std::bit_cast<int>(origin.w - 1) : PRIM_NONE;
+  if (ray.self.prim != PRIM_NONE && ray.self.object != OBJECT_NONE &&
+      needs_surface_ray_offset(&globals, ray, geometric.w))
+  {
+    ray.P = offset_surface_ray(ray.P, geometric);
+  }
+  if (!intersection_ray_valid(&ray)) {
+    return {1.0f, 1.0f, 1.0f, 0.0f};
+  }
+  const uint table = cycles_surface_word(CYCLES_WEBGPU_SURFACE_TRANSPARENT_OFFSET);
+  if (!(cycles_surface_word(table + 1) & CYCLES_WEBGPU_TRANSPARENT_SHADOW_ENABLE)) {
+    Intersection hit{};
+    const bool blocked = bvh_intersect_static_triangles(
+        &globals, &ray, &hit, PATH_RAY_VISIBILITY_SHADOW_OPAQUE);
+    const float unblocked = float(!blocked);
+    return {unblocked, unblocked, unblocked, 0.0f};
+  }
+  const int max_bounces = int(cycles_surface_word(table));
+  ConstantTransparentShadow payload{{PATH_RAY_VISIBILITY_SHADOW, ray.self},
+                                    0,
+                                    uint(max(max_bounces - int(transparent_bounce), 0)),
+                                    table,
+                                    one_spectrum()
+#  ifdef CYCLES_WEBGPU_SHADOW_SVM
+                                    , ray.D
+#  endif
+                                    };
+  bvh_intersect_constant_transparent_shadows(&globals, &ray, payload);
+  return {payload.throughput.x, payload.throughput.y, payload.throughput.z, 0.0f};
+}
+#endif
+
+#ifdef CYCLES_WEBGPU_ABSORPTION
+#  include "volume_absorption.h"
+#endif

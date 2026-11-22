@@ -90,6 +90,7 @@ class Fixture:
         self.engine = engine
         self.device = device
         self.scene = bpy.context.scene
+        self.triangle_probe = None
         for obj in list(self.scene.objects):
             bpy.data.objects.remove(obj, do_unlink=True)
 
@@ -177,17 +178,21 @@ class Fixture:
         if engine == "cycles":
             import _cycles
             _cycles.enable_print_stats()
-            prefs = bpy.context.preferences.addons["cycles"].preferences
-            prefs.compute_device_type = device
-            prefs.refresh_devices()
-            active = []
-            for candidate in prefs.devices:
-                candidate.use = candidate.type == device
-                if candidate.use:
-                    active.append(candidate.name)
-            if not active:
-                raise RuntimeError(f"No Cycles {device} device")
-            self.scene.cycles.device = "GPU"
+            if device == "CPU":
+                active = ["CPU"]
+                self.scene.cycles.device = "CPU"
+            else:
+                prefs = bpy.context.preferences.addons["cycles"].preferences
+                prefs.compute_device_type = device
+                prefs.refresh_devices()
+                active = []
+                for candidate in prefs.devices:
+                    candidate.use = candidate.type == device
+                    if candidate.use:
+                        active.append(candidate.name)
+                if not active:
+                    raise RuntimeError(f"No Cycles {device} device")
+                self.scene.cycles.device = "GPU"
             self.scene.cycles.use_light_tree = lighting in {"area-world", "mixed-hdri"}
             self.scene.cycles.light_sampling_threshold = 0
             self.scene.cycles.sample_clamp_direct = 0
@@ -497,24 +502,67 @@ class Fixture:
                 tree.links.new(primary, diffuse.inputs["Color"])
         if any(not link.is_valid for link in tree.links):
             raise ValueError("Fixture has an invalid node link")
+        if settings := case.get("triangle_emitter"):
+            from triangle_fixture import TriangleProbe
+
+            if self.triangle_probe is None:
+                self.triangle_probe = TriangleProbe(self.scene)
+            lighting = self.triangle_probe.configure(settings, node)
+            return hashlib.sha256(json_key([graph_fingerprint(tree), lighting]).encode()).hexdigest()
+        if query := case.get("query_fixture"):
+            from scene_query_fixture import configure
+
+            configure(self, node, tree, output, query, case["output"])
+            return hashlib.sha256(json_key([graph_fingerprint(tree), query]).encode()).hexdigest()
+        if transparency := case.get("transparent_fixture"):
+            from transparent_fixture import configure
+
+            configure(self, node, transparency)
+            return hashlib.sha256(
+                json_key([graph_fingerprint(tree), transparency]).encode()).hexdigest()
+        if absorption := case.get("absorption_fixture"):
+            from absorption_fixture import configure
+
+            configure(self, node, absorption)
+            return hashlib.sha256(
+                json_key([graph_fingerprint(tree), absorption]).encode()).hexdigest()
+        if volume := case.get("volume_transport"):
+            from volume_transport_fixture import configure
+
+            media = configure(self, node, volume)
+            return hashlib.sha256(
+                json_key([graph_fingerprint(tree), volume, media]).encode()).hexdigest()
+        if transport := case.get("ray_transport_fixture"):
+            from ray_transport_fixture import configure
+
+            configure(self, node, tree, output, transport)
+            return hashlib.sha256(
+                json_key([graph_fingerprint(tree), transport]).encode()).hexdigest()
         return graph_fingerprint(tree)
 
 
-def image_summary(path):
+def image_summary(path, include_pixels=False, size=(BOX, BOX)):
     # Loading the exported image verifies that a new, nonempty result was produced.
     image = bpy.data.images.load(str(path), check_existing=False)
     try:
         width, height = image.size
         pixels = image.pixels[:]
-        if (width, height) != (BOX, BOX) or len(pixels) != BOX * BOX * 4:
+        if (width, height) != size or len(pixels) != width * height * 4:
             raise ValueError("Render result has unexpected dimensions")
-        center = [pixels[offset:offset + 3] for y in range(8, 24) for x in range(8, 24)
-                  for offset in [4 * (y * width + x)]]
-        pixel_hash = hashlib.sha256(bytes(round(value * 255) for value in pixels)).hexdigest()
-        return {"size": [width, height], "pixel_sha256": pixel_hash, "mean_rgb": [
+        center_indices = [4 * (y * width + x) for y in range(height // 4, 3 * height // 4)
+                          for x in range(width // 4, 3 * width // 4)]
+        center = [pixels[offset:offset + 3] for offset in center_indices]
+        rgba = bytes(round(value * 255) for value in pixels)
+        pixel_hash = hashlib.sha256(rgba).hexdigest()
+        summary = {"size": [width, height], "pixel_sha256": pixel_hash, "mean_rgb": [
                     round(sum(pixel[channel] for pixel in center) / len(center), 6)
                     for channel in range(3)],
+                "mean_alpha": round(sum(pixels[offset + 3] for offset in center_indices) /
+                                    len(center_indices), 6),
                 "magenta": sum(r > 0.94 and g < 0.03 and b > 0.94 for r, g, b in center) / len(center)}
+        if include_pixels:
+            summary["rgba_hex"] = rgba.hex()
+        return summary
     finally:
         bpy.data.images.remove(image)
 
@@ -523,6 +571,9 @@ class Batch:
     def __init__(self, request):
         self.request = request
         self.fixture = Fixture(request["engine"], request["device"], request.get("lighting", "area-world"))
+        self.fixture.volume_grid = request.get("volume_grid")
+        if self.fixture.engine == "cycles":
+            self.default_volume_bounces = self.fixture.scene.cycles.volume_bounces
         self.pending = iter(request["cases"])
         self.active = None
         self.outcome = None
@@ -535,6 +586,12 @@ class Batch:
         self.image.unlink(missing_ok=True)
         emit("begin", id=case["id"])
         try:
+            if self.fixture.engine == "cycles":
+                self.fixture.scene.cycles.samples = case.get("cycles_samples", 2)
+                self.fixture.scene.cycles.volume_bounces = case.get(
+                    "cycles_volume_bounces", self.default_volume_bounces)
+            size = case.get("resolution", BOX)
+            self.fixture.scene.render.resolution_x = self.fixture.scene.render.resolution_y = size
             self.signature = self.fixture.build(case)
             emit("connected", id=case["id"], fingerprint=self.signature,
                  material=self.fixture.material.name)
@@ -553,7 +610,11 @@ class Batch:
             bpy.data.images["Render Result"].save_render(str(self.image), scene=self.fixture.scene)
             self.end("completed", fingerprint=self.signature,
                      gpu=backend() if self.fixture.engine == "eevee" else None,
-                     image=image_summary(self.image))
+                     image=image_summary(
+                         self.image, include_pixels=bool(self.active.get("include_pixels") or
+                                                          self.active.get("absorption_fixture")),
+                         size=(self.fixture.scene.render.resolution_x,
+                               self.fixture.scene.render.resolution_y)))
         except (KeyError, RuntimeError, ValueError) as error:
             self.end("render_error", str(error))
 

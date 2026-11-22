@@ -4,14 +4,18 @@
 
 #include "device/cpu/device_impl.h"
 #include "device/webgpu/svm_material_eval.h"
+#include "device/webgpu/volume_layout.h"
+#include "kernel/constants.h"
 #include "scene/mesh.h"
 #include "scene/object.h"
 #include "scene/scene.h"
 #include "scene/shader.h"
+#include "scene/shader_nodes.h"
 #include "util/color.h"
 
 #include <algorithm>
 #include <limits>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -480,6 +484,7 @@ struct WebGPUSvmSceneHost : WebGPUSvmPackedHost {
   std::vector<uint2> *slot_words;
   uint2 *last_node;
   bool *uses_ies;
+  bool *uses_shadow_path_context;
 
   bool ies(const uint slot, const float /*h_angle*/, const float /*v_angle*/, float &value) const
   {
@@ -510,6 +515,8 @@ struct WebGPUSvmSceneHost : WebGPUSvmPackedHost {
   void visit(const uint type, const uint word) const
   {
     *last_node = make_uint2(type, word);
+    *uses_shadow_path_context |= type == NODE_LIGHT_PATH || type == NODE_AMBIENT_OCCLUSION ||
+                                 type == NODE_RAYCAST || type == NODE_BEVEL;
   }
 
   int attribute(const uint word, const int attr) const
@@ -595,13 +602,150 @@ struct WebGPUSvmSceneHost : WebGPUSvmPackedHost {
   }
 };
 
+/* Keep one stock SVM volume closure in its typed encoding. Scene eligibility
+ * guarantees the kernel can evaluate it without a stack or grid attributes. */
+inline bool webgpu_svm_literal_volume(const DeviceScene &scene,
+                                     const uint shader,
+                                     const int object,
+                                     uint32_t *words,
+                                     bool &absorption,
+                                     bool &has_voxels,
+                                     uint &phase_slots,
+                                     const bool allow_voxel_attributes)
+{
+  const uint count = uint(scene.svm_nodes.size());
+  const auto fetch = [&](const uint index) { return uint(scene.svm_nodes.data()[index]); };
+  const uint shader_count = uint(scene.shaders.size());
+  if (shader_count > count / webgpu_svm_jump_words || shader >= shader_count) {
+    return false;
+  }
+  uint offset = shader * webgpu_svm_jump_words;
+  SVMNodeShaderJump jump;
+  if (fetch(offset++) != NODE_SHADER_JUMP || !webgpu_svm_read(fetch, offset, count, jump) ||
+      uint(jump.offset_volume) < shader_count * webgpu_svm_jump_words ||
+      uint(jump.offset_displacement) > count || jump.offset_displacement <= jump.offset_volume)
+  {
+    return false;
+  }
+  offset = uint(jump.offset_volume);
+  const uint end = uint(jump.offset_displacement);
+  SVMNodeClosureSetWeight weight;
+  if (fetch(offset++) != NODE_CLOSURE_SET_WEIGHT || !webgpu_svm_read(fetch, offset, end, weight) ||
+      offset == end)
+  {
+    return false;
+  }
+  const float3 color = make_float3(weight.rgb);
+  if (!webgpu_svm_finite(color.x) || !webgpu_svm_finite(color.y) || !webgpu_svm_finite(color.z) ||
+      reduce_min(color) < 0.0f)
+  {
+    return false;
+  }
+
+  const uint type = fetch(offset++);
+  const uint start = offset;
+  const WebGPUSvmStackUsage empty_stack;
+  const auto valid_phase = [](const ClosureType phase) {
+    return phase >= CLOSURE_VOLUME_HENYEY_GREENSTEIN_ID && phase <= CLOSURE_VOLUME_DRAINE_ID;
+  };
+  const auto phase_count = [](const ClosureType phase) {
+    return phase == CLOSURE_VOLUME_MIE_ID ? 2u : 1u;
+  };
+  switch (type) {
+    case NODE_CLOSURE_VOLUME: {
+      SVMNodeClosureVolume node;
+      if (!webgpu_svm_read(fetch, offset, end, node) ||
+          node.mix_weight_offset != SVM_STACK_INVALID ||
+          !webgpu_svm_inputs_valid(empty_stack, node.density, node.param1, node.param_extra))
+      {
+        return false;
+      }
+      absorption = node.closure_type == CLOSURE_VOLUME_ABSORPTION_ID;
+      if (absorption) {
+        if (reduce_max(color) > 1.0f || __uint_as_float(node.density.bits) < 0.0f) {
+          return false;
+        }
+        words[CYCLES_WEBGPU_ABSORPTION_COLOR] = std::bit_cast<uint32_t>(color.x);
+        words[CYCLES_WEBGPU_ABSORPTION_COLOR + 1] = std::bit_cast<uint32_t>(color.y);
+        words[CYCLES_WEBGPU_ABSORPTION_COLOR + 2] = std::bit_cast<uint32_t>(color.z);
+        words[CYCLES_WEBGPU_ABSORPTION_DENSITY] = node.density.bits;
+      }
+      else if (!valid_phase(node.closure_type)) {
+        return false;
+      }
+      phase_slots = absorption ? 0u : phase_count(node.closure_type);
+      break;
+    }
+    case NODE_VOLUME_COEFFICIENTS: {
+      SVMNodeVolumeCoefficients node;
+      if (!webgpu_svm_read(fetch, offset, end, node) ||
+          node.mix_weight_offset != SVM_STACK_INVALID || !valid_phase(node.closure_type) ||
+          !webgpu_svm_inputs_valid(
+              empty_stack, node.absorption_coeffs, node.emission_coeffs, node.param1, node.param_extra))
+      {
+        return false;
+      }
+      phase_slots = phase_count(node.closure_type);
+      break;
+    }
+    case NODE_PRINCIPLED_VOLUME: {
+      SVMNodePrincipledVolume node;
+      if (!webgpu_svm_read(fetch, offset, end, node) || node.mix_weight_offset != SVM_STACK_INVALID ||
+          !webgpu_svm_inputs_valid(empty_stack, node.absorption_color, node.emission_color,
+                                   node.blackbody_tint, node.density, node.anisotropy, node.emission,
+                                   node.blackbody, node.temperature) ||
+          (__uint_as_float(node.blackbody.bits) > 0.0f && !scene.data.film.is_rec709))
+      {
+        return false;
+      }
+      phase_slots = 1;
+      for (const int id : {node.attr_density, node.attr_color, node.attr_temperature}) {
+        if (id == ATTR_STD_NOT_FOUND || id == ATTR_STD_NONE) {
+          continue;
+        }
+        AttributeMap attribute;
+        const auto lookup = cycles_webgpu_svm_find_attribute(
+            scene, object, uint64_t(id), attribute);
+        if (lookup == WebGPUSvmAttributeLookup::Missing) {
+          continue;
+        }
+        if (!allow_voxel_attributes || lookup != WebGPUSvmAttributeLookup::Found ||
+            attribute.element != ATTR_ELEMENT_VOXEL) {
+          return false;
+        }
+        has_voxels = true;
+      }
+      break;
+    }
+    default:
+      return false;
+  }
+  if (offset + 1 != end || fetch(offset) != NODE_END ||
+      offset - start > CYCLES_WEBGPU_VOLUME_MAX_BOUNCES - CYCLES_WEBGPU_VOLUME_DATA)
+  {
+    return false;
+  }
+  words[CYCLES_WEBGPU_VOLUME_OPCODE] = type;
+  words[CYCLES_WEBGPU_VOLUME_WEIGHT] = std::bit_cast<uint32_t>(color.x);
+  words[CYCLES_WEBGPU_VOLUME_WEIGHT + 1] = std::bit_cast<uint32_t>(color.y);
+  words[CYCLES_WEBGPU_VOLUME_WEIGHT + 2] = std::bit_cast<uint32_t>(color.z);
+  for (uint index = start; index < offset; ++index) {
+    words[CYCLES_WEBGPU_VOLUME_DATA + index - start] = fetch(index);
+  }
+  return true;
+}
+
 /* Keep the synchronized scene bytecode verbatim and snapshot the texture inputs
  * used by triangle materials. Eval and eligibility share the supported opcodes. */
 inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
                                                std::vector<uint32_t> &words,
+                                               std::vector<uint32_t> &transparent_shadows,
+                                               bool &varying_transparency,
                                                bool &has_ggx,
                                                bool &has_transmission,
                                                bool &has_subsurface,
+                                               bool &advanced_query_svm,
+                                               std::span<const uint> volume_shaders,
                                                std::string &reason,
                                                size_t max_words)
 {
@@ -622,6 +766,9 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   size_t image_slots = 0;
   size_t remaining = max_words - header - count;
   bool requires_extended_svm = false;
+  bool requires_advanced_procedural_svm = false;
+  bool shader_uses_cubic = false;
+  bool has_aov = false;
   const auto fetch = [&](const uint index) { return uint(dscene.svm_nodes.data()[index]); };
   const auto image = [&](int id, float2 uv, bool alpha, float4 &color) {
     auto found = std::find_if(images.begin(), images.end(), [id](const WebGPUSvmImage &item) {
@@ -643,7 +790,6 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
       }
       remaining -= required;
       image_slots = slots;
-      requires_extended_svm |= webgpu_svm_uses_cubic_filter(item.info.interpolation);
       images.push_back(item);
       found = images.end() - 1;
     }
@@ -655,6 +801,9 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
       found->alpha = true;
     }
     const auto &info = found->info;
+    const bool cubic = webgpu_svm_uses_cubic_filter(info.interpolation);
+    requires_extended_svm |= cubic;
+    shader_uses_cubic |= cubic;
     color = webgpu_svm_sample_image<true>(
         [&](const uint index) { return found->pixel(index); },
         info.width,
@@ -693,6 +842,13 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   bool have_ggx = false;
   bool have_transmission = false;
   bool have_subsurface = false;
+  bool have_standalone = false;
+  bool have_hair = false;
+  bool have_portal = false;
+  bool have_mixed_transparent = false;
+  bool pixel_wireframe = false;
+  bool have_sheen = false;
+  bool uses_sheen_ltc = false;
   const WebGPUSvmColorSpace color_space{make_float3(dscene.data.film.rgb_to_y),
                                         make_float3(dscene.data.film.xyz_to_r),
                                         make_float3(dscene.data.film.xyz_to_g),
@@ -703,18 +859,29 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
       reason = "WebGPU Cycles found an invalid SVM material";
       return false;
     }
-    if (checked[shader]) {
+    if (checked[shader] ||
+        std::ranges::find(volume_shaders, shader) != volume_shaders.end()) {
       continue;
     }
 
     const Shader &material = *scene.shaders[shader];
     last_node = make_uint2(0, 0);
     WebGPUSvmMaterial decoded;
+    bool uses_shadow_path_context = false;
+    shader_uses_cubic = false;
     bool uses_uv = false;
     bool uses_generated = false;
+    /* GeometryManager has already evaluated true displacement on the host and
+     * synchronized the displaced BVH. Bump-only materials need surface bump
+     * evaluation only if the finalized graph still has a bump output. */
+    const auto displacement_method = material.get_displacement_method();
+    const bool unsupported_displacement =
+        displacement_method != DISPLACE_TRUE &&
+        (displacement_method == DISPLACE_BUMP ?
+             material.has_bump_from_displacement && material.graph->output()->input("Normal")->link :
+             material.has_displacement || material.has_bump_from_displacement);
     if (material.id != shader || material.has_volume_connected || material.has_volume ||
-        material.has_displacement || material.has_bump_from_surface ||
-        material.has_bump_from_displacement || material.has_aov_output_node ||
+        unsupported_displacement || material.has_bump_from_surface ||
         !webgpu_svm_eval_material(fetch,
                                  image,
                                  WebGPUSvmUv{0.25f, 0.25f},
@@ -730,7 +897,8 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
                                  WebGPUSvmSceneHost{{}, &dscene, &shader_objects[shader],
                                                     &missing_attributes, &attribute_slots,
                                                     &attribute_slot_types, &attribute_slot_words,
-                                                    &last_node, &uses_ies}))
+                                                    &last_node, &uses_ies,
+                                                    &uses_shadow_path_context}))
     {
       reason = "WebGPU Cycles needs supported Lambert, Principled or Glass SVM materials (" +
                material.name.string() + " stops at SVM node " + std::to_string(last_node.x) +
@@ -742,10 +910,86 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     generated_shaders[shader] = uses_generated;
     have_uv |= uses_uv;
     have_generated |= uses_generated;
-    have_ggx |= decoded.ggx;
-    have_transmission |= decoded.ggx && decoded.transmission > 0.0f;
+    const bool huang_hair = decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_HAIR_HUANG;
+    have_ggx |= decoded.ggx || huang_hair || decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_GLOSSY;
+    have_transmission |= huang_hair || (decoded.ggx && decoded.transmission > 0.0f);
     have_subsurface |= decoded.subsurface > 0.0f;
     requires_extended_svm |= decoded.requires_extended_svm;
+    requires_advanced_procedural_svm |= decoded.requires_advanced_procedural_svm;
+    pixel_wireframe |= decoded.pixel_wireframe;
+    uses_sheen_ltc |= decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_SHEEN;
+    have_sheen |= decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_SHEEN ||
+                  decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_VELVET;
+    const bool portal = decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_RAY_PORTAL;
+    have_portal |= portal;
+    const bool mixed = decoded.mixed_transparency;
+    have_mixed_transparent |= mixed;
+    if (mixed && (dscene.data.integrator.filter_closures & FILTER_CLOSURE_TRANSPARENT)) {
+      reason = "WebGPU Cycles needs unfiltered Transparent closures for mixed materials";
+      return false;
+    }
+    const bool shader_has_transparent_shadows =
+        (dscene.shaders.data()[shader].flags & SD_HAS_TRANSPARENT_SHADOW) != 0;
+    const bool varying_hair_shadows = huang_hair && shader_has_transparent_shadows;
+    if (portal || mixed || varying_hair_shadows ||
+        decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_TRANSPARENT)
+    {
+      if (transparent_shadows.empty()) {
+        if (shader_count > remaining / 3) {
+          reason = "WebGPU Cycles transparent shadow colors exceed the scene budget";
+          return false;
+        }
+        transparent_shadows.resize(3 * shader_count);
+      }
+      const bool evaluate_shadow = decoded.varying_transparency || varying_hair_shadows;
+      varying_transparency |= evaluate_shadow;
+      /* Stock shade_shadow treats portals as opaque even though main rays teleport. */
+      if (!portal && shader_has_transparent_shadows) {
+        if (evaluate_shadow) {
+          if (uses_shadow_path_context) {
+            reason = "WebGPU Cycles transparent shadow material needs unsupported ray context";
+            return false;
+          }
+          if (decoded.requires_full_svm || shader_uses_cubic) {
+            reason = "WebGPU Cycles varying transparent shadows need supported texture projections and filters";
+            return false;
+          }
+        }
+        const Spectrum tint = mixed ? decoded.transparency : decoded.color;
+        transparent_shadows[3 * shader] = evaluate_shadow ?
+                                               CYCLES_WEBGPU_TRANSPARENT_SHADOW_EVAL :
+                                               std::bit_cast<uint32_t>(tint.x);
+        transparent_shadows[3 * shader + 1] = std::bit_cast<uint32_t>(tint.y);
+        transparent_shadows[3 * shader + 2] = std::bit_cast<uint32_t>(tint.z);
+      }
+    }
+    have_hair |= CYCLES_WEBGPU_MATERIAL_IS_HAIR(decoded.surface_closure);
+    if (CYCLES_WEBGPU_MATERIAL_IS_STANDALONE(decoded.surface_closure)) {
+      have_standalone = true;
+      const auto &integrator = dscene.data.integrator;
+      if (((decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_GLOSSY_TOON ||
+            decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_GLOSSY) &&
+           (!integrator.caustics_reflective ||
+            (integrator.filter_closures & FILTER_CLOSURE_GLOSSY))) ||
+          (decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_TRANSLUCENT &&
+           (integrator.filter_closures & FILTER_CLOSURE_TRANSMISSION)))
+      {
+        reason = "WebGPU Cycles needs unfiltered standalone BSDFs";
+        return false;
+      }
+    }
+    has_aov |= material.has_aov_output_node;
+  }
+
+  if (have_standalone && std::ranges::any_of(
+                            std::span(dscene.objects.data(), dscene.objects.size()),
+                            [](const KernelObject &object) {
+                              return object.primitive_type != PRIMITIVE_LAMP &&
+                                     object.shadow_terminator_shading_offset > 1.0f;
+                            }))
+  {
+    reason = "WebGPU Cycles standalone BSDFs need the default shadow terminator shading offset";
+    return false;
   }
 
   const size_t triangles = have_uv ? dscene.tri_shader.size() : 0;
@@ -774,9 +1018,47 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     return false;
   }
   remaining -= ies_words;
+  static_assert(CYCLES_WEBGPU_SHEEN_LTC_WORDS == 3 * SHEEN_RES_MU * SHEEN_RES_ROUGH);
+  const size_t lookup_words = have_sheen ? webgpu_svm_lookup_words : 0;
+  const size_t sheen_words = uses_sheen_ltc ? CYCLES_WEBGPU_SHEEN_LTC_WORDS : 0;
+  const int sheen_offset = dscene.data.tables.sheen_ltc;
+  if (lookup_words > remaining || sheen_words > remaining - lookup_words ||
+      (sheen_words && (sheen_offset < 0 ||
+       size_t(sheen_offset) > dscene.lookup_table.size() ||
+       sheen_words > dscene.lookup_table.size() - size_t(sheen_offset))))
+  {
+    reason = "WebGPU Cycles needs the synchronized Sheen lookup table within the scene budget";
+    return false;
+  }
+  remaining -= lookup_words + sheen_words;
+  const bool queries = (dscene.data.kernel_features & KERNEL_FEATURE_NODE_RAYTRACE) != 0;
   std::vector<uint32_t> packed(max_words - remaining);
   packed[0] = uint32_t(count);
   packed[1] = uint32_t(shader_count) | (requires_extended_svm ? CYCLES_WEBGPU_SVM_EXTENDED : 0);
+  if (have_standalone) {
+    packed[1] |= CYCLES_WEBGPU_SVM_STANDALONE;
+  }
+  if (have_hair) {
+    packed[1] |= CYCLES_WEBGPU_SVM_HAIR;
+  }
+  if (have_sheen) {
+    packed[1] |= CYCLES_WEBGPU_SVM_SHEEN;
+  }
+  if (has_aov) {
+    packed[1] |= CYCLES_WEBGPU_SVM_AOV;
+  }
+  if (have_portal) {
+    packed[1] |= CYCLES_WEBGPU_SVM_RAY_PORTAL;
+  }
+  if (have_mixed_transparent) {
+    packed[1] |= CYCLES_WEBGPU_SVM_MIXED_TRANSPARENT;
+  }
+  if (pixel_wireframe) {
+    packed[1] |= CYCLES_WEBGPU_SVM_PIXEL_WIREFRAME;
+  }
+  if (dscene.data.kernel_features & KERNEL_FEATURE_NODE_RAYTRACE) {
+    packed[1] |= CYCLES_WEBGPU_SVM_QUERIES;
+  }
   for (size_t i = 0; i < count; ++i) {
     packed[webgpu_svm_header_words + i] = uint32_t(dscene.svm_nodes.data()[i]);
   }
@@ -862,11 +1144,22 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
       packed[texel++] = std::bit_cast<uint32_t>(dscene.ies_lights.data()[i]);
     }
   }
+  if (have_sheen) {
+    packed[texel + webgpu_svm_lookup_ies] = packed[texture + webgpu_svm_ies_offset];
+    packed[texel + webgpu_svm_lookup_sheen] = sheen_words ?
+                                                uint32_t(texel + lookup_words - texture) : 0;
+    packed[texture + webgpu_svm_ies_offset] = uint32_t(texel - texture);
+    texel += lookup_words;
+    for (size_t i = 0; i < sheen_words; ++i) {
+      packed[texel++] = std::bit_cast<uint32_t>(dscene.lookup_table.data()[size_t(sheen_offset) + i]);
+    }
+  }
 
   words = std::move(packed);
   has_ggx = have_ggx;
   has_transmission = have_transmission;
   has_subsurface = have_subsurface;
+  advanced_query_svm = queries && requires_advanced_procedural_svm;
   reason.clear();
   return true;
 }
