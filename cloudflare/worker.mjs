@@ -10,7 +10,9 @@ export default {
     }
 
     const headers = new Headers({
-      "Cache-Control": "public, no-cache",
+      "Cache-Control": path.startsWith("/runtime/")
+        ? "public, max-age=31536000, immutable"
+        : "public, no-cache",
       "Cross-Origin-Embedder-Policy": "require-corp",
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Resource-Policy": "same-origin",

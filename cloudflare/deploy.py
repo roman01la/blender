@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import mimetypes
 from pathlib import Path
 import re
 import shutil
@@ -103,6 +104,50 @@ def source_url(repository, verify):
     return f"https://github.com/{path}/tree/{commit}"
 
 
+def stage_runtime_cache(package, public, objects, launcher):
+    assets = {}
+    for path in sorted(package.rglob("*")):
+        name = path.relative_to(package).as_posix()
+        if not path.is_file() or name in ("index.html", "favicon.png"):
+            continue
+        stored = objects.get(f"/{name}")
+        if stored:
+            digest = stored.split("/", 1)[0]
+            content_type = R2_FILES[name][0]
+        else:
+            with path.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        assets[name] = {"digest": digest, "size": path.stat().st_size, "type": content_type}
+
+    script = (CLOUDFLARE / "runtime-cache.js").read_text()
+    manifest = json.dumps(assets, separators=(",", ":"))
+    release = hashlib.sha256((script + manifest).encode()).hexdigest()
+    prefix = f"runtime/{release}"
+    versioned = {f"{prefix}/{name}": info for name, info in assets.items()}
+    (public / "runtime-cache.js").write_text(script.replace(
+        "/* runtime manifest */", f"const assets = {json.dumps(versioned, indent=2)};"
+    ))
+    # Keep the original URLs for pages that opened before the versioned launcher.
+    for name in assets:
+        if f"/{name}" in objects:
+            continue
+        destination = public / prefix / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.hardlink_to(public / name)
+
+    html = launcher.read_text()
+    editor_import = '  import { startEditor } from "./editor.mjs";'
+    if html.count(editor_import) != 1:
+        raise ValueError("browser package is missing the editor import")
+    startup = (CLOUDFLARE / "runtime-startup.js").read_text()
+    launcher.write_text(html.replace(editor_import, (
+        f'{startup}\n  await enableRuntimeCache("{release}");\n'
+        f'  const {{ startEditor }} = await import("./{prefix}/editor.mjs");'
+    )))
+    return {f"/{prefix}{path}": key for path, key in objects.items()}
+
+
 def stage(package, output, source):
     for name in ("index.html", "blender.js", "blender.wasm", "blender-assets.data",
                  "blender-cycles-webgpu.data", "oidn-webgpu.mjs",
@@ -153,7 +198,12 @@ def stage(package, output, source):
         "  Cross-Origin-Embedder-Policy: require-corp\n"
         "  Cross-Origin-Resource-Policy: same-origin\n"
         "/\n"
+        "  Cache-Control: no-cache\n"
         f'  Link: <{source}>; rel="alternate"; title="Source code"\n'
+        "/runtime-cache.js\n"
+        "  Cache-Control: no-cache\n"
+        "/runtime/*\n"
+        "  Cache-Control: public, max-age=31536000, immutable\n"
         f"/{PREVIEW}\n"
         "  ! Cross-Origin-Resource-Policy\n"
     )
@@ -175,7 +225,8 @@ def stage(package, output, source):
         with path.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         objects[f"/{name}"] = f"{digest}/{name}"
-    (output / "objects.json").write_text(json.dumps(objects, indent=2) + "\n")
+    versioned = stage_runtime_cache(package, public, objects, launcher)
+    (output / "objects.json").write_text(json.dumps(objects | versioned, indent=2) + "\n")
     return objects
 
 
