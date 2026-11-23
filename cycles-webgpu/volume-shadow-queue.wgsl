@@ -129,3 +129,5 @@ fn compact_guided_volume_shadow_rays(@builtin(global_invocation_id) global_id: v
   }
   compact(index, local);
 }
+
+// Cycles WebGPU render buffer ABI 2

@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -32,6 +33,9 @@ CCL_NAMESPACE_BEGIN
 namespace {
 
 constexpr uint32_t workgroup_size = 64;
+constexpr uint32_t local_closure_width = 576;
+constexpr std::string_view local_closure_marker =
+    "// Cycles WebGPU experimental thread-local closures\n";
 using ShaderFeatures = std::array<bool, size_t(webgpu_svm_hardware_textures_kernel) + 1>;
 constexpr std::string_view validated_svm_marker = "// Cycles WebGPU validated SVM node bounds\n";
 constexpr std::string_view hardware_svm_marker = "// Cycles WebGPU hardware texture atlas\n";
@@ -168,7 +172,7 @@ constexpr auto path_buffer_sizes(const bool adaptive,
                                  const bool deferred_shadow,
                                  const bool guided = false,
                                  const bool textured = false,
-                                 const size_t extra_material_words = 0,
+                                 const size_t material_words = CYCLES_WEBGPU_MATERIAL_WORDS,
                                  const bool queries = false,
                                  const bool differentials = false,
                                  const bool hair = false,
@@ -193,7 +197,7 @@ constexpr auto path_buffer_sizes(const bool adaptive,
                                    radiance_header_words},
                     PathBufferSize{guided ? denoising_words_per_path : 0},
                     PathBufferSize{surface_passes ? surface_pass_words_per_path : 0},
-                    PathBufferSize{CYCLES_WEBGPU_MATERIAL_WORDS + extra_material_words},
+                    PathBufferSize{material_words},
                     PathBufferSize{CYCLES_WEBGPU_PATH_WORDS},
                     PathBufferSize{scattering ? CYCLES_WEBGPU_VOLUME_STATE_WORDS :
                                                 (absorption ? 1u : 0u)},
@@ -468,6 +472,18 @@ constexpr auto varying_shadow_bindings = std::array{
     transparent_shadow_bindings[4], transparent_shadow_bindings[5],
     WebGPUKernelBinding{6, storage, 8},
     WebGPUKernelBinding{7, storage, CYCLES_WEBGPU_CAMERA_WORDS * sizeof(uint32_t)}};
+constexpr WebGPUKernelBinding local_closure_bindings[] = {
+    {0, read_only, 8},
+    {1, read_only, 32},
+    {2, storage, 52},
+    {3, read_only, 32},
+    {4, storage, CYCLES_WEBGPU_PATH_WORDS * sizeof(uint32_t)},
+    {5, uniform, CYCLES_WEBGPU_CAMERA_WORDS * sizeof(uint32_t)},
+    {6, read_only, CYCLES_WEBGPU_SURFACE_OFFSETS * sizeof(uint32_t)},
+    {7, read_only, 40},
+    {8, read_only, 48},
+    {9, storage, 16},
+    {10, read_only, 28}};
 constexpr WebGPUKernelBinding path_update_bindings[] = {
     {0, storage, 52},
     {1, storage, 32},
@@ -835,6 +851,8 @@ struct WebGPURenderPipeline::Impl {
   ShaderFeatures glass_caustics_shaders{};
   ShaderFeatures diffuse_principled_mix_shaders{};
   bool deferred_shadow = false;
+  bool local_closures = false;
+  bool local_closures_loaded = false;
   bool reflection_deferred = false;
   bool full_deferred = false;
   bool shadow_loaded = false;
@@ -1596,6 +1614,29 @@ struct WebGPURenderPipeline::Impl {
     return DeviceKernelArguments(&buffer.device_pointer...);
   }
 
+  bool prepare_local_closures()
+  {
+    if (!device_webgpu_supports_workgroup(device, local_closure_width, 0)) {
+      return false;
+    }
+    if (!local_closures_loaded) {
+      const auto shader = load_shader("local-closures.wgsl");
+      if (!shader.starts_with(local_closure_marker)) {
+        return false;
+      }
+      std::string error;
+      local_closures_loaded = device_webgpu_try_register_kernel(
+          device, webgpu_local_closures_kernel, shader, local_closure_width,
+          local_closure_bindings, "main", error);
+      if (!local_closures_loaded) {
+        LOG_WARNING << "Cycles WebGPU local closure experiment: " << error;
+        return false;
+      }
+    }
+    LOG_INFO << "Cycles WebGPU using thread-local material closures";
+    return true;
+  }
+
   bool prepare_surface_roulette()
   {
     const auto source = load_shader("surface-roulette-queue.wgsl");
@@ -1628,7 +1669,7 @@ struct WebGPURenderPipeline::Impl {
 
   bool surface_roulette_enabled() const
   {
-    return surface_roulette_loaded && !portal_materials && !absorption;
+    return surface_roulette_loaded && !local_closures && !portal_materials && !absorption;
   }
 
   bool reserve_surface_roulette(const uint32_t capacity)
@@ -2606,8 +2647,27 @@ bool WebGPURenderPipeline::reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WOR
   if (film_words > limits.storage_buffer_bytes / sizeof(uint32_t)) {
     return p.fail("Cycles WebGPU render slice film exceeds the device buffer limit");
   }
+  /* This kernel fuses the legacy opaque reflection stages, including inline visibility.
+   * Leave the split stages registered for scenes and passes outside that contract. */
+  const char *enable_local_closures = std::getenv("CYCLES_WEBGPU_FUSED_CLOSURES");
+  p.local_closures = enable_local_closures && std::string_view(enable_local_closures) == "1" &&
+                     !adaptive && !guided && !p.aov_materials && !p.surface_passes_active &&
+                     !p.light_passes_active && !p.emission_pass_active &&
+                     std::ranges::none_of(geometry_passes, [&](const PassType type) {
+                       return params.get_pass_offset(type) != PASS_UNUSED;
+                     }) &&
+                     !p.textured_lights && !p.transparent_materials && !p.ordered_closures &&
+                     !p.standalone_closures && !p.absorption && !p.subsurface_materials &&
+                     !p.portal_materials && !p.triangle_tangents && !p.ray_differentials &&
+                     !p.svm_image_atlas && p.query_sampling.empty() &&
+                     p.active_svm_kernel == svm_core_kernel &&
+                     p.light_kernel == reflection_light_kernel &&
+                     p.update_kernel == reflection_update_kernel && p.prepare_local_closures();
+  p.material_words_per_path =
+      p.local_closures ? 0 : CYCLES_WEBGPU_MATERIAL_WORDS + extra_material_words;
   const auto path_buffers = path_buffer_sizes(
-      adaptive, p.deferred_shadow, guided, p.textured_lights, extra_material_words,
+      adaptive, p.deferred_shadow && !p.local_closures, guided, p.textured_lights,
+      p.material_words_per_path,
       !p.query_sampling.empty(), p.ray_differentials, p.triangle_tangents, p.absorption,
       p.scattering, p.emission_pass_active, p.surface_passes_active, p.light_passes_active,
       p.compact_volume_shadows, p.surface_roulette_enabled());
@@ -2622,7 +2682,6 @@ bool WebGPURenderPipeline::reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WOR
   p.batch_active = false;
   p.next_sample = 0;
   p.path_pool_limit = std::min(requested, device_capacity);
-  p.material_words_per_path = CYCLES_WEBGPU_MATERIAL_WORDS + extra_material_words;
   p.path_capacity = 0;
   p.pixel_count = uint32_t(pixels);
   p.crop = {uint32_t(params.full_x),
@@ -3080,7 +3139,7 @@ bool WebGPURenderPipeline::Impl::reserve_paths(const uint32_t capacity)
   else {
     absorption_state.free();
   }
-  if (deferred_shadow) {
+  if (deferred_shadow && !local_closures) {
     shadow_rays.alloc_to_device(shadow_storage_words_per_path(textured_lights) * capacity);
     if (!shadow_rays.device_pointer) {
       return fail("Cycles WebGPU could not allocate shadow rays");
@@ -3105,9 +3164,15 @@ bool WebGPURenderPipeline::Impl::reserve_paths(const uint32_t capacity)
   {
     return fail("Cycles WebGPU could not initialize the radiance layout");
   }
-  materials.alloc_to_device(material_words_per_path * capacity);
+  if (material_words_per_path) {
+    materials.alloc_to_device(material_words_per_path * capacity);
+  }
+  else {
+    materials.free();
+  }
   if (!pixels.device_pointer || !rays.device_pointer || !hits.device_pointer ||
-      !points.device_pointer || !radiance.device_pointer || !materials.device_pointer ||
+      !points.device_pointer || !radiance.device_pointer ||
+      (material_words_per_path && !materials.device_pointer) ||
       !path_state.alloc(capacity) || !wavefront_queue.alloc()) {
     return fail("Cycles WebGPU could not allocate path state and queue counters");
   }
@@ -3374,6 +3439,21 @@ bool WebGPURenderPipeline::enqueue_stage(const DeviceKernel stage)
   }
 
   const auto surface = p.bind(p.scene.bvh, p.scene.surface, p.rays, p.hits, p.points);
+  if (p.local_closures) {
+    const WebGPUDispatch setup_surface{surface_kernel, surface, count};
+    const auto local_args = p.bind(p.scene.svm, p.points, p.rays, p.hits, paths, p.camera,
+                                   p.scene.surface, p.scene.bvh, p.scene.light, p.radiance,
+                                   p.sampling);
+    const WebGPUDispatch shade{webgpu_local_closures_kernel, local_args, count};
+    if (!p.wavefront_queue.enqueue_material_stage(
+            stage, capacity, p.rays, paths, p.points, p.scene.svm, p.sort_surface_shaders,
+            setup_surface, shade) ||
+        !device_webgpu_enqueue(p.device, count, {&accumulate, 1}))
+    {
+      return p.fail("Cycles WebGPU thread-local closure dispatch failed");
+    }
+    return true;
+  }
   const auto aovs = p.bind(p.materials, p.film, paths, p.rays, p.params, p.aov_params);
   const WebGPUDispatch accumulate_aovs{accumulate_aov_kernel, aovs, count};
   const bool queries = !p.query_sampling.empty();

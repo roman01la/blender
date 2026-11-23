@@ -297,6 +297,9 @@ def lower_spirv(llvm: Path, work: Path, optimized: Path, plugin: Path,
 
 
 def build(options) -> None:
+    if options.local_closures:
+        options.svm_compact = options.svm_core = options.wavefront_light = True
+        options.path_update = options.reflection_only = True
     options.output.mkdir(parents=True, exist_ok=True)
     extended_queries = options.extended_queries or options.advanced_queries
     headers = options.emscripten_sysroot / "include"
@@ -428,13 +431,16 @@ def build(options) -> None:
     if options.volume_forward:
         shader_name = shader_name.removesuffix(".wgsl") + "-volume.wgsl"
 
-    shader_flags = []
+    if options.local_closures:
+        dispatch, shader_name = "local_closures", "local-closures.wgsl"
+
+    shader_flags = ["-DCYCLES_WEBGPU_LOCAL_CLOSURES=1"] if options.local_closures else []
     if options.validated_svm_words:
         shader_flags.append("-DCYCLES_WEBGPU_VALIDATED_SVM_WORDS=1")
     ordered_closures = (options.svm_compact or options.svm_query or options.wavefront_light or
                         options.film_surface or
                         (options.standalone_closures and (options.path_update or options.denoise_surface)))
-    if ordered_closures:
+    if ordered_closures and not options.local_closures:
         shader_flags.append("-DCYCLES_WEBGPU_ORDERED_CLOSURES=1")
     if options.volume_grid:
         shader_flags.append("-DCYCLES_WEBGPU_VOLUME_GRID=1")
@@ -681,6 +687,8 @@ def build(options) -> None:
             kernels.append("svm")
         if options.wavefront_light or options.path_update or options.denoise_surface or options.film_surface:
             kernels.append("ggx")
+        if options.local_closures:
+            kernels = ["svm", "bvh2", "direct_light", "camera", "ggx"]
         # Keep scanline induction variables at 32 bits for the WebGPU backend.
         hair_bsdf = options.standalone_closures or options.hair_closures
         narrow_indvars = (adaptive or hair_bsdf or options.svm_query or options.transparent_shadow or
@@ -712,6 +720,10 @@ def build(options) -> None:
             retarget(cpp_ir, wrapper_ir, shader_ir)
             shader_modules.append(shader_ir)
         run(options.llvm_bin / "llvm-link", *shader_modules, "-o", work / "linked.bc")
+        if options.local_closures:
+            from local_closures_lowering import check_linked_symbols
+            check_linked_symbols(options.llvm_bin, work / "linked.bc")
+
         optimized = work / "optimized.bc"
         plugin = build_lowering_plugin(options.llvm_bin, work) if structured_dispatch else None
         if adaptive:
@@ -790,8 +802,15 @@ def build(options) -> None:
             run(options.spirv_bin / "spirv-opt", "--target-env=vulkan1.2",
                 "--eliminate-dead-code-aggressive", "--eliminate-dead-const", "--trim-capabilities",
                 query, "-o", normalized)
+        if options.local_closures:
+            from local_closures_lowering import normalize_camera
+            normalize_camera(options.spirv_bin, normalized, work)
         run(options.spirv_bin / "spirv-val", "--target-env", "vulkan1.2", normalized)
         run("node", SOURCE / "translate.mjs", options.translator, normalized, work / shader_name)
+        if options.local_closures:
+            from local_closures_lowering import finalize_wgsl
+            finalize_wgsl(work / shader_name)
+
         if options.hardware_svm_textures:
             shader_path = work / shader_name
             sampler = (SOURCE / "svm-hardware-textures.wgsl").read_text()
@@ -812,7 +831,7 @@ def build(options) -> None:
         if options.advanced_queries:
             with (work / shader_name).open("a") as shader:
                 shader.write("\n// Cycles WebGPU advanced procedural queries\n")
-        if svm and not (options.sampled_emission or options.shadow_materials):
+        if svm and not (options.sampled_emission or options.shadow_materials or options.local_closures):
             shader_path = work / shader_name
             shader_path.write_text("// Cycles WebGPU AOV output\n" + shader_path.read_text())
         if options.sampled_emission:
@@ -1101,6 +1120,8 @@ if __name__ == "__main__":
                        help="compile SVM with Cycles BVH ray queries over compacted paths")
     modes.add_argument("--sampled-emission", action="store_true",
                        help="shade sampled triangle emission with SVM")
+    modes.add_argument("--local-closures", action="store_true",
+                       help="build the experimental nondeferred reflection surface shader")
     modes.add_argument("--wavefront-light", action="store_true",
                        help="compile direct lighting with per-path SVM materials")
     modes.add_argument("--film-ao", action="store_true",

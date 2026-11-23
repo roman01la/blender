@@ -383,7 +383,7 @@ bool WebGPUDevice::register_kernel(DeviceKernel kernel,
     return false;
   }
   /* Private dispatches follow the stock kernel range. */
-  if (kernel < 0 || kernel > webgpu_restore_surface_roulette_kernel || code.empty() || entry_point.empty() ||
+  if (kernel < 0 || kernel > webgpu_local_closures_kernel || code.empty() || entry_point.empty() ||
       workgroup_size == 0 || workgroup_size > limits_.maxComputeWorkgroupSizeX ||
       workgroup_size > limits_.maxComputeInvocationsPerWorkgroup || bindings.empty() ||
       bindings.size() > DeviceKernelArguments::MAX_ARGS ||

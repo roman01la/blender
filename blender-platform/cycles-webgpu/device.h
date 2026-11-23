@@ -41,6 +41,7 @@ constexpr DeviceKernel webgpu_reset_surface_roulette_kernel = DeviceKernel(DEVIC
 constexpr DeviceKernel webgpu_filter_surface_roulette_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 11);
 constexpr DeviceKernel webgpu_publish_surface_roulette_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 12);
 constexpr DeviceKernel webgpu_restore_surface_roulette_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 13);
+constexpr DeviceKernel webgpu_local_closures_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 14);
 
 struct WebGPUKernelBinding {
   enum class Type {

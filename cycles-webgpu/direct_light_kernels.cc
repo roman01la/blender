@@ -140,7 +140,7 @@ inline float2 light_fetch(KernelGlobals kg, light_background_conditional_cdf_tag
 using UInt4 = unsigned int __attribute__((ext_vector_type(4)));
 using Float4 = float __attribute__((ext_vector_type(4)));
 
-#ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
+#if defined(CYCLES_WEBGPU_WAVEFRONT_LIGHT) && !defined(CYCLES_WEBGPU_LOCAL_CLOSURES)
 float cycles_ggx_lookup(const unsigned int index)
 {
   return std::bit_cast<float>(cycles_light_word(CYCLES_WEBGPU_LIGHT_HEADER_WORDS + index));

@@ -4,6 +4,11 @@
 
 typedef float float3 __attribute__((ext_vector_type(3)));
 
+#ifdef CYCLES_WEBGPU_LOCAL_CLOSURES
+#  include "../blender-platform/cycles-webgpu/material_layout.h"
+#  include "../blender-platform/cycles-webgpu/path_state_layout.h"
+#  include "wavefront_queue.hlsl"
+#else
 #ifdef CYCLES_WEBGPU_DEFER_SHADOW
 RWStructuredBuffer<uint4> shadow_words : register(u0);
 #else
@@ -31,7 +36,15 @@ StructuredBuffer<float4> materials : register(t6);
 StructuredBuffer<uint> path_words : register(t7);
 #endif
 
+#endif
+
 #include "ordered_closure_access.hlsl"
+
+#ifdef CYCLES_WEBGPU_LOCAL_CLOSURES
+#  define LIGHT_CLOSURE(field, offset) local_closure_##field
+#else
+#  define LIGHT_CLOSURE(field, offset) materials[material + offset]
+#endif
 
 #ifndef CYCLES_WEBGPU_DEFER_SHADOW
 uint cycles_scene_word(uint index)
@@ -59,6 +72,11 @@ extern uint cycles_direct_light(uint4 position, uint4 normal, uint4 primary_hit,
                                 out float4 result);
 #endif
 
+#ifdef CYCLES_WEBGPU_LOCAL_CLOSURES
+__attribute__((noinline))
+void cycles_local_light(uint lane)
+{
+#else
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
@@ -66,6 +84,7 @@ void main(uint3 id : SV_DispatchThreadID)
   if (!cycles_queue_slot(id.x, lane)) {
     return;
   }
+#endif
   const uint base = 8 * lane;
   const uint4 position = uint4(surface_words[base], surface_words[base + 1],
                                surface_words[base + 2], surface_words[base + 3]);
@@ -140,13 +159,13 @@ void main(uint3 id : SV_DispatchThreadID)
   float4 diffuse_ratio, glossy_ratio;
   const uint capacity = ray_words[0];
   const bool save_ratios = path.x == 0u && cycles_light_pass_enabled(capacity);
-  const float4 hair = materials[material + 4];
+  const float4 hair = LIGHT_CLOSURE(subsurface, 4);
   cycles_wavefront_light(position, normal, spec_normal, geometric, shadow_along, shadow_opposite,
                          closest, ray, origin, path, sampling,
                          path_words[path_base + CYCLES_WEBGPU_PATH_EXTRA_RNG_STEPS],
-                         materials[material], materials[material + 1], materials[material + 2],
-                         materials[material + 3], hair,
-                         materials[material + CYCLES_WEBGPU_MATERIAL_NORMAL_SLOT],
+                         LIGHT_CLOSURE(result, 0), LIGHT_CLOSURE(specular, 1), LIGHT_CLOSURE(layers, 2),
+                         LIGHT_CLOSURE(glass, 3), hair,
+                         LIGHT_CLOSURE(closure_normal, CYCLES_WEBGPU_MATERIAL_NORMAL_SLOT),
                          result, area_result, hair_lcg, uint(save_ratios), diffuse_ratio,
                          glossy_ratio
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
@@ -180,8 +199,8 @@ void main(uint3 id : SV_DispatchThreadID)
 #  endif
 #endif
 #  ifndef CYCLES_WEBGPU_EXCLUDE_HAIR
-  if (materials[material].w == CYCLES_WEBGPU_MATERIAL_HAIR_HUANG) {
-    materials[material + 4] = float4(hair.xy, float(hair_lcg & 0xffffu),
+  if (LIGHT_CLOSURE(result, 0).w == CYCLES_WEBGPU_MATERIAL_HAIR_HUANG) {
+    LIGHT_CLOSURE(subsurface, 4) = float4(hair.xy, float(hair_lcg & 0xffffu),
                                      float(hair_lcg >> 16u));
   }
 #  endif
@@ -191,3 +210,5 @@ void main(uint3 id : SV_DispatchThreadID)
 #endif
   samples[lane] = result;
 }
+
+#undef LIGHT_CLOSURE

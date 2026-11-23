@@ -172,6 +172,13 @@ bool rematerialize_resource_pointers(Function &function)
   return changed;
 }
 
+bool is_outlined_local_closure_stage(const Function &function)
+{
+  return function.hasFnAttribute(Attribute::NoInline) &&
+         (function.getName() == "_Z21cycles_local_materialj" ||
+          function.getName() == "_Z18cycles_local_lightj");
+}
+
 /* HLSL lazily acquires bindings where they are first used. Constant handles
  * must dominate the dispatch loop to keep opaque resources out of its state. */
 struct HoistResourceHandles : PassInfoMixin<HoistResourceHandles> {
@@ -197,8 +204,55 @@ struct HoistResourceHandles : PassInfoMixin<HoistResourceHandles> {
     for (auto *handle : handles) {
       handle->moveBefore(entry.getTerminator()->getIterator());
     }
+    /* Outlining can give HLSL resource handles global backing storage. SPIR-V
+     * needs descriptor acquisition at the entry point of every consumer. */
+    bool outlined_rematerialized = false;
+    SmallVector<LoadInst *, 4> outlined_handles;
+    for (BasicBlock &block : function) {
+      for (Instruction &instruction : block) {
+        auto *load = dyn_cast<LoadInst>(&instruction);
+        if (load && load->isSimple() && load->getType()->isTargetExtTy() &&
+            isa<GlobalVariable>(load->getPointerOperand())) {
+          outlined_handles.push_back(load);
+        }
+      }
+    }
+    for (LoadInst *load : outlined_handles) {
+      auto *global = cast<GlobalVariable>(load->getPointerOperand());
+      if (!global->hasLocalLinkage()) {
+        continue;
+      }
+      CallInst *source = nullptr;
+      for (User *user : global->users()) {
+        if (auto *read = dyn_cast<LoadInst>(user);
+            read && read->isSimple() && read->getPointerOperand() == global) {
+          continue;
+        }
+        auto *store = dyn_cast<StoreInst>(user);
+        auto *binding = store ? dyn_cast<CallInst>(store->getValueOperand()) : nullptr;
+        if (source || !store || !store->isSimple() || store->getPointerOperand() != global ||
+            store->getFunction()->getName() != "main" ||
+            store->getParent() != &store->getFunction()->getEntryBlock() || !binding ||
+            !binding->getCalledFunction() ||
+            !binding->getCalledFunction()->getName().starts_with(
+                "llvm.spv.resource.handlefrombinding.") ||
+            !llvm::all_of(binding->args(), [](const Use &arg) { return isa<Constant>(arg.get()); }))
+        {
+          source = nullptr;
+          break;
+        }
+        source = binding;
+      }
+      if (source) {
+        auto *binding = source->clone();
+        binding->insertBefore(entry.getFirstInsertionPt());
+        load->replaceAllUsesWith(binding);
+        load->eraseFromParent();
+        outlined_rematerialized = true;
+      }
+    }
     const bool rematerialized = rematerialize_resource_pointers(function);
-    return handles.empty() && !rematerialized ? PreservedAnalyses::all() :
+    return handles.empty() && !rematerialized && !outlined_rematerialized ? PreservedAnalyses::all() :
                                                PreservedAnalyses::none();
   }
 };
@@ -587,6 +641,14 @@ Type *word_address_type(Value *pointer)
   if (Type *element = buffer_element_type(pointer)) {
     return element;
   }
+  if (auto *slot = dyn_cast<AllocaInst>(pointer); slot && slot->getAddressSpace() == 0 &&
+      slot->isStaticAlloca() && !slot->isArrayAllocation())
+  {
+    /* Logical SPIR-V needs a typed access even when LLVM folds a bitcast
+     * into a load or store through an opaque private pointer. */
+    Type *element = slot->getAllocatedType();
+    return element->isFloatTy() || element->isIntegerTy(32) ? element : nullptr;
+  }
   auto *array = local_array_element_address(pointer);
   Type *element = array ? array->getElementType() : nullptr;
   return element && (element->isFloatTy() || element->isIntegerTy(32)) ? element : nullptr;
@@ -745,12 +807,13 @@ bool lower_spirv_values(Function &function)
   for (BasicBlock &block : function) {
     for (Instruction &instruction : block) {
       if (auto *load = dyn_cast<LoadInst>(&instruction);
-          load && needs_word_bitcast(load->getPointerOperand(), load->getType()))
+          load && !load->isAtomic() &&
+          needs_word_bitcast(load->getPointerOperand(), load->getType()))
       {
         replacements.push_back(load);
       }
       if (auto *store = dyn_cast<StoreInst>(&instruction);
-          store &&
+          store && !store->isAtomic() &&
           needs_word_bitcast(store->getPointerOperand(), store->getValueOperand()->getType()))
       {
         replacements.push_back(store);
@@ -894,10 +957,11 @@ struct InlineShaderHelpers : PassInfoMixin<InlineShaderHelpers> {
   {
     for (Function &function : module) {
       /* These stock helpers take only scalars and can remain separate SPIR-V functions. */
-      const bool outlined_scalar = function.hasFnAttribute(Attribute::NoInline) &&
-                                   (function.getName().contains("9perlin_") ||
-                                    function.getName().contains("webgpu_scalar_noise_") ||
-                                    function.getName() == "_Z26cycles_svm_hardware_samplejjjjff");
+      const bool outlined_scalar = is_outlined_local_closure_stage(function) ||
+                                   (function.hasFnAttribute(Attribute::NoInline) &&
+                                    (function.getName().contains("9perlin_") ||
+                                     function.getName().contains("webgpu_scalar_noise_") ||
+                                     function.getName() == "_Z26cycles_svm_hardware_samplejjjjff"));
       if (!function.isDeclaration() && function.hasLocalLinkage() && !outlined_scalar) {
         function.removeFnAttr(Attribute::NoInline);
         function.addFnAttr(Attribute::AlwaysInline);

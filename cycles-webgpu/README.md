@@ -203,6 +203,28 @@ parameters, the film, and a row-major float RGBA output. For each film, clear
 or allocate its storage before the first submission, and dispatch a resolve
 after the contributions it should include.
 
+## Try thread-local surface closures
+
+Build `--local-closures` with the same toolchain as the other Cycles shaders.
+The browser packager includes `local-closures.wgsl` when it is in the shader
+output directory. Set `CYCLES_WEBGPU_FUSED_CLOSURES=1` in Blender's process
+environment before rendering. In the browser, set it from Blender's Python
+Console with `import os; os.environ["CYCLES_WEBGPU_FUSED_CLOSURES"] = "1"`.
+Restart the render after changing the setting.
+
+This opt-in shader keeps core SVM closure data thread-local through legacy
+opaque reflection lighting and path continuation. It uses inline shadow
+traversal and skips the split material queue. It requires an adapter that can
+run its 576-lane workgroup and bind ten storage buffers. The split WebGPU
+path handles other scenes and devices, including Light Trees, guided
+denoising, adaptive sampling, and additional surface passes.
+
+Run the LLVM scalar-pointer regression with:
+
+```sh
+python3 web/cycles-webgpu/test_lowering.py --llvm-bin LLVM_BIN --spirv-bin SPIRV_TOOLS_BIN
+```
+
 ## Use WebGPU in Cycles
 
 Build the stock-scheduler shaders below, stage and build Blender, then pass

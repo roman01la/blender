@@ -5,7 +5,11 @@ uint cycles_svm_camera_word(uint index)
 #ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
   return metadata_words[metadata_words[CYCLES_WEBGPU_SURFACE_VOLUME_SHADOW_PARAMS] + index];
 #else
+#  ifdef CYCLES_WEBGPU_LOCAL_CLOSURES
+  return camera_rows[index / 4u][index % 4u];
+#  else
   return camera_words[index];
+#  endif
 #endif
 }
 

@@ -172,7 +172,7 @@ def package(installation: Path, output: Path, python_process: Path | None = None
             if want_light_tree:
                 shaders.append(cycles_webgpu.resolve() / "shade-background-tree-guides.wgsl")
         for name in ("path-update-closures.wgsl", "path-update-reflection-closures.wgsl",
-                     "denoise-surface-closures.wgsl"):
+                     "denoise-surface-closures.wgsl", "local-closures.wgsl"):
             variant = cycles_webgpu.resolve() / name
             if variant.is_file():
                 shaders.append(variant)
@@ -181,12 +181,12 @@ def package(installation: Path, output: Path, python_process: Path | None = None
                 raise ValueError(f"missing or empty Cycles WebGPU shader: {shader}")
             if shader.name == "adaptive-check.wgsl" or shader.name.startswith((
                     "wavefront-light", "shade-background", "path-update", "denoise-surface",
-                    "absorption-", "volume-")):
+                    "absorption-", "volume-", "local-closures")):
                 if not shader.read_bytes().endswith(b"// Cycles WebGPU render buffer ABI 2\n"):
                     raise ValueError(f"rebuild Cycles WebGPU shader with the current layout: {shader}")
             if shader.name.startswith((
                     "svm-", "wavefront-light", "path-update", "denoise-surface",
-                    "subsurface-compact", "film-surface")):
+                    "subsurface-compact", "film-surface", "local-closures")):
                 if b"// Cycles WebGPU material layout 7\n" not in shader.read_bytes():
                     raise ValueError(f"rebuild Cycles WebGPU shader with the current materials: {shader}")
             cycle_preloads.append((shader, f"/cycles-webgpu/{shader.name}"))
