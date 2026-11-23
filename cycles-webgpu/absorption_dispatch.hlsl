@@ -85,16 +85,24 @@ uint cycles_volume_word(uint index)
 void main(uint3 id : SV_DispatchThreadID)
 {
   uint lane;
+#ifdef CYCLES_WEBGPU_COMPACT_MATERIAL_SHADOWS
+  const uint shadow_queue = 2u + 17u * ray_words[0];
+  if (id.x >= ray_words[shadow_queue]) {
+    return;
+  }
+  lane = ray_words[shadow_queue + 1u + id.x];
+#else
   if (!cycles_queue_slot(id.x, lane)) {
     return;
   }
+#endif
 #ifdef CYCLES_WEBGPU_ABSORPTION_SHADOW
   const uint shadow = 4 * lane;
   const uint4 options = shadow_words[shadow + 2];
 #  ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
   const bool from_volume = (options.x & CYCLES_WEBGPU_SHADOW_FROM_VOLUME) != 0u;
 #  endif
-#  ifdef CYCLES_WEBGPU_VOLUME_GUIDES
+#  if defined(CYCLES_WEBGPU_VOLUME_GUIDES) && !defined(CYCLES_WEBGPU_COMPACT_MATERIAL_SHADOWS)
 #    ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
   const bool use_albedo = cycles_svm_camera_word(CYCLES_WEBGPU_CAMERA_WORDS) != 0xffffffffu;
   const bool use_normal = cycles_svm_camera_word(CYCLES_WEBGPU_CAMERA_WORDS + 1u) != 0xffffffffu;

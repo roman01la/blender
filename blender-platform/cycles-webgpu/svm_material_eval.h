@@ -48,6 +48,13 @@
 #include <type_traits>
 #include <utility>
 
+#ifdef CYCLES_WEBGPU_HARDWARE_SVM_TEXTURES
+using WebGPUSvmHardwareSample = float __attribute__((ext_vector_type(4)));
+__attribute__((pure)) WebGPUSvmHardwareSample cycles_svm_hardware_sample(
+    unsigned int image, unsigned int width, unsigned int height, unsigned int extension,
+    float u, float v);
+#endif
+
 CCL_NAMESPACE_BEGIN
 
 static_assert(SHADER_MASK == CYCLES_WEBGPU_SVM_SHADER_ID_MASK);
@@ -436,6 +443,20 @@ ccl_device_inline bool webgpu_svm_image(
   if (alpha && !(interpolation & webgpu_svm_image_alpha)) {
     return false;
   }
+#ifdef CYCLES_WEBGPU_HARDWARE_SVM_TEXTURES
+  const bool has_alpha = (interpolation & webgpu_svm_image_alpha) != 0u;
+  if (webgpu_svm_uses_cubic_filter(interpolation & ~webgpu_svm_image_alpha) &&
+      (alpha || !has_alpha || extension != EXTENSION_CLIP))
+  {
+    const auto sample = cycles_svm_hardware_sample(uint(image), width, height, extension, uv.x, uv.y);
+    /* The atlas bridge uses an out-of-range color to indicate a software-only slot.
+     * Scene packing admits finite image channels with magnitude at most 1e6. */
+    if (sample.x != 2.0e6f) {
+      color = make_float4(sample.x, sample.y, sample.z, alpha || !has_alpha ? sample.w : 1.0f);
+      return true;
+    }
+  }
+#endif
   const uint start = word(base + 4);
   const auto texel = [&](const uint index) {
     const float3 rgb = webgpu_svm_read_rgb(word, start + 3u * index);
@@ -453,17 +474,42 @@ ccl_device_inline T webgpu_svm_decode(Fetch fetch, const uint offset, std::index
   return std::bit_cast<T>(std::array<uint, sizeof...(I)>{fetch(offset + uint(I))...});
 }
 
-template<typename T, typename Fetch>
+template<bool check_bounds = true, typename T, typename Fetch>
 ccl_device_inline bool webgpu_svm_read(Fetch fetch, uint &offset, const uint end, T &node)
 {
   static_assert(sizeof(T) % sizeof(uint) == 0);
   constexpr uint words = sizeof(T) / sizeof(uint);
-  if (words > end - offset) {
-    return false;
+  if constexpr (check_bounds) {
+    if (words > end - offset) {
+      return false;
+    }
   }
   node = webgpu_svm_decode<T>(fetch, offset, std::make_index_sequence<words>());
   offset += words;
   return true;
+}
+
+/* The scene encoder checks the complete non-volume surface program before
+ * upload. Its operand patches leave opcode, record sizes and layout intact.
+ * Here the interpreter visits both mixture branches, and AOV skipping can
+ * only jump to the checked end node. Keep all runtime operand checks and
+ * variable-length table bounds in the evaluator. */
+template<typename Fetch> struct WebGPUSvmValidatedWords {
+  Fetch read_word;
+
+  ccl_device_inline_method uint operator()(const uint index) const
+  {
+    return read_word(index);
+  }
+};
+
+template<typename T, typename Fetch>
+ccl_device_inline bool webgpu_svm_read(WebGPUSvmValidatedWords<Fetch> fetch,
+                                      uint &offset,
+                                      const uint end,
+                                      T &node)
+{
+  return webgpu_svm_read<false>(fetch.read_word, offset, end, node);
 }
 
 ccl_device_inline bool webgpu_svm_finite(const float value)
@@ -2023,8 +2069,10 @@ ccl_device_inline bool webgpu_svm_eval_material(Fetch fetch,
 
   uint offset = shader * webgpu_svm_jump_words;
   SVMNodeShaderJump jump;
+  /* Validate the header even when typed surface payloads are prevalidated. */
+  const auto read_jump_word = [&](const uint index) { return fetch(index); };
   if (fetch(offset++) != NODE_SHADER_JUMP ||
-      !webgpu_svm_read(fetch, offset, word_count, jump) ||
+      !webgpu_svm_read(read_jump_word, offset, word_count, jump) ||
       uint(jump.offset_surface) < shader_count * webgpu_svm_jump_words ||
       uint(jump.offset_surface) >= uint(jump.offset_volume) ||
       uint(jump.offset_volume) > word_count)

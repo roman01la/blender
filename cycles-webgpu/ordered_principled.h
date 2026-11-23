@@ -31,7 +31,7 @@ ccl_device OrderedPrincipledBranch read_ordered_principled_branch(
     const GgxFloat4 wi,
     const float blur_alpha)
 {
-  const unsigned int address = unsigned(material.x) + 4u * index;
+  const unsigned int address = cycles_ordered_tail_index(material.x) + 4u * index;
   const GgxFloat4 base = cycles_material_lobe(address);
   const GgxFloat4 tint = cycles_material_lobe(address + 1u);
   GgxFloat4 weights = cycles_material_lobe(address + 2u);

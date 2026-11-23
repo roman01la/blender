@@ -356,9 +356,14 @@ bool read_material(const unsigned int shader,
                    const FetchSurface surface,
                    const bool ordered_closures = false)
 {
-  const auto fetch = [](const unsigned int index) {
+  const auto read_word = [](const unsigned int index) {
     return cycles_svm_word(ccl::webgpu_svm_header_words + index);
   };
+#ifdef CYCLES_WEBGPU_VALIDATED_SVM_WORDS
+  const auto fetch = ccl::WebGPUSvmValidatedWords{read_word};
+#else
+  const auto fetch = read_word;
+#endif
   const unsigned int word_count = cycles_svm_word(0);
   const unsigned int texture = ccl::webgpu_svm_header_words + word_count;
   const auto uv = ccl::webgpu_svm_triangle_uv(cycles_svm_word, texture, primitive, u, v);

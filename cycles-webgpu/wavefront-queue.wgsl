@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Cycles WebGPU volume scatter classification
+// Cycles WebGPU linear workgroup grid
 
 @group(0) @binding(0) var<storage, read_write> paths: array<u32>;
 @group(0) @binding(1) var<storage, read_write> rays: array<atomic<u32>>;
@@ -71,40 +72,52 @@ fn compact(lane: u32, kernel: u32, local: u32) {
 }
 
 @compute @workgroup_size(64)
-fn compact_free(@builtin(global_invocation_id) id: vec3<u32>,
+fn compact_free(@builtin(global_invocation_id) global_id: vec3<u32>,
+                @builtin(num_workgroups) groups: vec3<u32>,
                 @builtin(local_invocation_index) local: u32) {
-  compact(id.x, 0u, local);
+  let index = global_id.x + global_id.y * groups.x * 64u;
+  compact(index, 0u, local);
 }
 
 @compute @workgroup_size(64)
-fn compact_intersect(@builtin(global_invocation_id) id: vec3<u32>,
+fn compact_intersect(@builtin(global_invocation_id) global_id: vec3<u32>,
+                     @builtin(num_workgroups) groups: vec3<u32>,
                      @builtin(local_invocation_index) local: u32) {
-  compact(id.x, intersect_closest, local);
+  let index = global_id.x + global_id.y * groups.x * 64u;
+  compact(index, intersect_closest, local);
 }
 
 @compute @workgroup_size(64)
-fn compact_surface(@builtin(global_invocation_id) id: vec3<u32>,
+fn compact_surface(@builtin(global_invocation_id) global_id: vec3<u32>,
+                   @builtin(num_workgroups) groups: vec3<u32>,
                    @builtin(local_invocation_index) local: u32) {
-  compact(id.x, shade_surface, local);
+  let index = global_id.x + global_id.y * groups.x * 64u;
+  compact(index, shade_surface, local);
 }
 
 @compute @workgroup_size(64)
-fn compact_subsurface(@builtin(global_invocation_id) id: vec3<u32>,
+fn compact_subsurface(@builtin(global_invocation_id) global_id: vec3<u32>,
+                      @builtin(num_workgroups) groups: vec3<u32>,
                       @builtin(local_invocation_index) local: u32) {
-  compact(id.x, intersect_subsurface, local);
+  let index = global_id.x + global_id.y * groups.x * 64u;
+  compact(index, intersect_subsurface, local);
 }
 
 @compute @workgroup_size(64)
-fn compact_background(@builtin(global_invocation_id) id: vec3<u32>,
+fn compact_background(@builtin(global_invocation_id) global_id: vec3<u32>,
+                      @builtin(num_workgroups) groups: vec3<u32>,
                       @builtin(local_invocation_index) local: u32) {
-  compact(id.x, shade_background, local);
+  let index = global_id.x + global_id.y * groups.x * 64u;
+  compact(index, shade_background, local);
 }
 
 @compute @workgroup_size(64)
-fn classify_intersection(@builtin(global_invocation_id) id: vec3<u32>) {
+fn classify_intersection(@builtin(global_invocation_id) global_id: vec3<u32>,
+                         @builtin(num_workgroups) groups: vec3<u32>) {
+  let index = global_id.x + global_id.y * groups.x * 64u;
   let queue = queue_offset();
-  if (id.x < atomicLoad(&rays[queue])) {
-    let lane = atomicLoad(&rays[queue + 1u + id.x]);
+  if (index < atomicLoad(&rays[queue])) {
+    let lane = atomicLoad(&rays[queue + 1u + index]);
     let hit = 8u * lane;
     if (hits[hit + hit_special] != volume_scatter_hit) {
       paths[lane * path_words + queued_kernel] =
@@ -114,14 +127,16 @@ fn classify_intersection(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
-fn count_queues(@builtin(global_invocation_id) id: vec3<u32>,
+fn count_queues(@builtin(global_invocation_id) global_id: vec3<u32>,
+                @builtin(num_workgroups) groups: vec3<u32>,
                 @builtin(local_invocation_index) local: u32) {
+  let index = global_id.x + global_id.y * groups.x * 64u;
   // Reduce within the workgroup to avoid one global atomic per live path.
-  if (id.x < capacity()) {
-    let base = id.x * path_words;
+  if (index < capacity()) {
+    let base = index * path_words;
     let kernel = paths[base + queued_kernel];
     if (kernel != 0u && kernel <= queue_kernels) {
-      let sample = pixels[id.x].w;
+      let sample = pixels[index].w;
       atomicAdd(&group_counts[kernel - 1u], 1u);
       atomicMax(&group_min_sample, ~sample);
       atomicMax(&group_max_sample, sample);

@@ -225,9 +225,13 @@ evaluates the environment and forward area-light hits directly into the
 retired path. Both modes reuse the same film kernels. The scheduler admits
 paths across a whole sample batch and can refill the pool while earlier
 paths are active. New paths use free GPU slots, and multiple samples can
-accumulate into the same pixel using atomic updates. WebGPU uses up to
-65,536 concurrent paths, subject to its device limits and a 33 MiB path-pool
-budget. The stock scheduler refills this pool for larger render tiles.
+accumulate into the same pixel using atomic updates. The Cycles compute device
+requests the adapter's available limits. The path pool grows at sample batch
+boundaries according to the work the stock scheduler admits and the size and
+indexing limits of its buffers. Large linear dispatches extend across two
+workgroup dimensions. SVM tries the largest supported one-dimensional
+workgroup and retries at a smaller size if the driver rejects it.
+
 Each queue snapshot clears, counts, and copies the counters in one command
 buffer. The renderer waits for validation and mapping before using the
 snapshot. It reuses the staging buffer between snapshots.
@@ -262,6 +266,8 @@ python3 web/cycles-webgpu/build.py --surface-query TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-compact --svm-core TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-compact --svm-core --svm-textures TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --svm-compact --svm-core --svm-textures --validated-svm-words TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --svm-compact --svm-core --svm-textures --validated-svm-words --hardware-svm-textures TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-query TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-query --extended-queries TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-query --extended-queries --ao-only-queries TOOLCHAIN_ARGUMENTS

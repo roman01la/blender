@@ -58,7 +58,9 @@ def package(installation: Path, output: Path, python_process: Path | None = None
             "stock-camera.wgsl", "bvh2-compact.wgsl", "surface-compact.wgsl",
             "svm-compact.wgsl", "wavefront-light.wgsl", "path-update.wgsl",
         )]
-        for name in ("svm-compact-core.wgsl", "svm-compact-textures.wgsl"):
+        for name in ("svm-compact-core.wgsl", "svm-compact-textures.wgsl",
+                     "svm-compact-textures-validated.wgsl",
+                     "svm-compact-textures-validated-hardware.wgsl"):
             svm_variant = cycles_webgpu.resolve() / name
             if svm_variant.is_file():
                 shaders.append(svm_variant)
@@ -97,6 +99,7 @@ def package(installation: Path, output: Path, python_process: Path | None = None
             shadow_materials = cycles_webgpu.resolve() / "volume-scatter-shadow-guides-materials.wgsl"
             if shadow_materials.is_file():
                 shaders.append(shadow_materials)
+                shaders.append(port / "cycles-webgpu" / "volume-shadow-queue.wgsl")
         volume_guide_shaders = [cycles_webgpu.resolve() / name for name in (
             "volume-scatter-guides.wgsl", "volume-scatter-shadow-guides.wgsl",
             "shade-background-tree-guides-volume.wgsl",
@@ -115,7 +118,7 @@ def package(installation: Path, output: Path, python_process: Path | None = None
         if all(shader.is_file() for shader in grid_guide_shaders):
             shaders.extend(grid_guide_shaders)
         shaders.extend(port / "cycles-webgpu" / name for name in (
-            "film.wgsl", "path-state.wgsl", "wavefront-queue.wgsl",
+            "film.wgsl", "path-state.wgsl", "wavefront-queue.wgsl", "wavefront-sort.wgsl",
         ))
         for name in ("film-surface.wgsl", "film-ao.wgsl", "film-ao-prepare.wgsl"):
             surface_pass = cycles_webgpu.resolve() / name

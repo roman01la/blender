@@ -101,6 +101,12 @@
  * raw normal and squared roughness. The per-ray tail follows film AOVs.
  * Auxiliary RGB holds Transparent extinction and W holds live lobe flags. */
 #define CYCLES_WEBGPU_MATERIAL_ORDERED_CLOSURES 21.0f
+/* Keep numeric float indices through 2^24 for older shader bundles. Larger
+ * indices use a negative normal float as a bit carrier. Storage is bounded
+ * by UINT32_MAX words, so a float4 index is at most 0x3fffffff. Adding the
+ * bias therefore keeps the carrier bits at or below 0xc07fffff. */
+#define CYCLES_WEBGPU_ORDERED_TAIL_FLOAT_LIMIT 0x01000000u
+#define CYCLES_WEBGPU_ORDERED_TAIL_BITS_BIAS 0x80800000u
 #define CYCLES_WEBGPU_ORDERED_HAS_TRANSPARENT 1u
 #define CYCLES_WEBGPU_ORDERED_HAS_TRANSLUCENT 2u
 /* Standalone Glossy records plus weighted Transparent RGB and its signed

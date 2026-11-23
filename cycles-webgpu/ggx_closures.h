@@ -4,10 +4,29 @@
 
 #include "../blender-platform/cycles-webgpu/material_layout.h"
 
+#include <bit>
+
 using GgxFloat4 = float __attribute__((ext_vector_type(4)));
 
 #ifdef CYCLES_WEBGPU_ORDERED_CLOSURES
 __attribute__((pure)) GgxFloat4 cycles_material_lobe(unsigned int vector_index);
+
+inline constexpr unsigned int cycles_ordered_tail_index(const float carrier)
+{
+  if (carrier < 0.0f) {
+    return std::bit_cast<unsigned int>(carrier) - CYCLES_WEBGPU_ORDERED_TAIL_BITS_BIAS;
+  }
+  return static_cast<unsigned int>(carrier);
+}
+
+static_assert(cycles_ordered_tail_index(float(CYCLES_WEBGPU_ORDERED_TAIL_FLOAT_LIMIT)) ==
+              CYCLES_WEBGPU_ORDERED_TAIL_FLOAT_LIMIT);
+static_assert(cycles_ordered_tail_index(std::bit_cast<float>(
+                  CYCLES_WEBGPU_ORDERED_TAIL_BITS_BIAS + CYCLES_WEBGPU_ORDERED_TAIL_FLOAT_LIMIT + 1u)) ==
+              CYCLES_WEBGPU_ORDERED_TAIL_FLOAT_LIMIT + 1u);
+static_assert(cycles_ordered_tail_index(
+                  std::bit_cast<float>(CYCLES_WEBGPU_ORDERED_TAIL_BITS_BIAS + 0x3fffffffu)) ==
+              0x3fffffffu);
 #endif
 
 /* Cycles computes a minimum microfacet alpha from the smallest previous

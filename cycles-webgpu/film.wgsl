@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Cycles WebGPU volume geometry passes
+// Cycles WebGPU linear workgroup grid
 
 struct FilmParameters {
   bounds: vec4<u32>, // Absolute raster origin XY, width, height.

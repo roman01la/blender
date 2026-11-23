@@ -31,8 +31,6 @@ struct WebGPURenderShaders {
  * pthread distinct from the WebGPU owner. The device must outlive the pipeline. */
 class WebGPURenderPipeline {
  public:
-  static constexpr uint32_t max_path_capacity = 64 * 1024;
-
   explicit WebGPURenderPipeline(Device &device);
   ~WebGPURenderPipeline();
 
@@ -52,14 +50,14 @@ class WebGPURenderPipeline {
                     bool coated_principled_emission,
                     bool compact_voronoi_distance,
                     bool has_mixed_diffuse);
-  /** Reset the GPU film and return the allocated capacity for the stock path scheduler. */
+  /** Reset the GPU film. */
   bool reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WORDS> camera,
              std::span<const float, CYCLES_WEBGPU_CAMERA_LENS_WORDS> camera_lens,
              std::span<const uint32_t, 16> denoising_config,
              const BufferParams &params,
-             size_t film_words,
-             uint32_t &path_capacity);
-  bool begin_batch(int start_sample, int samples_num);
+             size_t film_words);
+  /** Grow the idle path pool as needed for the work scheduled in this batch. */
+  bool begin_batch(int start_sample, int samples_num, uint32_t &path_capacity);
   /** Execute stages selected by PathTraceWorkGPU and return its current queue counters. */
   bool enqueue_camera(std::span<const KernelWorkTile> tiles);
   bool enqueue_stage(DeviceKernel stage);

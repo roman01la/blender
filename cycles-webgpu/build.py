@@ -17,6 +17,7 @@ from wgsl_loop_state import coalesce_loop_state
 
 SOURCE = Path(__file__).resolve().parent
 CYCLES = SOURCE.parent.parent / "blender" / "intern" / "cycles"
+SVM_SAMPLER_BRIDGE = "_Z26cycles_svm_hardware_samplejjjjff"
 
 
 def run(*args, stdout=None):
@@ -54,6 +55,11 @@ def retarget(source: Path, wrapper: Path, output: Path) -> None:
                        r"\1 spir_func ", shader_ir)
     shader_ir = re.sub(r"\b(call|declare) (?=<4 x i32> @_Z18cycles_svm_contextjj)",
                        r"\1 spir_func ", shader_ir)
+    shader_ir = re.sub(
+        rf"\b(call|declare) (?=(?:noundef )?<4 x float> @{SVM_SAMPLER_BRIDGE}\b)",
+        r"\1 spir_func ",
+        shader_ir,
+    )
     shader_ir = re.sub(r"\b(call|declare) (?=(?:noundef )?(?:"
                        r"void @_Z29cycles_svm_write_ordered_lobe|<4 x float> @_Z20cycles_material_lobej\b))",
                        r"\1 spir_func ", shader_ir)
@@ -72,7 +78,7 @@ def retarget(source: Path, wrapper: Path, output: Path) -> None:
     output.write_text(shader_ir)
 
 
-def normalize_spirv(code: bytes) -> bytes:
+def normalize_spirv(code: bytes, hardware_svm_textures: bool = False) -> bytes:
     if len(code) < 20 or len(code) % 4:
         raise ValueError("Invalid SPIR-V binary length")
     words = struct.unpack(f"<{len(code) // 4}I", code)
@@ -81,18 +87,31 @@ def normalize_spirv(code: bytes) -> bytes:
     instructions = []
     int_types = {}
     vector_types = {}
+    has_sampler_bridge = False
     cursor = 5
     while cursor < len(words):
         length, opcode = words[cursor] >> 16, words[cursor] & 0xFFFF
         if length == 0 or cursor + length > len(words):
             raise ValueError("Invalid SPIR-V instruction length")
         operands = words[cursor + 1 : cursor + length]
+        cursor += length
+        # Retain just the outlined sampler stub's name so WGSL generation can
+        # locate its definition. Other variants let spirv-opt strip their debug data.
+        if hardware_svm_textures and opcode in {2, 3, 4, 5, 6, 7, 8, 317, 330}:
+            if opcode != 5:
+                continue
+            name = struct.pack(f"<{len(operands) - 1}I", *operands[1:]).split(b"\0", 1)[0]
+            if name != SVM_SAMPLER_BRIDGE.encode():
+                continue
+            has_sampler_bridge = True
         if opcode == 21:  # OpTypeInt
             int_types[operands[0]] = operands[1:]
         elif opcode == 23:  # OpTypeVector
             vector_types[operands[0]] = operands[1:]
         instructions.append((opcode, operands))
-        cursor += length
+
+    if hardware_svm_textures and not has_sampler_bridge:
+        raise ValueError("Missing hardware SVM sampler bridge in SPIR-V")
 
     header = list(words[:5])
     added_types = []
@@ -346,6 +365,10 @@ def build(options) -> None:
     if options.svm_core:
         shader_name = ("svm-compact-textures.wgsl" if options.svm_textures else
                        "svm-compact-core.wgsl")
+    if options.validated_svm_words:
+        shader_name = shader_name.removesuffix(".wgsl") + "-validated.wgsl"
+    if options.hardware_svm_textures:
+        shader_name = shader_name.removesuffix(".wgsl") + "-hardware.wgsl"
     if options.sampled_emission:
         shader_name = "sampled-emission.wgsl"
     if options.svm_query:
@@ -406,6 +429,8 @@ def build(options) -> None:
         shader_name = shader_name.removesuffix(".wgsl") + "-volume.wgsl"
 
     shader_flags = []
+    if options.validated_svm_words:
+        shader_flags.append("-DCYCLES_WEBGPU_VALIDATED_SVM_WORDS=1")
     ordered_closures = (options.svm_compact or options.svm_query or options.wavefront_light or
                         options.film_surface or
                         (options.standalone_closures and (options.path_update or options.denoise_surface)))
@@ -427,6 +452,8 @@ def build(options) -> None:
         shader_flags.append("-DCYCLES_WEBGPU_SVM_TEXTURES=1")
     if extended_queries or options.svm_textures:
         shader_flags.append("-DCYCLES_WEBGPU_SVM_PROJECTED_IMAGES=1")
+    if options.hardware_svm_textures:
+        shader_flags.append("-DCYCLES_WEBGPU_HARDWARE_SVM_TEXTURES=1")
     if options.advanced_queries:
         shader_flags.append("-DCYCLES_WEBGPU_SVM_ADVANCED_QUERIES=1")
     if options.sampled_emission:
@@ -483,6 +510,7 @@ def build(options) -> None:
         shader_flags.extend(("-DCYCLES_WEBGPU_SHADOW_SVM=1", "-DCYCLES_WEBGPU_SURFACE=1"))
         if volume_shadow:
             shader_flags.append("-DCYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS=1")
+            shader_flags.append("-DCYCLES_WEBGPU_COMPACT_MATERIAL_SHADOWS=1")
     if options.bvh2_compact:
         shader_flags.append("-DCYCLES_WEBGPU_OFFSET_CLOSEST=1")
     if options.subsurface or options.subsurface_compact:
@@ -743,15 +771,17 @@ def build(options) -> None:
         )
         # LLVM retains names of resource bindings as unused 8-bit constants.
         # Optimize those away before validation.
+        strip_debug = () if options.hardware_svm_textures else ("--strip-debug",)
         run(
             options.spirv_bin / "spirv-opt",
             "--target-env=vulkan1.2",
-            "--strip-debug", "-O", "--trim-capabilities", "--skip-validation",
+            *strip_debug, "-O", "--trim-capabilities", "--skip-validation",
             work / "kernel.spv",
             "-o", work / "optimized.spv",
         )
         normalized = work / "normalized.spv"
-        normalized.write_bytes(normalize_spirv((work / "optimized.spv").read_bytes()))
+        normalized.write_bytes(normalize_spirv((work / "optimized.spv").read_bytes(),
+                                              options.hardware_svm_textures))
         if options.svm_query:
             from scene_query_headers import narrow_scene_query_indices
 
@@ -762,6 +792,20 @@ def build(options) -> None:
                 query, "-o", normalized)
         run(options.spirv_bin / "spirv-val", "--target-env", "vulkan1.2", normalized)
         run("node", SOURCE / "translate.mjs", options.translator, normalized, work / shader_name)
+        if options.hardware_svm_textures:
+            shader_path = work / shader_name
+            sampler = (SOURCE / "svm-hardware-textures.wgsl").read_text()
+            shader, count = re.subn(
+                rf"fn {SVM_SAMPLER_BRIDGE}\([^\n]*\) -> vec4<f32> \{{[^{{}}]*\}}",
+                lambda _: sampler,
+                shader_path.read_text(),
+            )
+            if count != 1:
+                raise ValueError("Expected one outlined SVM atlas sampler in generated WGSL")
+            shader_path.write_text("// Cycles WebGPU hardware texture atlas\n" + shader)
+        if options.validated_svm_words:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU validated SVM node bounds\n")
         if extended_queries:
             with (work / shader_name).open("a") as shader:
                 shader.write("\n// Cycles WebGPU projected query images\n")
@@ -852,6 +896,7 @@ def build(options) -> None:
         if ordered_closures:
             with (work / shader_name).open("a") as shader:
                 shader.write("\n// Cycles WebGPU ordered closures\n")
+                shader.write("// Cycles WebGPU integer ordered tail indices\n")
                 shader.write("// Cycles WebGPU paired Principled layers with metallic\n")
         if ordered_closures or options.shadow_materials:
             with (work / shader_name).open("a") as shader:
@@ -915,6 +960,8 @@ def build(options) -> None:
                 shader.write("// Cycles WebGPU extended shadow SVM\n")
                 if not volume_shadow:
                     shader.write("// Cycles WebGPU varying Ambient Occlusion shadows\n")
+                else:
+                    shader.write("// Cycles WebGPU compact material shadows\n")
         if (options.volume_interval or options.volume_scatter or options.volume_extinction_shadow or
                 (options.volume_scatter_shadow and options.shadow_materials) or
                 (options.wavefront_light and options.volume_forward) or
@@ -1098,6 +1145,10 @@ if __name__ == "__main__":
                        help="compile Cycles' adaptive film pass writers")
     parser.add_argument("--svm-textures", action="store_true",
                         help="include common textures and color nodes in the compact core SVM")
+    parser.add_argument("--validated-svm-words", action="store_true",
+                        help="use prevalidated typed SVM payloads in the compact texture shader")
+    parser.add_argument("--hardware-svm-textures", action="store_true",
+                        help="use hardware bicubic image filtering when the compact SVM atlas is available")
     parser.add_argument("--extended-queries", action="store_true",
                         help="include selected texture and color nodes with SVM ray queries")
     parser.add_argument("--advanced-queries", action="store_true",
@@ -1139,6 +1190,10 @@ if __name__ == "__main__":
         parser.error("--svm-core requires --svm-compact")
     if options.svm_textures and not options.svm_core:
         parser.error("--svm-textures requires --svm-core")
+    if options.validated_svm_words and not (options.svm_compact and options.svm_textures):
+        parser.error("--validated-svm-words requires --svm-compact --svm-core --svm-textures")
+    if options.hardware_svm_textures and not (options.svm_compact and options.svm_textures):
+        parser.error("--hardware-svm-textures requires --svm-compact --svm-core --svm-textures")
     if options.standalone_closures and not (options.path_update or options.denoise_surface):
         parser.error("--standalone-closures requires --path-update or --denoise-surface")
     if options.reflection_only and not (options.wavefront_light or options.path_update):

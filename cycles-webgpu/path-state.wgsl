@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Cycles WebGPU linear workgroup grid
 
 @group(0) @binding(0) var<storage, read> rays: array<u32>;
 @group(0) @binding(1) var<storage, read_write> path_state: array<u32>;
@@ -65,13 +66,17 @@ fn initialize_path(index: u32) -> u32 {
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  _ = initialize_path(id.x);
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>,
+        @builtin(num_workgroups) groups: vec3<u32>) {
+  let index = global_id.x + global_id.y * groups.x * 64u;
+  _ = initialize_path(index);
 }
 
 @compute @workgroup_size(64)
-fn initialize_guided(@builtin(global_invocation_id) id: vec3<u32>) {
-  let lane = initialize_path(id.x);
+fn initialize_guided(@builtin(global_invocation_id) global_id: vec3<u32>,
+                     @builtin(num_workgroups) groups: vec3<u32>) {
+  let index = global_id.x + global_id.y * groups.x * 64u;
+  let lane = initialize_path(index);
   if (lane == 0xffffffffu) {
     return;
   }
@@ -85,13 +90,15 @@ fn initialize_guided(@builtin(global_invocation_id) id: vec3<u32>) {
 // The storage adapter for Cycles' camera film_need_sample_pixel/film_write_sample.
 // Claim a contiguous effective sample ID per pixel before generating the ray.
 @compute @workgroup_size(64)
-fn admit_adaptive_pixels(@builtin(global_invocation_id) id: vec3<u32>) {
+fn admit_adaptive_pixels(@builtin(global_invocation_id) global_id: vec3<u32>,
+                         @builtin(num_workgroups) groups: vec3<u32>) {
+  let index = global_id.x + global_id.y * groups.x * 64u;
   let queue = 1u + 12u * rays[0];
-  if (id.x >= work[2] || id.x >= rays[queue]) {
+  if (index >= work[2] || index >= rays[queue]) {
     return;
   }
 
-  let lane = rays[queue + 1u + id.x];
+  let lane = rays[queue + 1u + index];
   let pixel = pixels[lane];
   let local = pixel.xy - render_buffer.bounds.xy;
   let pixel_index = render_buffer.placement.x + local.y * render_buffer.placement.y + local.x;

@@ -1347,7 +1347,7 @@ ccl_device float ordered_closure_sample_weight(Spectrum color, const unsigned in
 ccl_device unsigned int ordered_closure_address(const GgxFloat4 material,
                                                 const unsigned int index)
 {
-  return unsigned(material.x) + CYCLES_WEBGPU_ORDERED_LOBE_VECTORS * index;
+  return cycles_ordered_tail_index(material.x) + CYCLES_WEBGPU_ORDERED_LOBE_VECTORS * index;
 }
 
 ccl_device OrderedClosure read_ordered_closure(const GgxFloat4 material,

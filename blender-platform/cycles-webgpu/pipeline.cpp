@@ -32,7 +32,9 @@ CCL_NAMESPACE_BEGIN
 namespace {
 
 constexpr uint32_t workgroup_size = 64;
-using ShaderFeatures = std::array<bool, size_t(webgpu_svm_ao_textures_kernel) + 1>;
+using ShaderFeatures = std::array<bool, size_t(webgpu_svm_hardware_textures_kernel) + 1>;
+constexpr std::string_view validated_svm_marker = "// Cycles WebGPU validated SVM node bounds\n";
+constexpr std::string_view hardware_svm_marker = "// Cycles WebGPU hardware texture atlas\n";
 constexpr std::string_view triangle_light_tree_header =
     "// Cycles Light Tree finite point\n// Cycles Light Tree triangle emitters\n";
 constexpr std::string_view textured_light_tree_marker = "// Cycles Light Tree textured emitters\n";
@@ -43,6 +45,8 @@ constexpr std::string_view mixed_diffuse_marker = "// Cycles WebGPU mixed Diffus
 constexpr std::string_view independent_mixed_bump_marker =
     "// Cycles WebGPU independent mixed Bump normals\n";
 constexpr std::string_view ordered_closures_marker = "// Cycles WebGPU ordered closures\n";
+constexpr std::string_view integer_ordered_tail_marker =
+    "// Cycles WebGPU integer ordered tail indices\n";
 constexpr std::string_view ordered_transparency_marker =
     "// Cycles WebGPU ordered Transparent and Translucent closures\n";
 constexpr std::string_view glossy_displacement_bump_marker =
@@ -93,6 +97,8 @@ constexpr std::string_view extended_volume_stack_marker = "// Cycles WebGPU exte
 constexpr std::string_view transparent_volume_marker = "// Cycles WebGPU transparent volume shadows\n";
 constexpr std::string_view varying_volume_dispatch_marker =
     "// Cycles WebGPU varying volume shadow dispatch\n";
+constexpr std::string_view compact_volume_shadow_marker =
+    "// Cycles WebGPU compact material shadows\n";
 constexpr std::string_view volume_differential_marker = "// Cycles WebGPU volume ray differentials\n";
 constexpr std::string_view principled_alpha_marker = "// Cycles WebGPU Principled Alpha\n";
 constexpr std::string_view volume_guide_surface_marker =
@@ -108,11 +114,10 @@ constexpr std::string_view subsurface_marker = "// Cycles WebGPU Christensen-Bur
 constexpr std::string_view subsurface_bump_marker = "// Cycles WebGPU subsurface bump normals\n";
 /* The stock scheduler takes one eighth of the path pool as its work tile limit. */
 constexpr uint32_t min_path_capacity = 8;
-/* 136 words per path at 64K slots, including the optional closure normal record. */
-constexpr size_t path_pool_budget_words = 34 * 1024 * 1024 / sizeof(uint32_t);
 
 constexpr uint32_t pixel_words_per_path = 4;
 constexpr uint32_t ray_header_words = 2;
+constexpr uint32_t max_volume_ray_words_per_path = 17;
 constexpr uint32_t hit_words_per_path = 8;
 constexpr uint32_t shading_words_per_path = 24;
 constexpr uint32_t shading_storage_words_per_path(const bool queries, const bool hair)
@@ -139,8 +144,13 @@ constexpr uint32_t shadow_storage_words_per_path(const bool textured)
 
 constexpr uint32_t ray_words_per_path(const bool adaptive,
                                        const bool differentials,
-                                       const bool scattering)
+                                       const bool scattering,
+                                       const bool compact_volume_shadows = false)
 {
+  if (compact_volume_shadows) {
+    /* The shadow indices follow the longest volume ray layout. */
+    return max_volume_ray_words_per_path + 1;
+  }
   /* The shared active/free queue is followed by one film class word per adaptive path. */
   return differentials ? 16 + uint32_t(scattering) : (scattering ? 15 : (adaptive ? 14 : 13));
 }
@@ -152,21 +162,23 @@ struct PathBufferSize {
 
 constexpr auto path_buffer_sizes(const bool adaptive,
                                  const bool deferred_shadow,
-                                 const bool guided,
-                                 const bool textured,
-                                 const size_t extra_material_words,
-                                 const bool queries,
-                                 const bool differentials,
-                                 const bool hair,
-                                 const bool absorption,
-                                 const bool scattering,
-                                 const bool emission,
-                                 const bool surface_passes,
-                                 const bool light_passes)
+                                 const bool guided = false,
+                                 const bool textured = false,
+                                 const size_t extra_material_words = 0,
+                                 const bool queries = false,
+                                 const bool differentials = false,
+                                 const bool hair = false,
+                                 const bool absorption = false,
+                                 const bool scattering = false,
+                                 const bool emission = false,
+                                 const bool surface_passes = false,
+                                 const bool light_passes = false,
+                                 const bool compact_volume_shadows = false)
 {
   return std::array{PathBufferSize{pixel_words_per_path},
                     PathBufferSize{
-                        ray_words_per_path(adaptive, differentials, scattering), ray_header_words},
+                        ray_words_per_path(adaptive, differentials, scattering, compact_volume_shadows),
+                        ray_header_words + uint32_t(compact_volume_shadows)},
                     PathBufferSize{hit_words_per_path},
                     PathBufferSize{deferred_shadow ? shadow_storage_words_per_path(textured) : 0},
                     PathBufferSize{shading_storage_words_per_path(queries, hair)},
@@ -185,30 +197,14 @@ constexpr auto path_buffer_sizes(const bool adaptive,
 }
 
 constexpr uint32_t path_capacity_for_limits(const WebGPUComputeLimits &limits,
-                                            const bool adaptive,
-                                            const bool deferred_shadow,
-                                            size_t &bytes_per_path,
-                                            const bool guided = false,
-                                            const bool textured = false,
-                                            const size_t extra_material_words = 0,
-                                            const bool queries = false,
-                                            const bool differentials = false,
-                                            const bool hair = false,
-                                            const bool absorption = false,
-                                            const bool scattering = false,
-                                            const bool emission = false,
-                                            const bool surface_passes = false,
-                                            const bool light_passes = false)
+                                            const std::span<const PathBufferSize> buffers,
+                                            size_t &bytes_per_path)
 {
-  const size_t binding_words = limits.storage_buffer_bytes / sizeof(uint32_t);
-  uint64_t capacity = std::min<uint64_t>(WebGPURenderPipeline::max_path_capacity,
-                                         uint64_t(limits.workgroups_per_dimension) * workgroup_size);
+  const size_t binding_words = std::min(limits.storage_buffer_bytes / sizeof(uint32_t),
+                                        size_t(UINT32_MAX));
+  uint64_t capacity = std::numeric_limits<int>::max();
   size_t words_per_path = 0;
-  size_t header_words = 0;
-  for (const auto &buffer :
-       path_buffer_sizes(adaptive, deferred_shadow, guided, textured, extra_material_words, queries,
-                         differentials, hair, absorption, scattering, emission, surface_passes,
-                         light_passes)) {
+  for (const auto &buffer : buffers) {
     if (buffer.words_per_path == 0) {
       continue;
     }
@@ -218,20 +214,22 @@ constexpr uint32_t path_capacity_for_limits(const WebGPUComputeLimits &limits,
     capacity = std::min<uint64_t>(
         capacity, (binding_words - buffer.header_words) / buffer.words_per_path);
     words_per_path += buffer.words_per_path;
-    header_words += buffer.header_words;
   }
   bytes_per_path = words_per_path * sizeof(uint32_t);
-  return uint32_t(std::min<uint64_t>(capacity,
-                                      (path_pool_budget_words - header_words) / words_per_path));
+  return uint32_t(capacity);
 }
 
 static_assert([] {
   size_t bytes_per_path = 0;
-  return path_capacity_for_limits({128 * 1024 * 1024, 65535}, true, true, bytes_per_path) ==
-             WebGPURenderPipeline::max_path_capacity &&
-         path_capacity_for_limits({1536, 1}, true, true, bytes_per_path) ==
+  constexpr auto buffers = path_buffer_sizes(true, true);
+  return path_capacity_for_limits({128 * 1024 * 1024, 65535}, buffers, bytes_per_path) ==
+             (128 * 1024 * 1024) / (CYCLES_WEBGPU_MATERIAL_WORDS * sizeof(uint32_t)) &&
+         path_capacity_for_limits({1536, 1}, buffers, bytes_per_path) ==
              1536 / (CYCLES_WEBGPU_MATERIAL_WORDS * sizeof(uint32_t)) &&
-         path_capacity_for_limits({128 * 1024 * 1024, 1}, false, false, bytes_per_path) == 64;
+         path_capacity_for_limits({std::numeric_limits<size_t>::max(), 65535},
+                                  buffers, bytes_per_path) ==
+             std::min(std::numeric_limits<size_t>::max() / sizeof(uint32_t), size_t(UINT32_MAX)) /
+                 CYCLES_WEBGPU_MATERIAL_WORDS;
 }());
 
 /* The queue compiles a few fused stages into private slots alongside the
@@ -381,6 +379,13 @@ constexpr auto svm_query_bindings = [] {
   auto bindings = std::to_array(svm_bindings);
   bindings[4].minimum_size = 40;
   bindings[6].minimum_size = CYCLES_WEBGPU_QUERY_CAMERA_OFFSET * sizeof(uint32_t);
+  return bindings;
+}();
+constexpr auto svm_hardware_bindings = [] {
+  std::array<WebGPUKernelBinding, std::size(svm_bindings) + 2> bindings{};
+  std::copy(std::begin(svm_bindings), std::end(svm_bindings), bindings.begin());
+  bindings[8] = {8, WebGPUKernelBinding::Type::FloatTexture, 0};
+  bindings[9] = {9, WebGPUKernelBinding::Type::FilteringSampler, 0};
   return bindings;
 }();
 constexpr WebGPUKernelBinding sampled_emission_bindings[] = {
@@ -534,6 +539,16 @@ constexpr auto varying_volume_shadow_bindings = std::array{
     volume_scatter_shadow_bindings[4], volume_scatter_shadow_bindings[5],
     WebGPUKernelBinding{6, storage, 16},
     WebGPUKernelBinding{7, storage, 8}};
+constexpr WebGPUKernelBinding reset_volume_shadow_bindings[] = {
+    {0, storage, sizeof(uint32_t)}, {2, storage, 3 * sizeof(uint32_t)}};
+constexpr auto compact_volume_shadow_bindings = std::array{
+    reset_volume_shadow_bindings[0],
+    WebGPUKernelBinding{1, read_only, shadow_words_per_path * sizeof(uint32_t)},
+    reset_volume_shadow_bindings[1]};
+constexpr auto compact_guided_volume_shadow_bindings = std::array{
+    compact_volume_shadow_bindings[0], compact_volume_shadow_bindings[1],
+    compact_volume_shadow_bindings[2], WebGPUKernelBinding{3, storage, denoising_bytes},
+    WebGPUKernelBinding{4, read_only, CYCLES_WEBGPU_SURFACE_VOLUME_SHADOW_OFFSETS * sizeof(uint32_t)}};
 constexpr auto guided_accumulate_bindings = std::array{
     accumulate_bindings[0], accumulate_bindings[1], accumulate_bindings[2], accumulate_bindings[3],
     WebGPUKernelBinding{9, read_only, denoising_bytes},
@@ -715,6 +730,7 @@ struct WebGPURenderPipeline::Impl {
   device_only_memory<uint32_t> rays{&device, "WebGPU primary rays"};
   device_only_memory<uint32_t> hits{&device, "WebGPU primary intersections"};
   device_only_memory<uint32_t> shadow_rays{&device, "WebGPU shadow rays"};
+  device_only_memory<uint32_t> volume_shadow_indirect{&device, "WebGPU volume shadow indirect dispatch"};
   device_only_memory<uint32_t> points{&device, "WebGPU shading points"};
   WebGPUPathStateStorage path_state{device};
   device_only_memory<uint32_t> absorption_state{&device, "WebGPU homogeneous absorption paths"};
@@ -743,8 +759,10 @@ struct WebGPURenderPipeline::Impl {
   DeviceKernel guide_kernel = denoising_surface_kernel;
   DeviceKernel active_background_kernel = background_kernel;
   DeviceKernel active_svm_kernel = svm_core_kernel;
+  device_ptr svm_image_atlas = 0;
   bool svm_core_loaded = false;
   bool svm_extended_loaded = false;
+  bool sort_surface_shaders = false;
   bool sampled_emission_loaded = false;
   bool aov_loaded = false;
   bool aov_active = false;
@@ -781,6 +799,7 @@ struct WebGPURenderPipeline::Impl {
   ShaderFeatures mixed_diffuse_shaders{};
   ShaderFeatures independent_mixed_bump_shaders{};
   ShaderFeatures ordered_closure_shaders{};
+  ShaderFeatures integer_ordered_tail_shaders{};
   ShaderFeatures ordered_transparency_shaders{};
   ShaderFeatures closure_composition_shaders{};
   ShaderFeatures paired_principled_layer_shaders{};
@@ -814,6 +833,10 @@ struct WebGPURenderPipeline::Impl {
   bool additive_volume = false;
   bool extended_volume_stack = false;
   size_t volume_shadow_params_offset = 0;
+  bool compact_volume_shadow_shader = false;
+  bool compact_volume_shadow_queue_loaded = false;
+  bool compact_volume_shadow_linear_grid = false;
+  bool compact_volume_shadows = false;
   bool grid_volume = false;
   bool volume_queue_supported = false;
   ShaderFeatures absorption_shaders{};
@@ -869,6 +892,8 @@ struct WebGPURenderPipeline::Impl {
   bool guided_tree_background_loaded = false;
   uint32_t sampling_pattern = 0;
   std::array<uint32_t, 12> film_config{};
+  size_t material_words_per_path = 0;
+  uint32_t path_pool_limit = 0;
   uint32_t path_capacity = 0;
   uint32_t pixel_count = 0;
   uint32_t next_sample = 0;
@@ -877,6 +902,13 @@ struct WebGPURenderPipeline::Impl {
   std::array<uint32_t, 4> crop{};
 
   explicit Impl(Device &device) : device(device) {}
+
+  bool reserve_paths(uint32_t capacity);
+
+  ~Impl()
+  {
+    device_webgpu_free_texture_atlas(device, svm_image_atlas);
+  }
 
   bool supports_lamp_emission(const DeviceKernel kernel) const
   {
@@ -898,19 +930,82 @@ struct WebGPURenderPipeline::Impl {
                        const std::span<const WebGPUKernelBinding> bindings,
                        const std::string_view entry = "main")
   {
-    if (!device_webgpu_register_kernel(device, kernel, source, workgroup_size, bindings, entry)) {
+    const bool svm = kernel == svm_core_kernel || kernel == svm_textures_kernel ||
+                     kernel == svm_extended_kernel || kernel == svm_query_kernel ||
+                     kernel == svm_query_textures_kernel || kernel == svm_query_advanced_kernel ||
+                     kernel == webgpu_svm_ao_textures_kernel ||
+                     kernel == webgpu_svm_validated_textures_kernel ||
+                     kernel == webgpu_svm_hardware_textures_kernel;
+    uint32_t compiled_width = workgroup_size;
+    bool registered = false;
+    const uint32_t max_svm_width = svm ? device_webgpu_max_1d_workgroup_size(device) : 0;
+    if (svm) {
+      /* Generated SVM entry points use global IDs and no workgroup storage. Keep
+       * the original entry for older assets and any other shader shape. */
+      constexpr std::string_view original = "@workgroup_size(64, 1, 1)";
+      const size_t attribute = source.find(original);
+      if (max_svm_width > workgroup_size && attribute != source.npos &&
+          source.find("@workgroup_size(") == attribute &&
+          source.find("@workgroup_size(", attribute + original.size()) == source.npos &&
+          source.find("var<workgroup>") == source.npos &&
+          source.find("@builtin(local_invocation_") == source.npos &&
+          source.find("@builtin(workgroup_id)") == source.npos &&
+          source.find("@builtin(num_workgroups)") == source.npos)
+      {
+        /* Try the previously verified width if a larger group exceeds the
+         * compiler's resource budget. The packaged shader is the final retry. */
+        constexpr uint32_t fallback_width = 576;
+        for (const uint32_t width : {max_svm_width, max_svm_width > fallback_width ? fallback_width : 0u}) {
+          if (!width) {
+            break;
+          }
+          std::string resized = "@workgroup_size(" + std::to_string(width) + ",1,1)";
+          /* Preserve source length for the browser's shader profiler. */
+          if (resized.size() < original.size()) {
+            resized.append(original.size() - resized.size(), ' ');
+          }
+          std::string tuned(source);
+          tuned.replace(attribute, original.size(), resized);
+          std::string compile_error;
+          registered = device_webgpu_try_register_kernel(
+              device, kernel, tuned, width, bindings, entry, compile_error);
+          if (registered) {
+            compiled_width = width;
+            break;
+          }
+          if (compile_error.empty()) {
+            break;
+          }
+          LOG_WARNING << "Cycles WebGPU SVM workgroup width " << width << " was rejected: "
+                      << compile_error;
+        }
+      }
+    }
+    if (!registered &&
+        !device_webgpu_register_kernel(device, kernel, source, workgroup_size, bindings, entry))
+    {
       const std::string_view name = kernel == webgpu_prepare_ao_pass_kernel ? "prepare_ao_pass" :
                                     kernel == webgpu_svm_ao_textures_kernel ? "svm_ao_textures" :
-                                    kernel == DEVICE_KERNEL_NUM ? entry :
+                                    kernel == webgpu_svm_validated_textures_kernel ? "svm_validated_textures" :
+                                    kernel == webgpu_svm_hardware_textures_kernel ? "svm_hardware_textures" :
+                                    kernel >= DEVICE_KERNEL_NUM ? entry :
                                                                   device_kernel_as_string(kernel);
       LOG_ERROR << "Cycles WebGPU could not register compute pipeline " << name;
       return false;
+    }
+    if (svm) {
+      LOG_INFO << "Cycles WebGPU SVM workgroup width " << compiled_width << ", negotiated maximum "
+               << max_svm_width;
+    }
+    if (kernel == varying_volume_shadow_kernel) {
+      compact_volume_shadow_shader = source.find(compact_volume_shadow_marker) != source.npos;
     }
     standalone_shaders[kernel] = source.find(standalone_closure_marker) != source.npos;
     mixed_diffuse_shaders[kernel] = source.find(mixed_diffuse_marker) != source.npos;
     independent_mixed_bump_shaders[kernel] =
         source.find(independent_mixed_bump_marker) != source.npos;
     ordered_closure_shaders[kernel] = source.find(ordered_closures_marker) != source.npos;
+    integer_ordered_tail_shaders[kernel] = source.find(integer_ordered_tail_marker) != source.npos;
     ordered_transparency_shaders[kernel] = source.find(ordered_transparency_marker) != source.npos;
     closure_composition_shaders[kernel] = source.find(closure_compositions_marker) != source.npos;
     paired_principled_layer_shaders[kernel] = source.find(paired_principled_layers_marker) !=
@@ -971,10 +1066,20 @@ struct WebGPURenderPipeline::Impl {
     return true;
   }
 
+  bool supports_integer_ordered_indices(const bool guided, const bool surface_passes) const
+  {
+    return integer_ordered_tail_shaders[active_svm_kernel] &&
+           integer_ordered_tail_shaders[light_kernel] &&
+           integer_ordered_tail_shaders[update_kernel] &&
+           (!guided || integer_ordered_tail_shaders[guide_kernel]) &&
+           (!surface_passes || integer_ordered_tail_shaders[shade_surface_passes_kernel]);
+  }
+
   bool prepare_svm(const bool requires_extended_svm,
                    const bool queries,
                    const bool advanced,
-                   const bool ao_only)
+                   const bool ao_only,
+                   const std::span<const uint32_t> packed_svm)
   {
     if (queries) {
       if (!shader_loaded[surface_query_kernel]) {
@@ -1034,6 +1139,31 @@ struct WebGPURenderPipeline::Impl {
     /* The full module includes the Gabor and advanced Voronoi kernels.
      * Skip their compile cost for ordinary procedural and image textures. */
     if (!advanced) {
+      /* Scene packing validated each non-volume material in its selected closure mode.
+       * Leave other scene and shader consumers on checked bytecode reads. */
+      if (!absorption) {
+        if (device_webgpu_filterable_texture_limit(device)) {
+          const auto source = load_shader("svm-compact-textures-validated-hardware.wgsl");
+          if (!source.empty() && source.find(validated_svm_marker) != source.npos &&
+              source.find(hardware_svm_marker) != source.npos)
+          {
+            svm_image_atlas = cycles_webgpu_create_svm_image_atlas(device, packed_svm);
+            if (svm_image_atlas) {
+              active_svm_kernel = webgpu_svm_hardware_textures_kernel;
+              LOG_INFO << "Cycles WebGPU using hardware cubic filtering and validated surface SVM";
+              return shader_loaded[active_svm_kernel] ||
+                     register_kernel(active_svm_kernel, source, svm_hardware_bindings);
+            }
+          }
+        }
+        const auto source = load_shader("svm-compact-textures-validated.wgsl");
+        if (!source.empty() && source.find(validated_svm_marker) != source.npos) {
+          active_svm_kernel = webgpu_svm_validated_textures_kernel;
+          LOG_INFO << "Cycles WebGPU using validated surface SVM";
+          return shader_loaded[active_svm_kernel] ||
+                 register_kernel(active_svm_kernel, source, svm_bindings);
+        }
+      }
       if (!shader_loaded[svm_textures_kernel]) {
         const auto source = load_shader("svm-compact-textures.wgsl");
         if (!source.empty() && !register_kernel(svm_textures_kernel, source, svm_bindings)) {
@@ -1451,6 +1581,68 @@ struct WebGPURenderPipeline::Impl {
   {
     return DeviceKernelArguments(&buffer.device_pointer...);
   }
+
+  bool prepare_compact_volume_shadow_queue()
+  {
+    if (compact_volume_shadow_queue_loaded) {
+      return true;
+    }
+    const auto source = load_shader("volume-shadow-queue.wgsl");
+    constexpr std::string_view linear_grid_marker = "// Cycles WebGPU linear workgroup grid\n";
+    compact_volume_shadow_linear_grid = source.find(linear_grid_marker) != source.npos;
+    auto reset_bindings = std::to_array(reset_volume_shadow_bindings);
+    auto compact_bindings = compact_volume_shadow_bindings;
+    auto guided_bindings = compact_guided_volume_shadow_bindings;
+    if (compact_volume_shadow_linear_grid) {
+      reset_bindings[1].minimum_size = 4 * sizeof(uint32_t);
+      compact_bindings[2] = reset_bindings[1];
+      guided_bindings[2] = reset_bindings[1];
+    }
+    compact_volume_shadow_queue_loaded =
+        !source.empty() &&
+        device_webgpu_register_kernel(device, webgpu_reset_volume_shadow_queue,
+                                      source, 1, reset_bindings,
+                                      "reset_shadow_queue") &&
+        device_webgpu_register_kernel(device, webgpu_compact_volume_shadow_queue,
+                                      source, workgroup_size, compact_bindings,
+                                      "compact_shadow_rays") &&
+        device_webgpu_register_kernel(device, webgpu_compact_guided_volume_shadow_queue,
+                                      source, workgroup_size, guided_bindings,
+                                      "compact_guided_volume_shadow_rays") &&
+        (!compact_volume_shadow_linear_grid ||
+         device_webgpu_register_kernel(device, webgpu_finish_volume_shadow_grid_kernel,
+                                       source, 1, reset_bindings, "finish_shadow_grid"));
+    return compact_volume_shadow_queue_loaded;
+  }
+
+  bool enqueue_compact_volume_shadow(const uint32_t count,
+                                     const DeviceKernelArguments &shadow,
+                                     const bool accumulate_guides,
+                                     const WebGPUDispatch *after = nullptr)
+  {
+    const auto reset = bind(rays, volume_shadow_indirect);
+    const auto compact = accumulate_guides ?
+                             bind(rays, shadow_rays, volume_shadow_indirect,
+                                  denoising, scene.surface) :
+                             bind(rays, shadow_rays, volume_shadow_indirect);
+    const WebGPUDispatch prepare[] = {
+        {webgpu_reset_volume_shadow_queue, reset, 1},
+        {accumulate_guides ? webgpu_compact_guided_volume_shadow_queue :
+                             webgpu_compact_volume_shadow_queue, compact, count},
+        {webgpu_finish_volume_shadow_grid_kernel, reset, 1},
+    };
+    const WebGPUDispatch trace{
+        varying_volume_shadow_kernel, shadow, count, volume_shadow_indirect.device_pointer};
+    const size_t prepare_count = compact_volume_shadow_linear_grid ? 3 : 2;
+    if (!device_webgpu_enqueue(device, count, std::span(prepare).first(prepare_count))) {
+      return false;
+    }
+    if (after) {
+      const WebGPUDispatch stages[] = {trace, *after};
+      return device_webgpu_enqueue(device, count, stages);
+    }
+    return device_webgpu_enqueue(device, count, {&trace, 1});
+  }
 };
 
 WebGPURenderPipeline::WebGPURenderPipeline(Device &device) : impl_(make_unique<Impl>(device)) {}
@@ -1482,6 +1674,9 @@ bool WebGPURenderPipeline::initialize(const WebGPURenderShaders &shaders)
     return p.fail("Cycles WebGPU render pipeline failed to compile a kernel");
   }
   p.load_shader = shaders.load_shader;
+  if (!p.wavefront_queue.prepare_surface_sort(p.load_shader("wavefront-sort.wgsl"))) {
+    return p.fail("Cycles WebGPU could not compile the shader sorting kernel");
+  }
   p.volume_queue_supported = shaders.wavefront_queue.find(volume_queue_marker) !=
                              shaders.wavefront_queue.npos;
   const auto background = p.load_shader("shade-background.wgsl");
@@ -1610,6 +1805,8 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
   p.scene_uploaded = false;
   p.film_ready = false;
   p.batch_active = false;
+  device_webgpu_free_texture_atlas(p.device, p.svm_image_atlas);
+  p.svm_image_atlas = 0;
   p.transparent_materials = CYCLES_WEBGPU_SURFACE_HAS_TRANSPARENCY(surface.front());
   p.active_shadow_kernel = shadow_kernel;
   const bool varying_volume_shadows =
@@ -1624,6 +1821,7 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
   bool shadow_extended_svm = false;
   p.extended_volume_stack = false;
   p.volume_shadow_params_offset = 0;
+  p.compact_volume_shadows = false;
   p.grid_volume = false;
   if (p.absorption) {
     if (surface.size() < CYCLES_WEBGPU_SURFACE_ABSORPTION_OFFSETS) {
@@ -1726,7 +1924,8 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
   if (!p.prepare_svm((svm[1] & CYCLES_WEBGPU_SVM_EXTENDED) != 0,
                      queries,
                      advanced_svm,
-                     ao_only_queries))
+                     ao_only_queries,
+                     svm))
   {
     return p.fail("Cycles WebGPU could not load the SVM material shader");
   }
@@ -1734,6 +1933,10 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
   const size_t shader_count = svm[1] & CYCLES_WEBGPU_SVM_SHADER_COUNT;
   if (shader_flags > surface.size() || shader_count > surface.size() - shader_flags) {
     return p.fail("Cycles WebGPU has invalid shader flag offsets");
+  }
+  p.sort_surface_shaders = p.wavefront_queue.use_surface_sort(shader_count);
+  if (p.sort_surface_shaders) {
+    LOG_INFO << "Cycles WebGPU sorting surface paths by shader";
   }
   p.ordered_closures = std::ranges::any_of(surface.subspan(shader_flags, shader_count),
                                            [](const uint32_t flags) {
@@ -1944,6 +2147,10 @@ bool WebGPURenderPipeline::upload_scene(std::span<const uint32_t> scene,
         prepared = prepared && load_volume_stage(varying_volume_shadow_kernel,
                                                  "volume-scatter-shadow-guides-materials.wgsl",
                                                  varying_volume_shadow_bindings);
+        if (prepared && p.compact_volume_shadow_shader) {
+          prepared = p.prepare_compact_volume_shadow_queue();
+          p.compact_volume_shadows = prepared;
+        }
       }
       else {
         prepared = prepared && load_volume_stage(
@@ -2168,8 +2375,7 @@ bool WebGPURenderPipeline::reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WOR
                                  std::span<const float, CYCLES_WEBGPU_CAMERA_LENS_WORDS> camera_lens,
                                  std::span<const uint32_t, 16> denoising_config,
                                  const BufferParams &params,
-                                 const size_t film_words,
-                                 uint32_t &path_capacity)
+                                 const size_t film_words)
 {
   Impl &p = *impl_;
   p.error.clear();
@@ -2286,29 +2492,24 @@ bool WebGPURenderPipeline::reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WOR
   if (film_words > limits.storage_buffer_bytes / sizeof(uint32_t)) {
     return p.fail("Cycles WebGPU render slice film exceeds the device buffer limit");
   }
-  uint32_t device_capacity = path_capacity_for_limits(
-      limits, adaptive, p.deferred_shadow, bytes_per_path, guided, p.textured_lights, extra_material_words,
-      !p.query_sampling.empty(), p.ray_differentials, p.triangle_tangents, p.absorption, p.scattering,
-      p.emission_pass_active, p.surface_passes_active, p.light_passes_active);
-  if (p.ordered_closures) {
-    /* Store the tail address as an exactly representable float value. */
-    constexpr size_t max_exact_index = size_t(1) << std::numeric_limits<float>::digits;
-    const size_t vectors_per_path = (CYCLES_WEBGPU_MATERIAL_WORDS + extra_material_words) / 4;
-    device_capacity = uint32_t(std::min<size_t>(device_capacity,
-                                                max_exact_index / vectors_per_path));
-  }
+  const auto path_buffers = path_buffer_sizes(
+      adaptive, p.deferred_shadow, guided, p.textured_lights, extra_material_words,
+      !p.query_sampling.empty(), p.ray_differentials, p.triangle_tangents, p.absorption,
+      p.scattering, p.emission_pass_active, p.surface_passes_active, p.light_passes_active,
+      p.compact_volume_shadows);
+  const uint32_t device_capacity = path_capacity_for_limits(
+      limits, path_buffers, bytes_per_path);
   if (device_capacity < min_path_capacity) {
     return p.fail("Cycles WebGPU device limits cannot fit the minimum path pool");
   }
   const uint32_t requested = uint32_t(
       std::max(int(min_path_capacity), p.queue->num_concurrent_states(bytes_per_path)));
-  const uint32_t capacity = uint32_t(std::min<uint64_t>(
-      {std::max<uint64_t>(pixels * 2, min_path_capacity), requested, device_capacity}));
-
   p.film_ready = false;
   p.batch_active = false;
   p.next_sample = 0;
-  p.path_capacity = capacity;
+  p.path_pool_limit = std::min(requested, device_capacity);
+  p.material_words_per_path = CYCLES_WEBGPU_MATERIAL_WORDS + extra_material_words;
+  p.path_capacity = 0;
   p.pixel_count = uint32_t(pixels);
   p.crop = {uint32_t(params.full_x),
             uint32_t(params.full_y),
@@ -2440,9 +2641,7 @@ bool WebGPURenderPipeline::reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WOR
     std::copy(denoising_config.begin(), denoising_config.end(), guide_config.begin());
     guide_config[0] = denoising_albedo == PASS_UNUSED ? 0xffffffffu : uint32_t(denoising_albedo);
     guide_config[1] = denoising_normal == PASS_UNUSED ? 0xffffffffu : uint32_t(denoising_normal);
-    p.denoising.alloc_to_device(denoising_words_per_path * capacity);
-    if (!p.denoising.device_pointer ||
-        !upload(p.device, p.denoising_params, std::span<const uint32_t, 16>(guide_config)))
+    if (!upload(p.device, p.denoising_params, std::span<const uint32_t, 16>(guide_config)))
     {
       return p.fail("Cycles WebGPU could not allocate denoising guide state");
     }
@@ -2452,7 +2651,6 @@ bool WebGPURenderPipeline::reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WOR
     }
   }
   else {
-    p.denoising.free();
     p.denoising_params.free();
   }
 
@@ -2613,15 +2811,12 @@ bool WebGPURenderPipeline::reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WOR
         return p.fail("Cycles WebGPU could not initialize filtered surface film writing");
       }
     }
-    p.surface_pass_values.alloc_to_device(surface_pass_words_per_path * capacity);
-    if (!p.surface_pass_values.device_pointer ||
-        !upload(p.device, p.surface_pass_params, std::span<const uint32_t>(surface_offsets)))
+    if (!upload(p.device, p.surface_pass_params, std::span<const uint32_t>(surface_offsets)))
     {
       return p.fail("Cycles WebGPU could not allocate filtered surface passes");
     }
   }
   else {
-    p.surface_pass_values.free();
     p.surface_pass_params.free();
   }
   if (p.emission_pass_active) {
@@ -2717,65 +2912,119 @@ bool WebGPURenderPipeline::reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WOR
       return p.fail("Cycles WebGPU varying volume shadow parameters could not be uploaded");
     }
   }
-  p.pixels.alloc_to_device(pixel_words_per_path * capacity);
-  p.rays.alloc_to_device(ray_header_words +
-                         ray_words_per_path(adaptive, p.ray_differentials, p.scattering) * capacity);
-  p.hits.alloc_to_device(hit_words_per_path * capacity);
-  if (p.absorption) {
-    p.absorption_state.alloc_to_device(capacity *
-                                       (p.scattering ? CYCLES_WEBGPU_VOLUME_STATE_WORDS : 1u));
-    if (!p.absorption_state.device_pointer) {
-      return p.fail("Cycles WebGPU could not allocate homogeneous absorption paths");
-    }
-  }
-  else {
-    p.absorption_state.free();
-  }
-  if (p.deferred_shadow) {
-    p.shadow_rays.alloc_to_device(shadow_storage_words_per_path(p.textured_lights) * capacity);
-    if (!p.shadow_rays.device_pointer) {
-      return p.fail("Cycles WebGPU could not allocate shadow rays");
-    }
-  }
-  else {
-    p.shadow_rays.free();
-  }
-  p.points.alloc_to_device(
-      shading_storage_words_per_path(!p.query_sampling.empty(), p.triangle_tangents) * capacity);
-  /* Area light hits accumulate separately from surface and world shading. */
-  const size_t radiance_words = radiance_words_per_path * capacity;
-  p.radiance.alloc_to_device(radiance_words + radiance_header_words +
-                             (p.emission_pass_active ? emission_words_per_path * capacity : 0) +
-                             (p.light_passes_active ? light_pass_words_per_path * capacity : 0));
-  const std::array<float, radiance_header_words> radiance_header = {
-      float(p.light_passes_active), 0.0f, 0.0f, float(p.emission_pass_active)};
-  if (!device_webgpu_upload(p.device,
-                            p.radiance,
-                            radiance_words * sizeof(float),
-                            std::as_bytes(std::span(radiance_header))))
-  {
-    return p.fail("Cycles WebGPU could not initialize the radiance layout");
-  }
-  p.materials.alloc_to_device((CYCLES_WEBGPU_MATERIAL_WORDS + extra_material_words) * capacity);
-  if (!p.pixels.device_pointer || !p.rays.device_pointer || !p.hits.device_pointer ||
-      !p.points.device_pointer || !p.radiance.device_pointer || !p.materials.device_pointer ||
-      !p.path_state.alloc(capacity) || !p.wavefront_queue.alloc()) {
-    return p.fail("Cycles WebGPU could not allocate path state and queue counters");
-  }
-  p.queue->zero_to_device(p.path_state.words());
   p.queue->zero_to_device(p.film);
-  if (!p.wavefront_queue.set_capacity(*p.queue, p.rays, p.path_state.words()) ||
-      !device_webgpu_error(p.device).empty())
-  {
-    return p.fail("Cycles WebGPU could not initialize the path pool and film");
+  if (!device_webgpu_error(p.device).empty()) {
+    return p.fail("Cycles WebGPU could not initialize the film");
   }
   p.film_ready = true;
-  path_capacity = capacity;
-  LOG_INFO << "Cycles WebGPU path pool: " << capacity << " slots";
   return true;
 }
 
-bool WebGPURenderPipeline::begin_batch(const int start_sample, const int samples_num)
+bool WebGPURenderPipeline::Impl::reserve_paths(const uint32_t capacity)
+{
+  denoising.alloc_to_device(guided ? size_t(denoising_words_per_path) * capacity : 0);
+  if (guided && !denoising.device_pointer) {
+    return fail("Cycles WebGPU could not allocate denoising guide state");
+  }
+  surface_pass_values.alloc_to_device(
+      surface_passes_active ? size_t(surface_pass_words_per_path) * capacity : 0);
+  if (surface_passes_active && !surface_pass_values.device_pointer) {
+    return fail("Cycles WebGPU could not allocate filtered surface pass storage");
+  }
+  pixels.alloc_to_device(pixel_words_per_path * capacity);
+  rays.alloc_to_device(ray_header_words + uint32_t(compact_volume_shadows) +
+                       ray_words_per_path(adaptive_sampling, ray_differentials, scattering,
+                                          compact_volume_shadows) * capacity);
+  if (compact_volume_shadows) {
+    if (!volume_shadow_indirect.device_pointer) {
+      if (compact_volume_shadow_linear_grid) {
+        const auto limits = device_webgpu_compute_limits(device);
+        const std::array<uint32_t, 4> initial_grid = {0, 1, 1, limits.workgroups_per_dimension};
+        if (!upload(device, volume_shadow_indirect, std::span<const uint32_t, 4>(initial_grid))) {
+          return fail("Cycles WebGPU could not initialize volume shadow dispatch limits");
+        }
+      }
+      else {
+        volume_shadow_indirect.alloc_to_device(3);
+      }
+    }
+    if (!volume_shadow_indirect.device_pointer) {
+      return fail("Cycles WebGPU could not allocate volume shadow dispatch arguments");
+    }
+  }
+  else {
+    volume_shadow_indirect.free();
+  }
+  hits.alloc_to_device(hit_words_per_path * capacity);
+  if (absorption) {
+    absorption_state.alloc_to_device(
+        capacity * (scattering ? CYCLES_WEBGPU_VOLUME_STATE_WORDS : 1u));
+    if (!absorption_state.device_pointer) {
+      return fail("Cycles WebGPU could not allocate homogeneous absorption paths");
+    }
+  }
+  else {
+    absorption_state.free();
+  }
+  if (deferred_shadow) {
+    shadow_rays.alloc_to_device(shadow_storage_words_per_path(textured_lights) * capacity);
+    if (!shadow_rays.device_pointer) {
+      return fail("Cycles WebGPU could not allocate shadow rays");
+    }
+  }
+  else {
+    shadow_rays.free();
+  }
+  points.alloc_to_device(
+      shading_storage_words_per_path(!query_sampling.empty(), triangle_tangents) * capacity);
+  /* Area light hits accumulate separately from surface and world shading. */
+  const size_t radiance_words = radiance_words_per_path * capacity;
+  radiance.alloc_to_device(radiance_words + radiance_header_words +
+                           (emission_pass_active ? emission_words_per_path * capacity : 0) +
+                           (light_passes_active ? light_pass_words_per_path * capacity : 0));
+  const std::array<float, radiance_header_words> radiance_header = {
+      float(light_passes_active), 0.0f, 0.0f, float(emission_pass_active)};
+  if (!device_webgpu_upload(device,
+                            radiance,
+                            radiance_words * sizeof(float),
+                            std::as_bytes(std::span(radiance_header))))
+  {
+    return fail("Cycles WebGPU could not initialize the radiance layout");
+  }
+  materials.alloc_to_device(material_words_per_path * capacity);
+  if (!pixels.device_pointer || !rays.device_pointer || !hits.device_pointer ||
+      !points.device_pointer || !radiance.device_pointer || !materials.device_pointer ||
+      !path_state.alloc(capacity) || !wavefront_queue.alloc()) {
+    return fail("Cycles WebGPU could not allocate path state and queue counters");
+  }
+  queue->zero_to_device(path_state.words());
+  if (!wavefront_queue.set_capacity(*queue, rays, path_state.words()) ||
+      !device_webgpu_error(device).empty())
+  {
+    return fail("Cycles WebGPU could not initialize the path pool");
+  }
+  path_capacity = capacity;
+  const device_memory *allocations[] = {
+      &pixels, &rays, &hits, &shadow_rays, &points, &radiance, &denoising,
+      &surface_pass_values, &materials, &path_state.words(), &absorption_state,
+      &volume_shadow_indirect};
+  uint64_t allocated_bytes = 0;
+  size_t largest_binding_bytes = 0;
+  for (const device_memory *buffer : allocations) {
+    if (buffer->device_pointer) {
+      allocated_bytes += buffer->device_size;
+      largest_binding_bytes = std::max(largest_binding_bytes, buffer->device_size);
+    }
+  }
+  LOG_INFO << "Cycles WebGPU path pool: " << capacity << " slots, " << allocated_bytes
+           << " allocated path bytes, largest binding " << largest_binding_bytes
+           << " bytes, limit " << path_pool_limit << " slots";
+  return true;
+}
+
+bool WebGPURenderPipeline::begin_batch(const int start_sample,
+                                      const int samples_num,
+                                      uint32_t &path_capacity)
 {
   Impl &p = *impl_;
   if (!p.film_ready || p.batch_active || start_sample < 0 || samples_num <= 0 ||
@@ -2784,6 +3033,31 @@ bool WebGPURenderPipeline::begin_batch(const int start_sample, const int samples
   {
     return p.fail("Cycles WebGPU received a non-consecutive render batch");
   }
+  if (!p.path_capacity) {
+    p.path_pool_limit = std::min(p.path_pool_limit, device_webgpu_path_dispatch_capacity(p.device));
+    if (p.ordered_closures &&
+        !p.supports_integer_ordered_indices(p.guided, p.surface_passes_active))
+    {
+      /* Legacy ordered-closure shaders store the tail index in a float. */
+      constexpr size_t max_exact_index = size_t(1) << std::numeric_limits<float>::digits;
+      const size_t vectors_per_path = p.material_words_per_path / 4;
+      p.path_pool_limit = uint32_t(std::min<size_t>(p.path_pool_limit,
+                                                  max_exact_index / vectors_per_path));
+    }
+    if (p.path_pool_limit < min_path_capacity) {
+      return p.fail("Cycles WebGPU dispatch limits cannot fit the minimum path pool");
+    }
+  }
+
+  /* The stock scheduler assigns actual overlap in its sample batches. Grow only
+   * while paths are retired, and preserve film data from previous batches. */
+  const uint64_t batch_paths = uint64_t(p.pixel_count) * samples_num;
+  const uint32_t capacity = uint32_t(std::min<uint64_t>(
+      p.path_pool_limit, std::max<uint64_t>(min_path_capacity, batch_paths)));
+  if (capacity > p.path_capacity && !p.reserve_paths(capacity)) {
+    return false;
+  }
+  path_capacity = p.path_capacity;
   p.batch_active = true;
   p.batch_end_sample = uint32_t(start_sample + samples_num);
   p.admitted_paths = 0;
@@ -2907,7 +3181,9 @@ bool WebGPURenderPipeline::enqueue_stage(const DeviceKernel stage)
           classify_dispatch};
       if (!p.wavefront_queue.enqueue_stage(stage, capacity, p.rays, paths, segment) ||
           !device_webgpu_enqueue(p.device, count, {&integrate, 1}) ||
-          !device_webgpu_enqueue(p.device, count, visibility))
+          (p.compact_volume_shadows ?
+               !p.enqueue_compact_volume_shadow(count, shadow, p.guided, &classify_dispatch) :
+               !device_webgpu_enqueue(p.device, count, visibility)))
       {
         return p.fail("Cycles WebGPU volume intersection dispatch failed");
       }
@@ -3044,10 +3320,10 @@ bool WebGPURenderPipeline::enqueue_stage(const DeviceKernel stage)
       p.rays, p.hits, p.points, p.pixels, p.sampling, p.materials, p.radiance, paths);
   const auto transition = p.bind(p.rays, p.hits, paths, p.absorption_state);
   const WebGPUDispatch cross_volume_boundary{volume_transition_kernel, transition, count};
-  const WebGPUDispatch shading[] = {
-      {queries ? surface_query_kernel : surface_kernel, surface, count},
-      {p.active_svm_kernel, svm, count},
-      {p.light_kernel, light, count}};
+  const WebGPUDispatch setup_surface{queries ? surface_query_kernel : surface_kernel,
+                                    surface, count};
+  const WebGPUDispatch evaluate_material{p.active_svm_kernel, svm, count, 0, 1, p.svm_image_atlas};
+  const WebGPUDispatch sample_light{p.light_kernel, light, count};
   std::vector<WebGPUDispatch> continuation;
   continuation.reserve(5);
   continuation.push_back({p.update_kernel, update, count});
@@ -3061,15 +3337,18 @@ bool WebGPURenderPipeline::enqueue_stage(const DeviceKernel stage)
     continuation.push_back(accumulate_lighting);
   }
   continuation.push_back(accumulate);
-  const auto stages = std::span(shading);
   /* Visibility traversal and BSDF continuation are the expensive stages.
    * Submit them separately to bound the work in each browser command buffer. */
-  if (!p.wavefront_queue.enqueue_stage(stage, capacity, p.rays, paths, stages.first(2)) ||
+  if (!p.wavefront_queue.enqueue_material_stage(
+          stage, capacity, p.rays, paths, p.points, p.scene.svm, p.sort_surface_shaders,
+          setup_surface, evaluate_material) ||
       (p.aov_active && !device_webgpu_enqueue(p.device, count, {&accumulate_aovs, 1})) ||
-      !device_webgpu_enqueue(p.device, count, stages.subspan(2, 1)) ||
+      !device_webgpu_enqueue(p.device, count, {&sample_light, 1}) ||
       (p.textured_lights && !device_webgpu_enqueue(p.device, count, {&shade_emission, 1})) ||
       (p.deferred_shadow &&
-       !device_webgpu_enqueue(p.device, count, {&intersect_shadow, 1})) ||
+       (p.compact_volume_shadows ?
+            !p.enqueue_compact_volume_shadow(count, shadow, false) :
+            !device_webgpu_enqueue(p.device, count, {&intersect_shadow, 1}))) ||
       (p.guided && !device_webgpu_enqueue(p.device, count, {&shade_guides, 1})) ||
       (p.geometry_passes_active && p.next_sample == 0 &&
        !device_webgpu_enqueue(p.device, count, {&geometry, 1})) ||

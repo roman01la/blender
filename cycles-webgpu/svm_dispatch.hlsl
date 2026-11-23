@@ -17,6 +17,17 @@ StructuredBuffer<uint> path_words : register(t5);
 StructuredBuffer<uint> camera_words : register(t6);
 StructuredBuffer<uint> metadata_words : register(t7);
 
+#ifdef CYCLES_WEBGPU_HARDWARE_SVM_TEXTURES
+/* Retain a scalar-argument function for the WGSL atlas bridge. The HLSL
+ * frontend used by this build supports buffer but not sampled texture types. */
+__attribute__((noinline))
+float4 cycles_svm_hardware_sample(uint image, uint width, uint height, uint extension,
+                                  float u, float v)
+{
+  return float4(float(image + width + height + extension), u, v, 1.0);
+}
+#endif
+
 #include "svm_context.hlsl"
 
 #ifdef CYCLES_WEBGPU_COMPACT_PATHS
@@ -219,7 +230,10 @@ void main(uint3 id : SV_DispatchThreadID)
                         result, specular, layers, glass, subsurface, emission, closure_normal);
 #ifdef CYCLES_WEBGPU_ORDERED_CLOSURES
     if (CYCLES_WEBGPU_MATERIAL_HAS_ORDERED_CLOSURES(result.w)) {
-      result.x = float(cycles_svm_ordered_base(lane));
+      const uint tail = cycles_svm_ordered_base(lane);
+      result.x = tail <= CYCLES_WEBGPU_ORDERED_TAIL_FLOAT_LIMIT ?
+                     float(tail) :
+                     __builtin_bit_cast(float, tail + CYCLES_WEBGPU_ORDERED_TAIL_BITS_BIAS);
       result.z = float(bump_correction);
     }
 #endif

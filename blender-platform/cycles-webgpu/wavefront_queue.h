@@ -61,6 +61,31 @@ class WebGPUWavefrontQueue {
     return counts_.device_pointer != 0;
   }
 
+  bool prepare_surface_sort(std::string_view source)
+  {
+    if (source.empty() ||
+        !device_webgpu_supports_workgroup(
+            *counts_.device, surface_sort_group_size, surface_sort_storage_size))
+    {
+      return true;
+    }
+    constexpr auto storage = WebGPUKernelBinding::Type::Storage;
+    constexpr auto read_only = WebGPUKernelBinding::Type::ReadOnlyStorage;
+    constexpr WebGPUKernelBinding bindings[] = {
+        {0, storage, sizeof(uint32_t)},
+        {1, read_only, 8 * sizeof(uint32_t)},
+        {2, read_only, 2 * sizeof(uint32_t)}};
+    surface_sort_loaded_ = device_webgpu_register_kernel(
+        *counts_.device, webgpu_sort_surface_paths_kernel, source, surface_sort_group_size,
+        bindings, "sort_surface_paths");
+    return surface_sort_loaded_;
+  }
+
+  bool use_surface_sort(const size_t shader_count) const
+  {
+    return surface_sort_loaded_ && shader_count > 1 && shader_count <= max_surface_sort_shaders;
+  }
+
   bool set_capacity(DeviceQueue &queue, const device_memory &rays, const device_memory &paths)
   {
     const DeviceKernelArguments args(&paths.device_pointer, &rays.device_pointer);
@@ -89,6 +114,31 @@ class WebGPUWavefrontQueue {
                                             compact_subsurface_kernel :
                                             compact_background_kernel;
     return enqueue(compact_kernel, capacity, rays, paths, kernels);
+  }
+
+  bool enqueue_material_stage(const DeviceKernel stage,
+                              const int capacity,
+                              const device_memory &rays,
+                              const device_memory &paths,
+                              const device_memory &surfaces,
+                              const device_memory &svm,
+                              const bool sort,
+                              const WebGPUDispatch &setup,
+                              const WebGPUDispatch &evaluate)
+  {
+    if (!sort || stage != DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE || evaluate.work_size < 2) {
+      const WebGPUDispatch commands[] = {setup, evaluate};
+      return enqueue_stage(stage, capacity, rays, paths, commands);
+    }
+
+    const uint32_t partitions = (evaluate.work_size - 1) / surface_sort_partition_size + 1;
+    const DeviceKernelArguments sort_args(
+        &rays.device_pointer, &surfaces.device_pointer, &svm.device_pointer);
+    const WebGPUDispatch commands[] = {
+        setup,
+        {webgpu_sort_surface_paths_kernel, sort_args, partitions * surface_sort_group_size},
+        evaluate};
+    return enqueue(compact_surface_kernel, capacity, rays, paths, commands);
   }
 
   bool read(int capacity,
@@ -124,6 +174,12 @@ class WebGPUWavefrontQueue {
   static_assert(sizeof(IntegratorQueueCounter) == 19 * sizeof(uint32_t));
   static constexpr size_t counter_words = sizeof(IntegratorQueueCounter) / sizeof(uint32_t) + 2;
   static constexpr size_t counter_bytes = counter_words * sizeof(uint32_t);
+  /* Match wavefront-sort.wgsl. The indices and buckets use 12 KiB of workgroup storage. */
+  static constexpr uint32_t surface_sort_partition_size = 2048;
+  static constexpr uint32_t surface_sort_group_size = 256;
+  static constexpr size_t max_surface_sort_shaders = 1024;
+  static constexpr uint32_t surface_sort_storage_size =
+      sizeof(uint32_t) * (surface_sort_partition_size + max_surface_sort_shaders);
 
   bool enqueue(DeviceKernel compact_kernel,
                int capacity,
@@ -158,6 +214,7 @@ class WebGPUWavefrontQueue {
       DEVICE_KERNEL_INTEGRATOR_COMPACT_PATHS_ARRAY;
   static constexpr DeviceKernel count_kernel = DEVICE_KERNEL_INTEGRATOR_ACTIVE_PATHS_ARRAY;
   device_only_memory<uint32_t> counts_;
+  bool surface_sort_loaded_ = false;
 };
 
 CCL_NAMESPACE_END

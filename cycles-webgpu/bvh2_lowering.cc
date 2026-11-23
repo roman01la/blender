@@ -896,7 +896,8 @@ struct InlineShaderHelpers : PassInfoMixin<InlineShaderHelpers> {
       /* These stock helpers take only scalars and can remain separate SPIR-V functions. */
       const bool outlined_scalar = function.hasFnAttribute(Attribute::NoInline) &&
                                    (function.getName().contains("9perlin_") ||
-                                    function.getName().contains("webgpu_scalar_noise_"));
+                                    function.getName().contains("webgpu_scalar_noise_") ||
+                                    function.getName() == "_Z26cycles_svm_hardware_samplejjjjff");
       if (!function.isDeclaration() && function.hasLocalLinkage() && !outlined_scalar) {
         function.removeFnAttr(Attribute::NoInline);
         function.addFnAttr(Attribute::AlwaysInline);

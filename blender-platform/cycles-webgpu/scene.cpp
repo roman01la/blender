@@ -20,6 +20,7 @@
 #include <cfloat>
 #include <cmath>
 #include <fstream>
+#include <new>
 #include <span>
 #include <utility>
 
@@ -1682,6 +1683,139 @@ const char *encode_volumes(const Scene &scene,
 }
 
 }  // namespace
+
+device_ptr cycles_webgpu_create_svm_image_atlas(Device &device, const std::span<const uint32_t> svm)
+{
+  /* Keep the packed image data for other kernels and devices without float filtering. Only
+   * duplicate cubic/smart images, and bound the extra memory and upload independently. */
+  constexpr uint32_t padding = 2;
+  constexpr uint32_t max_dimension = 2048;
+  constexpr size_t max_atlas_bytes = 64 * 1024 * 1024;
+  const uint32_t limit = std::min(device_webgpu_filterable_texture_limit(device), max_dimension);
+  if (limit <= 2 * padding || svm.size() < webgpu_svm_header_words) {
+    return 0;
+  }
+  const size_t texture = webgpu_svm_header_words + size_t(svm[0]);
+  if (texture > svm.size() || svm.size() - texture < webgpu_svm_texture_header_words ||
+      svm[texture + 3] > webgpu_svm_attribute_slots)
+  {
+    return 0;
+  }
+  const size_t image_table = texture + webgpu_svm_texture_header_words +
+                             size_t(svm[texture]) * webgpu_svm_triangle_uv_words +
+                             size_t(svm[texture + 2]) * webgpu_svm_triangle_generated_words +
+                             size_t(svm[texture + 3]) * svm[texture + 4] * webgpu_svm_attribute_words;
+  const uint32_t slots = svm[texture + 1];
+  if (image_table > svm.size() || slots > (svm.size() - image_table) / webgpu_svm_image_words) {
+    return 0;
+  }
+
+  struct Image {
+    uint32_t id, width, height, extension, start;
+    bool alpha;
+    uint32_t x = 0, y = 0;
+  };
+  std::vector<Image> images;
+  uint32_t minimum_width = 0;
+  size_t total_width = 0;
+  for (uint32_t id = 0; id < std::min(slots, limit); ++id) {
+    const size_t record = image_table + size_t(id) * webgpu_svm_image_words;
+    const uint32_t width = svm[record];
+    const uint32_t height = svm[record + 1];
+    const uint32_t extension = svm[record + 2];
+    const uint32_t interpolation = svm[record + 3];
+    const uint32_t start = svm[record + 4];
+    const bool alpha = (interpolation & webgpu_svm_image_alpha) != 0;
+    if (!webgpu_svm_uses_cubic_filter(interpolation & ~webgpu_svm_image_alpha) ||
+        width == 0 || height == 0 || width > limit - 2 * padding ||
+        height >= limit - 2 * padding || start > svm.size() ||
+        size_t(width) * height * (alpha ? 4 : 3) > svm.size() - start ||
+        (extension != EXTENSION_REPEAT && extension != EXTENSION_MIRROR &&
+         extension != EXTENSION_EXTEND && extension != EXTENSION_CLIP))
+    {
+      continue;
+    }
+    images.push_back({id, width, height, extension, start, alpha});
+    minimum_width = std::max({minimum_width, width + 2 * padding, id + 1});
+    total_width += width + 2 * padding;
+  }
+  if (images.empty()) {
+    return 0;
+  }
+  const uint32_t atlas_width = std::max(minimum_width, uint32_t(std::min<size_t>(total_width, limit)));
+  const uint32_t height_limit = uint32_t(std::min<size_t>(
+      limit, max_atlas_bytes / (size_t(atlas_width) * 4 * sizeof(float))));
+  /* Pack taller images first. The reserved top row maps original image IDs to their
+   * origins. Zero entries keep using the packed buffer. */
+  std::stable_sort(images.begin(), images.end(), [](const Image &a, const Image &b) {
+    return a.height > b.height;
+  });
+  uint32_t left = 0, top = 1, shelf_height = 0, atlas_height = 1;
+  for (Image &image : images) {
+    const uint32_t width = image.width + 2 * padding;
+    const uint32_t height = image.height + 2 * padding;
+    if (left + width > atlas_width) {
+      left = 0;
+      top += shelf_height;
+      shelf_height = 0;
+    }
+    if (top + height > height_limit) {
+      continue;
+    }
+    image.x = left + padding;
+    image.y = top + padding;
+    left += width;
+    shelf_height = std::max(shelf_height, height);
+    atlas_height = std::max(atlas_height, top + shelf_height);
+  }
+  if (atlas_height == 1) {
+    return 0;
+  }
+  std::vector<float> atlas;
+  try {
+    atlas.resize(size_t(atlas_width) * atlas_height * 4);
+  }
+  catch (const std::bad_alloc &) {
+    return 0;
+  }
+  uint32_t uploaded = 0;
+  const auto address = [](const int coord, const uint32_t size, const uint32_t extension) {
+    return webgpu_svm_address_texel(size, extension, uint32_t(std::abs(coord)), coord < 0);
+  };
+  for (const Image &image : images) {
+    if (!image.x) {
+      continue;
+    }
+    ++uploaded;
+    atlas[size_t(image.id) * 4] = float(image.x);
+    atlas[size_t(image.id) * 4 + 1] = float(image.y);
+    const size_t alpha_start = image.start + size_t(image.width) * image.height * 3;
+    for (int y = -int(padding); y < int(image.height + padding); ++y) {
+      const uint32_t row = address(y, image.height, image.extension);
+      if (row >= image.height) {
+        continue;
+      }
+      for (int x = -int(padding); x < int(image.width + padding); ++x) {
+        const uint32_t col = address(x, image.width, image.extension);
+        if (col >= image.width) {
+          continue;
+        }
+        const size_t src = size_t(row) * image.width + col;
+        const size_t dst = (size_t(int(image.y) + y) * atlas_width + int(image.x) + x) * 4;
+        for (int channel = 0; channel < 3; ++channel) {
+          atlas[dst + channel] = std::bit_cast<float>(svm[image.start + 3 * src + channel]);
+        }
+        atlas[dst + 3] = image.alpha ? std::bit_cast<float>(svm[alpha_start + src]) : 1.0f;
+      }
+    }
+  }
+  const device_ptr handle = device_webgpu_create_texture_atlas(device, atlas_width, atlas_height, atlas);
+  if (handle) {
+    LOG_INFO << "Cycles WebGPU cubic image atlas: " << uploaded << " images, " << atlas_width
+             << " x " << atlas_height;
+  }
+  return handle;
+}
 
 WebGPUSceneBuffers::WebGPUSceneBuffers(Device &device)
     : bvh(&device, "WebGPU BVH2"),

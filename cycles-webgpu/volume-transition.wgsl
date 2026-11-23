@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Cycles WebGPU linear workgroup grid
 
 @group(0) @binding(0) var<storage, read> rays: array<u32>;
 @group(0) @binding(1) var<storage, read> hits: array<u32>;
@@ -16,14 +17,16 @@ const transmit_visibility = 2u;
 const transparent_flag = 4u;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>,
+        @builtin(num_workgroups) groups: vec3<u32>) {
+  let index = global_id.x + global_id.y * groups.x * 64u;
   let capacity = rays[0];
   let queue = 1u + 12u * capacity;
-  if (id.x >= rays[queue]) {
+  if (index >= rays[queue]) {
     return;
   }
 
-  let lane = rays[queue + 1u + id.x];
+  let lane = rays[queue + 1u + index];
   let visibility = rays[1u + 12u * lane + 8u];
   let path = lane * path_words;
   if (hits[8u * lane + hit_special] == mixed_volume_boundary &&

@@ -14,6 +14,9 @@ CCL_NAMESPACE_BEGIN
 
 class Scene;
 
+/** Duplicate a bounded subset of packed cubic images into filterable device storage. */
+device_ptr cycles_webgpu_create_svm_image_atlas(Device &device, std::span<const uint32_t> svm);
+
 /* Immutable shader inputs for an uploaded scene. Keep the packing vectors only until the
  * upload completes. Cycles' original DeviceScene stays available to synchronize and render on
  * the CPU. */

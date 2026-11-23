@@ -259,11 +259,42 @@ struct ComputeWorker {
             return;
           }
           wgpu::DeviceDescriptor descriptor{};
+          const wgpu::FeatureName float_filtering = wgpu::FeatureName::Float32Filterable;
+          if (adapter.HasFeature(float_filtering)) {
+            descriptor.requiredFeatureCount = 1;
+            descriptor.requiredFeatures = &float_filtering;
+          }
           wgpu::Limits available{};
           wgpu::Limits required{};
           if (adapter.GetLimits(&available) == wgpu::Status::Success) {
+            /* Request the adapter's available Core compute limits. The graphics
+             * device negotiates its render limits separately. */
+            required.maxTextureDimension1D = available.maxTextureDimension1D;
+            required.maxTextureDimension2D = available.maxTextureDimension2D;
+            required.maxTextureDimension3D = available.maxTextureDimension3D;
+            required.maxTextureArrayLayers = available.maxTextureArrayLayers;
+            required.maxBindGroups = available.maxBindGroups;
+            required.maxBindingsPerBindGroup = available.maxBindingsPerBindGroup;
+            required.maxDynamicUniformBuffersPerPipelineLayout =
+                available.maxDynamicUniformBuffersPerPipelineLayout;
+            required.maxDynamicStorageBuffersPerPipelineLayout =
+                available.maxDynamicStorageBuffersPerPipelineLayout;
+            required.maxSampledTexturesPerShaderStage = available.maxSampledTexturesPerShaderStage;
+            required.maxSamplersPerShaderStage = available.maxSamplersPerShaderStage;
+            required.maxStorageBuffersPerShaderStage = available.maxStorageBuffersPerShaderStage;
+            required.maxStorageTexturesPerShaderStage = available.maxStorageTexturesPerShaderStage;
+            required.maxUniformBuffersPerShaderStage = available.maxUniformBuffersPerShaderStage;
+            required.maxUniformBufferBindingSize = available.maxUniformBufferBindingSize;
             required.maxStorageBufferBindingSize = available.maxStorageBufferBindingSize;
+            required.minUniformBufferOffsetAlignment = available.minUniformBufferOffsetAlignment;
+            required.minStorageBufferOffsetAlignment = available.minStorageBufferOffsetAlignment;
             required.maxBufferSize = available.maxBufferSize;
+            required.maxComputeWorkgroupStorageSize = available.maxComputeWorkgroupStorageSize;
+            required.maxComputeInvocationsPerWorkgroup = available.maxComputeInvocationsPerWorkgroup;
+            required.maxComputeWorkgroupSizeX = available.maxComputeWorkgroupSizeX;
+            required.maxComputeWorkgroupSizeY = available.maxComputeWorkgroupSizeY;
+            required.maxComputeWorkgroupSizeZ = available.maxComputeWorkgroupSizeZ;
+            required.maxComputeWorkgroupsPerDimension = available.maxComputeWorkgroupsPerDimension;
             descriptor.requiredLimits = &required;
           }
           descriptor.SetDeviceLostCallback(

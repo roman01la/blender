@@ -373,13 +373,13 @@ bool WebGPUPreview::begin_batch(const BufferParams &params,
   }
   if (reset_pending_) {
     if (!pipeline_->reset(
-            camera_, camera_lens_, denoising_config_, params, film_words, path_capacity))
+            camera_, camera_lens_, denoising_config_, params, film_words))
     {
       return report_error();
     }
     reset_pending_ = false;
   }
-  return pipeline_->begin_batch(start_sample, samples_num) || report_error();
+  return pipeline_->begin_batch(start_sample, samples_num, path_capacity) || report_error();
 }
 
 bool WebGPUPreview::enqueue_camera(const std::span<const KernelWorkTile> tiles)
