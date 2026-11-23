@@ -42,6 +42,13 @@ constexpr DeviceKernel webgpu_filter_surface_roulette_kernel = DeviceKernel(DEVI
 constexpr DeviceKernel webgpu_publish_surface_roulette_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 12);
 constexpr DeviceKernel webgpu_restore_surface_roulette_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 13);
 constexpr DeviceKernel webgpu_local_closures_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 14);
+constexpr DeviceKernel webgpu_local_deferred_closures_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 15);
+constexpr DeviceKernel webgpu_local_shadow_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 16);
+constexpr DeviceKernel webgpu_count_queue_delta_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 17);
+constexpr DeviceKernel webgpu_count_admitted_delta_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 18);
+constexpr DeviceKernel webgpu_scene_surface_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 20);
+constexpr DeviceKernel webgpu_scene_shadow_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 21);
+constexpr DeviceKernel webgpu_scene_emission_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 22);
 
 struct WebGPUKernelBinding {
   enum class Type {
@@ -161,6 +168,16 @@ struct WebGPUDispatch {
 /** Record dispatches in order on the owning worker. Stages inherit work_size
  * unless they provide a direct size or a buffer containing indirect group counts. */
 bool device_webgpu_enqueue(Device &device, int work_size, std::span<const WebGPUDispatch> dispatches);
+
+struct WebGPUSubmission {
+  int work_size;
+  std::span<const WebGPUDispatch> dispatches;
+};
+
+/** Record a bounded group with one owner round trip and validation scope. Each group member
+ * retains its own command buffer and queue submission. */
+bool device_webgpu_enqueue_submissions(Device &device,
+                                       std::span<const WebGPUSubmission> submissions);
 
 /** Clear the counter buffer, dispatch its producer and read the full snapshot in queue order. */
 bool device_webgpu_read_queue_counters(Device &device,

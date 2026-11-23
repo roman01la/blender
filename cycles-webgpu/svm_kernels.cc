@@ -38,7 +38,11 @@ using KernelGlobals = const SvmGlobals *;
 #define kernel_data (kg->data)
 #define kernel_data_fetch(name, index) (kg->name[index])
 #define CYCLES_WEBGPU_RUNTIME_SVM
-#include "../blender-platform/cycles-webgpu/svm_material_eval.h"
+#ifdef CYCLES_WEBGPU_SVM_SPECIALIZED_HEADER
+#  include CYCLES_WEBGPU_SVM_SPECIALIZED_HEADER
+#else
+#  include "../blender-platform/cycles-webgpu/svm_material_eval.h"
+#endif
 #ifndef CYCLES_WEBGPU_SHADOW_SVM
 #  include "kernel/closure/bsdf_microfacet.h"
 #endif

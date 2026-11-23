@@ -193,7 +193,12 @@ void main(uint3 id : SV_DispatchThreadID)
   }
   const bool has_nee = shade_surface && incoming.w > 0.0f && float(bounce) <= light_max_bounces;
   float3 nee = float3(0, 0, 0);
+#if defined(CYCLES_WEBGPU_LOCAL_CLOSURES) && defined(CYCLES_WEBGPU_DEFER_SHADOW)
+  const bool defer_nee = has_nee && shadow_words[4u * lane + 2u].x != 0u;
+  if (has_nee && !defer_nee) {
+#else
   if (has_nee) {
+#endif
     nee = clamp_light(surface_throughput * incoming.xyz, incoming.w);
     rgb += nee;
   }
@@ -329,7 +334,19 @@ void main(uint3 id : SV_DispatchThreadID)
   path_words[sum] = sum_bits.x;
   path_words[sum + 1] = sum_bits.y;
   path_words[sum + 2] = sum_bits.z;
+#if defined(CYCLES_WEBGPU_LOCAL_CLOSURES) && defined(CYCLES_WEBGPU_DEFER_SHADOW)
+  if (defer_nee) {
+    /* Once the forward contribution is in the path sum, its scratch slot
+     * holds pre-bounce throughput for the separate visibility kernel. */
+    radiance[capacity + lane] = float4(surface_throughput, area.w);
+  }
+  else {
+    shadow_words[4u * lane + 2u] = uint4(0, 0, 0, 0);
+    radiance[lane] = float4(rgb, opacity);
+  }
+#else
   radiance[lane] = float4(rgb, opacity);
+#endif
   cycles_write_emission_delta(ray_words[0], lane, bounce, counts.w, emission_delta);
   if (visibility == CYCLES_WEBGPU_PATH_SUBSURFACE_PENDING) {
     if (ray_differentials) {

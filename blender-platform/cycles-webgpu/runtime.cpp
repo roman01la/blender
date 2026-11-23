@@ -243,6 +243,7 @@ struct ComputeWorker {
       }
       status = Status::Lost;
     }
+    cycles_webgpu_discard_fusion_pipelines(device);
     ready.notify_all();
   }
 

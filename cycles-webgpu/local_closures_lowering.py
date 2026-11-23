@@ -90,10 +90,10 @@ def normalize_camera(spirv: Path, binary: Path, work: Path) -> None:
     ], check=True)
 
 
-def finalize_wgsl(shader: Path) -> None:
+def finalize_dispatch(shader: Path, width: int, read_only: tuple[int, ...], marker: str) -> None:
     source = shader.read_text()
     # Keep the host bind groups read-only where HLSL has StructuredBuffer.
-    for binding in (0, 1, 3, 6, 7, 8, 10):
+    for binding in read_only:
         source, count = re.subn(
             rf"(@group\(0\) @binding\({binding}\)\s+var<storage, )read_write(?=>)",
             r"\g<1>read", source,
@@ -101,11 +101,23 @@ def finalize_wgsl(shader: Path) -> None:
         if count != 1:
             raise ValueError(f"Expected one read-only binding at slot {binding}")
     before = "fn main(@builtin(global_invocation_id) param: vec3<u32>) {"
-    after = """fn main(@builtin(global_invocation_id) id: vec3<u32>,
-        @builtin(num_workgroups) groups: vec3<u32>) {
-    let param = vec3<u32>(id.x + id.y * groups.x * 576u, 0u, 0u);"""
-    if source.count(before) != 1 or "@workgroup_size(576, 1, 1)" not in source:
+    after = f"""fn main(@builtin(global_invocation_id) id: vec3<u32>,
+        @builtin(num_workgroups) groups: vec3<u32>) {{
+    let param = vec3<u32>(id.x + id.y * groups.x * {width}u, 0u, 0u);"""
+    if source.count(before) != 1 or f"@workgroup_size({width}, 1, 1)" not in source:
         raise ValueError("Unexpected fused entry point")
     source = source.replace(before, after)
-    shader.write_text("// Cycles WebGPU experimental thread-local closures\n"
-                      "// Cycles WebGPU linear workgroup grid\n" + source)
+    shader.write_text(marker + "\n// Cycles WebGPU linear workgroup grid\n" + source)
+
+
+def finalize_wgsl(shader: Path, *, deferred: bool = False) -> None:
+    if deferred:
+        finalize_dispatch(shader, 576, (0, 1, 3, 6, 8, 10),
+                          "// Cycles WebGPU thread-local Light Tree closures")
+    else:
+        finalize_dispatch(shader, 576, (0, 1, 3, 6, 7, 8, 10),
+                          "// Cycles WebGPU experimental thread-local closures")
+
+
+def finalize_shadow_wgsl(shader: Path) -> None:
+    finalize_dispatch(shader, 64, (0, 1, 2, 3), "// Cycles WebGPU thread-local closure shadows")

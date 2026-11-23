@@ -146,13 +146,13 @@ void main(uint3 id : SV_DispatchThreadID)
   const uint weight = path_base + CYCLES_WEBGPU_PATH_THROUGHPUT;
   const float4 throughput = __builtin_bit_cast(
       float4, uint4(path_words[weight], path_words[weight + 1], path_words[weight + 2], 0));
-  const uint emission_slot = material + CYCLES_WEBGPU_MATERIAL_EMISSION_SLOT;
-  const float4 emission = materials[emission_slot];
+  const float4 emission = LIGHT_CLOSURE(emission, CYCLES_WEBGPU_MATERIAL_EMISSION_SLOT);
   if (closest.x != 0 && (position.w == 1 || position.w == 2) &&
       (emission.x != 0.0f || emission.y != 0.0f || emission.z != 0.0f)) {
     const float mis = cycles_triangle_hit_mis(closest, position, geometric, ray, origin, path,
                                              mis_origin_normal);
-    materials[emission_slot] = float4(emission.xyz * mis, emission.w);
+    LIGHT_CLOSURE(emission, CYCLES_WEBGPU_MATERIAL_EMISSION_SLOT) =
+        float4(emission.xyz * mis, emission.w);
   }
 #endif
   uint hair_lcg;

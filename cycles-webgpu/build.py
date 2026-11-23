@@ -296,10 +296,12 @@ def lower_spirv(llvm: Path, work: Path, optimized: Path, plugin: Path,
     return lowered
 
 
-def build(options) -> None:
+def build(options, svm_profile: str | None = None) -> None:
     if options.local_closures:
         options.svm_compact = options.svm_core = options.wavefront_light = True
         options.path_update = options.reflection_only = True
+    if options.local_shadow:
+        options.intersect_shadow = True
     options.output.mkdir(parents=True, exist_ok=True)
     extended_queries = options.extended_queries or options.advanced_queries
     headers = options.emscripten_sysroot / "include"
@@ -432,7 +434,13 @@ def build(options) -> None:
         shader_name = shader_name.removesuffix(".wgsl") + "-volume.wgsl"
 
     if options.local_closures:
-        dispatch, shader_name = "local_closures", "local-closures.wgsl"
+        dispatch = "local_closures"
+        shader_name = "local-closures-deferred-tree.wgsl" if options.defer_shadow else "local-closures.wgsl"
+    if options.local_shadow:
+        dispatch, shader_name = "local_shadow", "local-shadow.wgsl"
+
+    if svm_profile:
+        shader_name = shader_name.removesuffix(".wgsl") + "-specialized.wgsl"
 
     shader_flags = ["-DCYCLES_WEBGPU_LOCAL_CLOSURES=1"] if options.local_closures else []
     if options.validated_svm_words:
@@ -554,6 +562,12 @@ def build(options) -> None:
         work = Path(temporary)
         wrapper_ir = work / "dispatch.ll"
         build_cxx_flags = cxx_flags
+        if svm_profile:
+            from svm_specialization import prepare_specialized_svm
+
+            header, svm_manifest = prepare_specialized_svm(work, CYCLES, SOURCE, svm_profile)
+            build_cxx_flags = (*build_cxx_flags, "-I", SOURCE.parent / "blender-platform/cycles-webgpu",
+                               f'-DCYCLES_WEBGPU_SVM_SPECIALIZED_HEADER="{header}"')
         if (extended_queries or options.shadow_materials or options.svm_textures or
                 options.sampled_emission or (options.svm_compact and not options.svm_core)):
             # Share the stock Perlin arithmetic across SVM call sites.
@@ -688,7 +702,8 @@ def build(options) -> None:
         if options.wavefront_light or options.path_update or options.denoise_surface or options.film_surface:
             kernels.append("ggx")
         if options.local_closures:
-            kernels = ["svm", "bvh2", "direct_light", "camera", "ggx"]
+            kernels = (["svm", "direct_light", "camera", "ggx"] if options.defer_shadow else
+                       ["svm", "bvh2", "direct_light", "camera", "ggx"])
         # Keep scanline induction variables at 32 bits for the WebGPU backend.
         hair_bsdf = options.standalone_closures or options.hair_closures
         narrow_indvars = (adaptive or hair_bsdf or options.svm_query or options.transparent_shadow or
@@ -809,7 +824,10 @@ def build(options) -> None:
         run("node", SOURCE / "translate.mjs", options.translator, normalized, work / shader_name)
         if options.local_closures:
             from local_closures_lowering import finalize_wgsl
-            finalize_wgsl(work / shader_name)
+            finalize_wgsl(work / shader_name, deferred=options.defer_shadow)
+        if options.local_shadow:
+            from local_closures_lowering import finalize_shadow_wgsl
+            finalize_shadow_wgsl(work / shader_name)
 
         if options.hardware_svm_textures:
             shader_path = work / shader_name
@@ -1011,8 +1029,16 @@ def build(options) -> None:
         if volume_shadow:
             with (work / shader_name).open("a") as shader:
                 shader.write("\n// Cycles WebGPU transparent volume shadows\n")
+        if svm_profile:
+            shader_path = work / shader_name
+            if svm_profile == "shadow":
+                from svm_specialization import flatten_shadow_wgsl
+
+                shader_path.write_text(flatten_shadow_wgsl(shader_path.read_text()))
+            with shader_path.open("a") as shader:
+                shader.write("\n" + svm_manifest)
         if (adaptive == "check" or options.wavefront_light or options.shade_background or
-                options.path_update or options.denoise_surface or absorption or
+                options.path_update or options.denoise_surface or options.local_shadow or absorption or
                 options.volume_interval or options.volume_scatter or volume_shadow):
             with (work / shader_name).open("a") as shader:
                 shader.write("\n// Cycles WebGPU render buffer ABI 2\n")
@@ -1121,7 +1147,9 @@ if __name__ == "__main__":
     modes.add_argument("--sampled-emission", action="store_true",
                        help="shade sampled triangle emission with SVM")
     modes.add_argument("--local-closures", action="store_true",
-                       help="build the experimental nondeferred reflection surface shader")
+                       help="fuse reflection shading, optionally with deferred Light Tree shadows")
+    modes.add_argument("--local-shadow", action="store_true",
+                       help="trace compact shadows produced by fused surface shading")
     modes.add_argument("--wavefront-light", action="store_true",
                        help="compile direct lighting with per-path SVM materials")
     modes.add_argument("--film-ao", action="store_true",
@@ -1219,8 +1247,10 @@ if __name__ == "__main__":
         parser.error("--standalone-closures requires --path-update or --denoise-surface")
     if options.reflection_only and not (options.wavefront_light or options.path_update):
         parser.error("--reflection-only requires --wavefront-light or --path-update")
-    if options.defer_shadow and not options.wavefront_light:
-        parser.error("--defer-shadow requires --wavefront-light")
+    if options.local_closures and options.defer_shadow != options.light_tree:
+        parser.error("--local-closures requires both --defer-shadow and --light-tree, or neither")
+    if options.defer_shadow and not (options.wavefront_light or options.local_closures):
+        parser.error("--defer-shadow requires --wavefront-light or --local-closures")
     if options.point_distribution and not options.defer_shadow:
         parser.error("--point-distribution requires --wavefront-light --defer-shadow")
     if options.light_tree and (options.point_distribution or not (
@@ -1229,5 +1259,15 @@ if __name__ == "__main__":
     if options.denoise_background and not options.shade_background:
         parser.error("--denoise-background requires --shade-background")
     build(options)
+    if options.validated_svm_words and not options.hardware_svm_textures:
+        build(options, "surface")
+    if options.transparent_shadow and options.shadow_materials:
+        build(options, "shadow")
+    if options.sampled_emission:
+        build(options, "emission")
     if options.svm_core and not (options.svm_textures or options.local_closures):
         build(argparse.Namespace(**{**vars(options), "local_closures": True}))
+        build(argparse.Namespace(**{**vars(options), "local_closures": True,
+                                    "defer_shadow": True, "light_tree": True}))
+        build(argparse.Namespace(**{**vars(options), "svm_compact": False, "svm_core": False,
+                                    "local_shadow": True}))

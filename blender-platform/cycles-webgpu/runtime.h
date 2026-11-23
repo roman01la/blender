@@ -25,6 +25,8 @@ bool cycles_webgpu_requested();
 bool cycles_webgpu_available();
 /** Call on a render pthread. The callback runs on the compute owner. */
 bool cycles_webgpu_on_compute_device(const std::function<void(const wgpu::Device &)> &operation);
+/** The compute worker drops its render-independent pipeline state on device loss. */
+void cycles_webgpu_discard_fusion_pipelines(const wgpu::Device &device);
 bool cycles_webgpu_publish_preview(Device &device,
                                    const device_memory &buffer,
                                    const WebGPUDisplayPreview &preview);

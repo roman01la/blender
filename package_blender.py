@@ -61,7 +61,8 @@ def package(installation: Path, output: Path, python_process: Path | None = None
         )]
         for name in ("svm-compact-textures.wgsl",
                      "svm-compact-textures-validated.wgsl",
-                     "svm-compact-textures-validated-hardware.wgsl"):
+                     "svm-compact-textures-validated-hardware.wgsl",
+                     "svm-compact-textures-validated-specialized.wgsl"):
             svm_variant = cycles_webgpu.resolve() / name
             if svm_variant.is_file():
                 shaders.append(svm_variant)
@@ -78,9 +79,11 @@ def package(installation: Path, output: Path, python_process: Path | None = None
         transparent_shadow = cycles_webgpu.resolve() / "intersect-shadow-transparent.wgsl"
         if transparent_shadow.is_file():
             shaders.append(transparent_shadow)
-        varying_shadow = cycles_webgpu.resolve() / "intersect-shadow-transparent-materials.wgsl"
-        if varying_shadow.is_file():
-            shaders.append(varying_shadow)
+        for name in ("intersect-shadow-transparent-materials.wgsl",
+                     "intersect-shadow-transparent-materials-specialized.wgsl"):
+            varying_shadow = cycles_webgpu.resolve() / name
+            if varying_shadow.is_file():
+                shaders.append(varying_shadow)
         absorption_shaders = [cycles_webgpu.resolve() / name for name in (
             "absorption-compact.wgsl", "absorption-shadow.wgsl",
         )]
@@ -149,9 +152,10 @@ def package(installation: Path, output: Path, python_process: Path | None = None
         )] + [multi_point]
         if want_light_tree:
             shaders.extend(light_tree)
-            sampled_emission = cycles_webgpu.resolve() / "sampled-emission.wgsl"
-            if sampled_emission.is_file():
-                shaders.append(sampled_emission)
+            for name in ("sampled-emission.wgsl", "sampled-emission-specialized.wgsl"):
+                sampled_emission = cycles_webgpu.resolve() / name
+                if sampled_emission.is_file():
+                    shaders.append(sampled_emission)
         if want_light_tree or any(shader.exists() for shader in deferred_lighting):
             shaders.append(cycles_webgpu.resolve() / "intersect-shadow.wgsl")
             shaders.extend(shader for shader in deferred_lighting if shader.exists())
@@ -177,12 +181,20 @@ def package(installation: Path, output: Path, python_process: Path | None = None
             variant = cycles_webgpu.resolve() / name
             if variant.is_file():
                 shaders.append(variant)
+        deferred_closures = [cycles_webgpu.resolve() / name for name in (
+            "local-closures-deferred-tree.wgsl", "local-shadow.wgsl",
+        )]
+        if any(shader.exists() for shader in deferred_closures):
+            shaders.extend(deferred_closures)
+            compact_shadows = port / "cycles-webgpu" / "volume-shadow-queue.wgsl"
+            if compact_shadows not in shaders:
+                shaders.append(compact_shadows)
         for shader in shaders:
             if not shader.is_file() or not shader.stat().st_size:
                 raise ValueError(f"missing or empty Cycles WebGPU shader: {shader}")
             if shader.name == "adaptive-check.wgsl" or shader.name.startswith((
                     "wavefront-light", "shade-background", "path-update", "denoise-surface",
-                    "absorption-", "volume-", "local-closures")):
+                    "absorption-", "volume-", "local-closures", "local-shadow")):
                 if not shader.read_bytes().endswith(b"// Cycles WebGPU render buffer ABI 2\n"):
                     raise ValueError(f"rebuild Cycles WebGPU shader with the current layout: {shader}")
             if shader.name.startswith((

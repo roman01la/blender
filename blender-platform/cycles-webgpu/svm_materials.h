@@ -4,6 +4,7 @@
 
 #include "device/cpu/device_impl.h"
 #include "device/webgpu/svm_material_eval.h"
+#include "device/webgpu/svm_specialization.h"
 #include "device/webgpu/volume_layout.h"
 #include "kernel/closure/bsdf_microfacet.h"
 #include "kernel/constants.h"
@@ -522,6 +523,7 @@ struct WebGPUSvmSceneHost : WebGPUSvmPackedHost {
   std::vector<uint2> *slot_words;
   std::vector<uint2> *displacement_words;
   uint2 *last_node;
+  WebGPUSvmNodeMask *nodes;
   bool *uses_ies;
   bool *uses_shadow_path_context;
   bool *uses_shadow_query_defaults;
@@ -556,6 +558,10 @@ struct WebGPUSvmSceneHost : WebGPUSvmPackedHost {
 
   void visit(const uint type, const uint word) const
   {
+    static_assert(NODE_NUM <= WebGPUSvmNodeMask{}.size() * 32);
+    if (type < NODE_NUM) {
+      (*nodes)[type / 32] |= 1u << (type % 32);
+    }
     *last_node = make_uint2(type, word);
     *has_ao_query |= type == NODE_AMBIENT_OCCLUSION;
     *has_general_query |= type == NODE_RAYCAST || type == NODE_BEVEL;
@@ -939,6 +945,7 @@ inline bool webgpu_svm_sampled_mesh_emitter(const DeviceScene &dscene, const uin
  * used by triangle materials. Eval and eligibility share the supported opcodes. */
 inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
                                                std::vector<uint32_t> &words,
+                                               WebGPUSvmNodeUsage &node_usage,
                                                std::vector<uint32_t> &transparent_shadows,
                                                bool &varying_transparency,
                                                bool &cubic_transparent_shadows,
@@ -1118,6 +1125,7 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     shader_uses_cubic = false;
     bool uses_uv = false;
     bool uses_generated = false;
+    WebGPUSvmNodeMask shader_nodes{};
     /* GeometryManager has already evaluated true displacement on the host and
      * synchronized the displaced BVH. The surface interpreter evaluates the
      * residual bump when the finalized graph still has a bump output. */
@@ -1133,7 +1141,7 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
                                  &missing_attributes, &attribute_slots,
                                  &attribute_slot_types, &attribute_slot_words,
                                  &displacement_words,
-                                 &last_node, &uses_ies, &uses_shadow_path_context,
+                                 &last_node, &shader_nodes, &uses_ies, &uses_shadow_path_context,
                                  &uses_shadow_query_defaults,
                                  &has_ao_query, &has_general_query};
     const auto evaluate = [&](const bool ordered) {
@@ -1306,16 +1314,22 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     }
     /* The sampled triangle-emission shader does not carry the shadow ray's
      * position differential. Other surfaces still use the main path's data. */
-    if ((decoded.pixel_wireframe || decoded.surface_bump) &&
-        material.emission_sampling != EMISSION_SAMPLING_NONE &&
-        (dscene.shaders.data()[shader].flags & SD_HAS_CONSTANT_EMISSION) == 0 &&
-        webgpu_svm_sampled_mesh_emitter(dscene, shader))
+    const bool sampled_emission = material.emission_sampling != EMISSION_SAMPLING_NONE &&
+        !(dscene.shaders.data()[shader].flags & SD_HAS_CONSTANT_EMISSION) &&
+        webgpu_svm_sampled_mesh_emitter(dscene, shader);
+    if ((decoded.pixel_wireframe || decoded.surface_bump) && sampled_emission)
     {
       reason = "WebGPU Cycles needs ray differentials for sampled mesh emission on " +
                material.name.string();
       return false;
     }
     have_bump |= decoded.surface_bump;
+    for (size_t word = 0; word < shader_nodes.size(); ++word) {
+      node_usage.surface[word] |= shader_nodes[word];
+      if (sampled_emission) {
+        node_usage.emission[word] |= shader_nodes[word];
+      }
+    }
     checked[shader] = true;
     uv_shaders[shader] = uses_uv;
     generated_shaders[shader] = uses_generated;
@@ -1362,6 +1376,9 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
       /* Stock shade_shadow treats portals as opaque even though main rays teleport. */
       if (!portal && shader_has_transparent_shadows) {
         if (evaluate_shadow) {
+          for (size_t word = 0; word < shader_nodes.size(); ++word) {
+            node_usage.shadow[word] |= shader_nodes[word];
+          }
           if (uses_shadow_path_context) {
             reason = "WebGPU Cycles transparent shadow material needs unsupported ray context";
             return false;

@@ -205,18 +205,21 @@ after the contributions it should include.
 
 ## Thread-local surface closures
 
-The core SVM build generates `local-closures.wgsl` alongside its split
-shader. The standard Cycles WebGPU package includes both and selects fusion
-automatically for eligible renders. Use `--local-closures` to rebuild just
-the fused shader. It keeps core SVM closure
-data thread-local through legacy opaque reflection lighting and path
-continuation, with inline shadow traversal. It requires an adapter that can
-run its 576-lane workgroup and bind ten storage buffers. The split WebGPU
-path handles other scenes and devices, including Light Trees, guided
+The core SVM build generates inline and deferred fused shaders alongside its
+split shader. Fusion keeps core SVM closures thread-local through direct
+light sampling and path continuation. Legacy opaque reflection uses inline
+visibility. Eligible opaque Light Tree renders trace visibility in a
+separate compact shadow queue. Fusion requires a 576-lane workgroup and ten
+storage buffers. WebGPU uses split shading for other cases, including guided
 denoising, adaptive sampling, and additional surface passes.
 
-For an A/B comparison, set `CYCLES_WEBGPU_FUSED_CLOSURES=0` in Blender's
-process environment before rendering to use the split path.
+Use `--local-closures` to rebuild the inline variant. Add
+`--defer-shadow --light-tree` to build the deferred variant and use
+`--local-shadow` to rebuild its visibility kernel.
+
+The deferred Light Tree variant compiles on first use and reuses its
+pipelines for later renders on the same browser compute device. Use
+`CYCLES_WEBGPU_FUSED_CLOSURES=0` to test the split path.
 
 Run the LLVM scalar-pointer regression with:
 
@@ -253,9 +256,18 @@ indexing limits of its buffers. Large linear dispatches extend across two
 workgroup dimensions. SVM tries the largest supported one-dimensional
 workgroup and retries at a smaller size if the driver rejects it.
 
-Each queue snapshot clears, counts, and copies the counters in one command
-buffer. The renderer waits for validation and mapping before using the
-snapshot. It reuses the staging buffer between snapshots.
+Queue snapshots count transitions over the stage's compact path list and
+apply the resulting deltas to the scheduler's counts. The full-pool recount
+also handles batches that exceed the transition sample histogram. Both paths
+reuse the staging buffer and wait for validation and mapping before handing
+counts to the scheduler. Consecutive stage submissions share a validation
+scope while retaining separate GPU command buffers.
+
+The validated textured SVM, varying transparent shadow, and sampled
+emission build modes also generate smaller texture-oriented variants.
+The scene packer tracks the Cycles opcodes each stage needs. The renderer
+selects a specialized variant when its manifest covers those opcodes and
+uses the general shader for other materials.
 
 The deferred lighting shaders prepare light samples, run Cycles’ opaque BVH2 shadow traversal,
 and continue paths in separate submissions. Earlier shader packages still

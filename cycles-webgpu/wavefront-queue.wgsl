@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Cycles WebGPU volume scatter classification
 // Cycles WebGPU linear workgroup grid
+// Cycles WebGPU queue transitions
 
 @group(0) @binding(0) var<storage, read_write> paths: array<u32>;
 @group(0) @binding(1) var<storage, read_write> rays: array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read_write> counts: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read> hits: array<u32>;
 @group(0) @binding(4) var<storage, read> pixels: array<vec4<u32>>;
+@group(0) @binding(5) var<storage, read> work: array<u32>;
 
 // Path-state entries store the Cycles DeviceKernel index plus one. Zero means terminated.
 const path_words = 24u;
@@ -23,9 +25,16 @@ const volume_scatter_hit = 4u;
 const queue_kernels = 18u;
 const min_sample_word = 19u;
 const max_sample_word = 20u;
+// Keep the delta snapshot in sync with WebGPUWavefrontQueue. Slot 18
+// is cache_miss, and words 19 and 20 are used by the full-scan fallback.
+const sample_delta_base = 21u;
+const sample_bins = 64u;
+const delta_work_word = sample_delta_base + sample_bins;
+const delta_error_word = delta_work_word + 1u;
 
 var<workgroup> group_counts: array<atomic<u32>, queue_kernels>;
 var<workgroup> group_min_sample: atomic<u32>;
+var<workgroup> group_sample_delta: array<atomic<u32>, sample_bins>;
 var<workgroup> group_max_sample: atomic<u32>;
 var<workgroup> compact_count: atomic<u32>;
 var<workgroup> compact_base: u32;
@@ -153,4 +162,65 @@ fn count_queues(@builtin(global_invocation_id) global_id: vec3<u32>,
     atomicMax(&counts[min_sample_word], atomicLoad(&group_min_sample));
     atomicMax(&counts[max_sample_word], atomicLoad(&group_max_sample));
   }
+}
+
+// The completed stage operated on this list after compaction. Other paths
+// retain their previously counted state, as in Cycles' path transition counters.
+fn count_changed_paths(index: u32, local: u32, count: u32, admission: bool) {
+  if (index < count) {
+    let queue = queue_offset();
+    let lane = atomicLoad(&rays[queue + 1u + index]);
+    if (lane < capacity()) {
+      let kernel = paths[lane * path_words + queued_kernel];
+      if (kernel != 0u && kernel <= queue_kernels) {
+        atomicAdd(&group_counts[kernel - 1u], 1u);
+      } else if (kernel > queue_kernels) {
+        atomicStore(&counts[delta_error_word], 1u);
+      }
+      // Adaptive admission can leave a pixel unclaimed. Only a newly live
+      // or a retired path changes the per-sample occupancy.
+      if (admission == (kernel != 0u)) {
+        let sample = pixels[lane].w;
+        if (sample != 0xffffffffu) {
+          atomicAdd(&group_sample_delta[sample % sample_bins], 1u);
+        } else {
+          atomicStore(&counts[delta_error_word], 1u);
+        }
+      }
+    } else {
+      atomicStore(&counts[delta_error_word], 1u);
+    }
+  }
+  workgroupBarrier();
+
+  if (local < queue_kernels) {
+    let queued = atomicLoad(&group_counts[local]);
+    if (queued != 0u) {
+      atomicAdd(&counts[local], queued);
+    }
+  }
+  let changed = atomicLoad(&group_sample_delta[local]);
+  if (changed != 0u) {
+    atomicAdd(&counts[sample_delta_base + local], changed);
+  }
+  if (index == 0u) {
+    atomicStore(&counts[delta_work_word], count);
+  }
+}
+
+@compute @workgroup_size(64)
+fn count_queue_delta(@builtin(global_invocation_id) global_id: vec3<u32>,
+                     @builtin(num_workgroups) groups: vec3<u32>,
+                     @builtin(local_invocation_index) local: u32) {
+  let index = global_id.x + global_id.y * groups.x * 64u;
+  count_changed_paths(index, local, atomicLoad(&rays[queue_offset()]), false);
+}
+
+@compute @workgroup_size(64)
+fn count_admitted_delta(@builtin(global_invocation_id) global_id: vec3<u32>,
+                        @builtin(num_workgroups) groups: vec3<u32>,
+                        @builtin(local_invocation_index) local: u32) {
+  let index = global_id.x + global_id.y * groups.x * 64u;
+  let admitted = min(work[2u], atomicLoad(&rays[queue_offset()]));
+  count_changed_paths(index, local, admitted, true);
 }

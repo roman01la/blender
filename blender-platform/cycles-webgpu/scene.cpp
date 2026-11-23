@@ -14,6 +14,7 @@
 #include "scene/scene.h"
 #include "scene/shader.h"
 #include "scene/shader_nodes.h"
+#include "util/log.h"
 
 #include <algorithm>
 #include <bit>
@@ -1933,8 +1934,10 @@ bool cycles_webgpu_encode_scene(const Scene &scene,
   bool has_ordered_transparency = false;
   uint32_t closure_compositions = 0u;
   std::vector<bool> ordered_closure_shaders;
+  WebGPUSvmNodeUsage svm_nodes{};
   if (!cycles_webgpu_encode_svm_materials(scene,
                                          encoded.svm,
+                                         svm_nodes,
                                          transparent_shadows,
                                          varying_transparency,
                                          cubic_transparent_shadows,
@@ -1966,6 +1969,10 @@ bool cycles_webgpu_encode_scene(const Scene &scene,
   {
     return false;
   }
+  LOG_DEBUG << "Cycles WebGPU scene SVM opcodes: surface "
+            << webgpu_svm_mask_nodes(svm_nodes.surface) << ", shadow "
+            << webgpu_svm_mask_nodes(svm_nodes.shadow) << ", emission "
+            << webgpu_svm_mask_nodes(svm_nodes.emission);
   const bool transparent = !transparent_shadows.empty();
   const bool varying_volume_shadows = volume && varying_transparency;
   const size_t tangent_words = (encoded.svm[1] & (CYCLES_WEBGPU_SVM_HAIR | CYCLES_WEBGPU_SVM_BUMP)) ?
@@ -2222,6 +2229,7 @@ bool cycles_webgpu_encode_scene(const Scene &scene,
 
   encoded.bvh = std::move(bvh.words);
   encoded.surface = std::move(surface.words);
+  webgpu_append_svm_node_usage(encoded.svm, svm_nodes);
   out = std::move(encoded);
   reason.clear();
   return true;

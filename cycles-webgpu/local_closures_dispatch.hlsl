@@ -9,7 +9,11 @@ cbuffer CameraRows : register(b5) {
   uint4 camera_rows[15];
 };
 StructuredBuffer<uint> metadata_words : register(t6);
+#ifdef CYCLES_WEBGPU_DEFER_SHADOW
+RWStructuredBuffer<uint4> shadow_words : register(u7);
+#else
 StructuredBuffer<uint> scene_words : register(t7);
+#endif
 StructuredBuffer<uint> light_words : register(t8);
 RWStructuredBuffer<float4> radiance : register(u9);
 StructuredBuffer<uint> camera_sampling : register(t10);

@@ -62,7 +62,30 @@ struct KernelPipeline {
   std::vector<WebGPUKernelBinding> bindings;
   uint32_t workgroup_size;
   bool linear_grid;
+  uint32_t buffer_count;
+  /* A kernel usually binds the same resources throughout a path batch. */
+  std::array<device_ptr, DeviceKernelArguments::MAX_ARGS + 1> bind_group_key = {};
+  wgpu::BindGroup bind_group;
 };
+
+struct CachedFusionPipeline {
+  std::string source;
+  std::string entry_point;
+  uint32_t workgroup_size;
+  bool linear_grid;
+  std::vector<WebGPUKernelBinding> bindings;
+  wgpu::ComputePipeline pipeline;
+  wgpu::BindGroupLayout layout;
+};
+
+/* The compute owner outlives render sessions. Cache only the two deferred
+ * fusion PSOs here; each session still owns its own storage and bind groups. */
+struct FusionPipelineCache {
+  wgpu::Device device;
+  std::map<DeviceKernel, CachedFusionPipeline> kernels;
+};
+
+thread_local FusionPipelineCache fusion_pipeline_cache;
 
 constexpr std::string_view linear_grid_marker = "// Cycles WebGPU linear workgroup grid\n";
 
@@ -119,6 +142,25 @@ struct OwnerState {
     const auto it = buffers.find(handle);
     return it == buffers.end() ? nullptr : it->second.get();
   }
+
+  void forget_buffer_bindings(const device_ptr buffer)
+  {
+    for (auto &[kernel, pipeline] : kernels) {
+      const auto &key = pipeline.bind_group_key;
+      if (pipeline.bind_group && std::find(key.begin() + 1, key.end(), buffer) != key.end()) {
+        pipeline.bind_group = {};
+      }
+    }
+  }
+
+  void forget_atlas_bindings(const device_ptr atlas)
+  {
+    for (auto &[kernel, pipeline] : kernels) {
+      if (pipeline.bind_group && pipeline.bind_group_key[0] == atlas) {
+        pipeline.bind_group = {};
+      }
+    }
+  }
 };
 
 class WebGPUDevice final : public CPUDevice {
@@ -167,6 +209,7 @@ class WebGPUDevice final : public CPUDevice {
                        std::string *compile_error = nullptr);
 
   bool enqueue(int work_size, std::span<const WebGPUDispatch> dispatches);
+  bool enqueue_submissions(std::span<const WebGPUSubmission> submissions);
   uint32_t path_dispatch_capacity();
   device_ptr create_texture_atlas(uint32_t width, uint32_t height, std::span<const float> rgba);
   void free_texture_atlas(device_ptr atlas);
@@ -383,7 +426,7 @@ bool WebGPUDevice::register_kernel(DeviceKernel kernel,
     return false;
   }
   /* Private dispatches follow the stock kernel range. */
-  if (kernel < 0 || kernel > webgpu_local_closures_kernel || code.empty() || entry_point.empty() ||
+  if (kernel < 0 || kernel > webgpu_scene_emission_kernel || code.empty() || entry_point.empty() ||
       workgroup_size == 0 || workgroup_size > limits_.maxComputeWorkgroupSizeX ||
       workgroup_size > limits_.maxComputeInvocationsPerWorkgroup || bindings.empty() ||
       bindings.size() > DeviceKernelArguments::MAX_ARGS ||
@@ -458,10 +501,50 @@ bool WebGPUDevice::register_kernel(DeviceKernel kernel,
       linear_grid = true;
     }
   }
+  const bool cache_fusion = host_scene_ && (kernel == webgpu_local_deferred_closures_kernel ||
+                                            kernel == webgpu_local_shadow_kernel);
   return await_owner([&](OwnerState &state, Finish finish) {
     if (state.kernels.contains(kernel)) {
       finish("Cycles WebGPU kernel is already registered");
       return;
+    }
+
+    const auto add_kernel = [&state, kernel, workgroup_size, linear_grid, bindings,
+                             buffer_count = uniforms + storage_buffers](
+                                wgpu::ComputePipeline pipeline, wgpu::BindGroupLayout layout) {
+      state.kernels.emplace(kernel,
+                            KernelPipeline{std::move(pipeline),
+                                           std::move(layout),
+                                           {bindings.begin(), bindings.end()},
+                                           workgroup_size,
+                                           linear_grid,
+                                           buffer_count,
+                                           {},
+                                           {}});
+    };
+    if (cache_fusion) {
+      if (fusion_pipeline_cache.device.Get() != state.device.Get()) {
+        fusion_pipeline_cache = {state.device, {}};
+      }
+      if (const auto it = fusion_pipeline_cache.kernels.find(kernel);
+          it != fusion_pipeline_cache.kernels.end())
+      {
+        const CachedFusionPipeline &cached = it->second;
+        if (cached.source == code && cached.entry_point == entry_point &&
+            cached.workgroup_size == workgroup_size && cached.linear_grid == linear_grid &&
+            std::ranges::equal(cached.bindings, bindings, [](const auto &a, const auto &b) {
+              return a.binding == b.binding && a.type == b.type &&
+                     a.minimum_size == b.minimum_size;
+            }))
+        {
+          add_kernel(cached.pipeline, cached.layout);
+          LOG_INFO << "Cycles WebGPU reused " << (kernel == webgpu_local_deferred_closures_kernel ?
+                                                       "deferred fusion" : "compact fused shadow")
+                   << " pipeline";
+          finish({});
+          return;
+        }
+      }
     }
 
     wgpu::BindGroupLayoutDescriptor binding_layout{};
@@ -487,7 +570,8 @@ bool WebGPUDevice::register_kernel(DeviceKernel kernel,
     state.device.CreateComputePipelineAsync(
         &descriptor,
         wgpu::CallbackMode::AllowSpontaneous,
-        [&state, kernel, workgroup_size, linear_grid, bindings, group = std::move(group), finish, compile_error](
+        [&state, kernel, workgroup_size, linear_grid, bindings, code, entry_point,
+         cache_fusion, add_kernel, group = std::move(group), finish, compile_error](
             wgpu::CreatePipelineAsyncStatus status,
             wgpu::ComputePipeline pipeline,
             wgpu::StringView detail) mutable {
@@ -502,12 +586,17 @@ bool WebGPUDevice::register_kernel(DeviceKernel kernel,
             }
             return;
           }
-          state.kernels.emplace(kernel,
-                                KernelPipeline{std::move(pipeline),
-                                               std::move(group),
-                                               {bindings.begin(), bindings.end()},
-                                               workgroup_size,
-                                               linear_grid});
+          if (cache_fusion && fusion_pipeline_cache.device.Get() == state.device.Get()) {
+            fusion_pipeline_cache.kernels.insert_or_assign(
+                kernel, CachedFusionPipeline{std::string(code),
+                                             std::string(entry_point),
+                                             workgroup_size,
+                                             linear_grid,
+                                             {bindings.begin(), bindings.end()},
+                                             pipeline,
+                                             group});
+          }
+          add_kernel(std::move(pipeline), std::move(group));
           finish({});
         });
   }) && (!compile_error || compile_error->empty());
@@ -523,7 +612,7 @@ string WebGPUDevice::record_dispatch(OwnerState &state,
     return "Cycles WebGPU kernel has no registered pipeline";
   }
   const auto &args = dispatch.args;
-  const KernelPipeline &kernel_pipeline = found->second;
+  KernelPipeline &kernel_pipeline = found->second;
   const uint32_t items = dispatch.work_size ? dispatch.work_size : uint32_t(work_size);
   const uint64_t workgroups = (uint64_t(items) + kernel_pipeline.workgroup_size - 1) /
                               kernel_pipeline.workgroup_size;
@@ -546,60 +635,63 @@ string WebGPUDevice::record_dispatch(OwnerState &state,
   {
     return "Cycles WebGPU dispatch exceeds the pipeline limits";
   }
-  const auto atlas = dispatch.texture_atlas ? state.atlases.find(dispatch.texture_atlas) :
-                                               state.atlases.end();
-  std::array<wgpu::BindGroupEntry, DeviceKernelArguments::MAX_ARGS> entries{};
-  size_t index = 0;
-  size_t entry_index = 0;
-  for (const auto &binding : kernel_pipeline.bindings) {
-    auto &entry = entries[entry_index++];
-    entry.binding = binding.binding;
-    using Type = WebGPUKernelBinding::Type;
-    if (binding.type == Type::FloatTexture || binding.type == Type::FilteringSampler) {
-      if (atlas == state.atlases.end()) {
-        return "Cycles WebGPU dispatch has no image atlas";
-      }
-      if (binding.type == Type::FloatTexture) {
-        entry.textureView = atlas->second.view;
-      }
-      else {
-        entry.sampler = atlas->second.sampler;
-      }
-      continue;
-    }
-    if (index == args.count) {
-      return "Cycles WebGPU dispatch is missing a buffer argument for kernel " +
-             std::to_string(int(dispatch.kernel));
-    }
+  if (args.count != kernel_pipeline.buffer_count) {
+    return "Cycles WebGPU dispatch has an invalid buffer argument count for kernel " +
+           std::to_string(int(dispatch.kernel));
+  }
+  std::array<device_ptr, DeviceKernelArguments::MAX_ARGS + 1> key = {};
+  key[0] = dispatch.texture_atlas;
+  for (size_t index = 0; index < args.count; index++) {
     if (args.types[index] != DeviceKernelArguments::POINTER ||
         args.sizes[index] != sizeof(device_ptr) || !args.values[index])
     {
       return "Cycles WebGPU storage binding needs a buffer argument";
     }
-    const auto handle = *static_cast<const device_ptr *>(args.values[index]);
-    ++index;
-    const WebGPUBuffer *buffer = state.get_buffer(handle);
-    if (!buffer || buffer->size() < binding.minimum_size ||
-        (binding.type == Type::Uniform &&
-         buffer->allocation_size() > limits_.maxUniformBufferBindingSize))
-    {
-      return "Cycles WebGPU dispatch has an invalid storage-buffer handle or size";
-    }
-    entry.buffer = buffer->handle();
-    entry.size = buffer->allocation_size();
-  }
-  if (index != args.count) {
-    return "Cycles WebGPU dispatch has excess buffer arguments for kernel " +
-           std::to_string(int(dispatch.kernel));
+    key[index + 1] = *static_cast<const device_ptr *>(args.values[index]);
   }
 
-  wgpu::BindGroupDescriptor descriptor{};
-  descriptor.layout = kernel_pipeline.layout;
-  descriptor.entries = entries.data();
-  descriptor.entryCount = entry_index;
-  const auto group = state.device.CreateBindGroup(&descriptor);
+  if (!kernel_pipeline.bind_group || kernel_pipeline.bind_group_key != key) {
+    const auto atlas = dispatch.texture_atlas ? state.atlases.find(dispatch.texture_atlas) :
+                                               state.atlases.end();
+    std::array<wgpu::BindGroupEntry, DeviceKernelArguments::MAX_ARGS> entries{};
+    size_t index = 0;
+    size_t entry_index = 0;
+    for (const auto &binding : kernel_pipeline.bindings) {
+      auto &entry = entries[entry_index++];
+      entry.binding = binding.binding;
+      using Type = WebGPUKernelBinding::Type;
+      if (binding.type == Type::FloatTexture || binding.type == Type::FilteringSampler) {
+        if (atlas == state.atlases.end()) {
+          return "Cycles WebGPU dispatch has no image atlas";
+        }
+        if (binding.type == Type::FloatTexture) {
+          entry.textureView = atlas->second.view;
+        }
+        else {
+          entry.sampler = atlas->second.sampler;
+        }
+        continue;
+      }
+      const WebGPUBuffer *buffer = state.get_buffer(key[++index]);
+      if (!buffer || buffer->size() < binding.minimum_size ||
+          (binding.type == Type::Uniform &&
+           buffer->allocation_size() > limits_.maxUniformBufferBindingSize))
+      {
+        return "Cycles WebGPU dispatch has an invalid storage-buffer handle or size";
+      }
+      entry.buffer = buffer->handle();
+      entry.size = buffer->allocation_size();
+    }
+
+    wgpu::BindGroupDescriptor descriptor{};
+    descriptor.layout = kernel_pipeline.layout;
+    descriptor.entries = entries.data();
+    descriptor.entryCount = entry_index;
+    kernel_pipeline.bind_group = state.device.CreateBindGroup(&descriptor);
+    kernel_pipeline.bind_group_key = key;
+  }
   pass.SetPipeline(kernel_pipeline.pipeline);
-  pass.SetBindGroup(0, group);
+  pass.SetBindGroup(0, kernel_pipeline.bind_group);
   if (indirect) {
     pass.DispatchWorkgroupsIndirect(indirect->handle(), 0);
   }
@@ -630,30 +722,50 @@ uint32_t WebGPUDevice::path_dispatch_capacity()
 
 bool WebGPUDevice::enqueue(const int work_size, std::span<const WebGPUDispatch> dispatches)
 {
+  const WebGPUSubmission submission{work_size, dispatches};
+  return enqueue_submissions({&submission, 1});
+}
+
+bool WebGPUDevice::enqueue_submissions(std::span<const WebGPUSubmission> submissions)
+{
   if (gpu_failed()) {
     return false;
   }
-  if (work_size < 0) {
-    set_gpu_error("Negative Cycles WebGPU dispatch size");
+  constexpr size_t max_submissions = 8;
+  if (submissions.size() > max_submissions || std::ranges::any_of(submissions, [](const auto &item) {
+        return item.work_size < 0;
+      }))
+  {
+    set_gpu_error("Invalid Cycles WebGPU submission group");
     return false;
   }
-  if (work_size == 0 || dispatches.empty()) {
+  if (std::ranges::none_of(submissions, [](const auto &item) {
+        return item.work_size > 0 && !item.dispatches.empty();
+      }))
+  {
     return true;
   }
 
   return await_owner([&](OwnerState &state, Finish finish) {
     state.device.PushErrorScope(wgpu::ErrorFilter::Validation);
-    const auto encoder = state.device.CreateCommandEncoder();
-    const auto pass = encoder.BeginComputePass();
     string error;
-    for (const WebGPUDispatch &dispatch : dispatches) {
-      error = record_dispatch(state, pass, work_size, dispatch);
+    for (const WebGPUSubmission &submission : submissions) {
+      if (submission.work_size == 0 || submission.dispatches.empty()) {
+        continue;
+      }
+      const auto encoder = state.device.CreateCommandEncoder();
+      const auto pass = encoder.BeginComputePass();
+      for (const WebGPUDispatch &dispatch : submission.dispatches) {
+        error = record_dispatch(state, pass, submission.work_size, dispatch);
+        if (!error.empty()) {
+          break;
+        }
+      }
+      pass.End();
       if (!error.empty()) {
         break;
       }
-    }
-    pass.End();
-    if (error.empty()) {
+      /* Keep the command buffer boundaries chosen by the wavefront pipeline. */
       const auto commands = encoder.Finish();
       state.queue.Submit(1, &commands);
     }
@@ -748,6 +860,7 @@ void WebGPUDevice::free_texture_atlas(const device_ptr atlas)
     const auto found = state.atlases.find(atlas);
     if (found != state.atlases.end()) {
       bytes = found->second.bytes;
+      state.forget_atlas_bindings(atlas);
       state.atlases.erase(found);
     }
   });
@@ -944,6 +1057,7 @@ void WebGPUDevice::mem_free(device_memory &mem)
           return;
         }
         allocation_size = it->second->allocation_size();
+        state.forget_buffer_bindings(mem.device_pointer);
         state.buffers.erase(it);
       }))
   {
@@ -1180,6 +1294,13 @@ unique_ptr<DeviceQueue> WebGPUDevice::gpu_queue_create()
 
 }  // namespace
 
+void cycles_webgpu_discard_fusion_pipelines(const wgpu::Device &device)
+{
+  if (fusion_pipeline_cache.device.Get() == device.Get()) {
+    fusion_pipeline_cache = {};
+  }
+}
+
 DeviceInfo device_webgpu_info()
 {
   DeviceInfo info;
@@ -1351,6 +1472,13 @@ bool device_webgpu_enqueue(Device &device,
 {
   auto *webgpu = dynamic_cast<WebGPUDevice *>(&device);
   return webgpu && webgpu->enqueue(work_size, dispatches);
+}
+
+bool device_webgpu_enqueue_submissions(Device &device,
+                                       std::span<const WebGPUSubmission> submissions)
+{
+  auto *webgpu = dynamic_cast<WebGPUDevice *>(&device);
+  return webgpu && webgpu->enqueue_submissions(submissions);
 }
 
 bool device_webgpu_read_queue_counters(Device &device,
