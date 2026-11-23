@@ -253,19 +253,20 @@ self.addEventListener("message", function start(event) {
     preRun: prepare,
     setStatus(message) {
       if (!message) return;
-      // Emscripten's file packager reports downloaded and total bytes.
-      const download = /^Downloading data\.\.\.(?: \((\d+)\/(\d+)\))?$/.exec(message);
+      const download = /^Downloading data\.\.\.(?: \((\d+)\/\d+\))?$/.exec(message);
       if (!download) {
         send("status", message);
         return;
       }
       const loaded = Number(download[1] ?? 0);
-      const total = Number(download[2] ?? 0);
+      // Fetch streams decoded bytes. A gzip response's Content-Length describes
+      // the encoded transfer, so use the uncompressed archive sizes from the build.
+      const total = assets.preloadBytes >= loaded ? assets.preloadBytes : 0;
       const scale = Math.max(loaded, total);
       const [divisor, unit] = scale >= 1e6 ? [1e6, "MB"] : scale >= 1e3 ? [1e3, "kB"] : [1, "B"];
       const amount = downloadSize.format(loaded / divisor);
       const received = total > 0 ? `${amount} of ${downloadSize.format(total / divisor)}` : amount;
-      send("status", loaded || total ? `Downloading Blender… ${received} ${unit}` : "Downloading Blender…");
+      send("status", loaded || total ? `Loading Blender data… ${received} ${unit}` : "Loading Blender data…");
     },
     onRuntimeInitialized() {
       send("status", "Starting the Blender editor…");

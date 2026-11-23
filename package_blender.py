@@ -273,6 +273,7 @@ def package(installation: Path, output: Path, python_process: Path | None = None
             raise ValueError(f"no files to package under {resources}")
         assets = {
             "preloads": [path.name for path in preload_scripts],
+            "preloadBytes": sum(path.with_suffix(".data").stat().st_size for path in preload_scripts),
             "translator": translator.name if has_translator else None,
             "pythonProcess": "./python-process/client.mjs" if python_process is not None else None,
         }
@@ -291,6 +292,7 @@ def package(installation: Path, output: Path, python_process: Path | None = None
                             bundle / "cycles-webgpu-render-preview.mjs")
             pack_preloads(file_packager, bundle, "blender-cycles-webgpu", cycle_preloads)
             assets["cyclesWebGPU"] = "blender-cycles-webgpu.js"
+            assets["preloadBytes"] += (bundle / "blender-cycles-webgpu.data").stat().st_size
         (bundle / "index.html").write_text(
             launcher.replace("/* editor assets */ null", json.dumps(assets)), encoding="utf-8"
         )
