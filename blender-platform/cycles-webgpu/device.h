@@ -28,6 +28,9 @@ class Stats;
 class device_memory;
 struct DeviceKernelArguments;
 
+constexpr DeviceKernel webgpu_prepare_ao_pass_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 1);
+constexpr DeviceKernel webgpu_svm_ao_textures_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 2);
+
 struct WebGPUKernelBinding {
   enum class Type {
     Storage,
@@ -73,6 +76,12 @@ bool device_webgpu_upload(Device &device,
                           const device_memory &buffer,
                           std::span<const std::byte> bytes);
 
+/** Upload a range aligned to WebGPU's four-byte write granularity. */
+bool device_webgpu_upload(Device &device,
+                          const device_memory &buffer,
+                          size_t byte_offset,
+                          std::span<const std::byte> bytes);
+
 /** Read a whole GPU buffer directly into caller-owned storage. */
 bool device_webgpu_read(Device &device, const device_memory &buffer, std::span<std::byte> bytes);
 
@@ -103,6 +112,7 @@ struct WebGPUDispatch {
   const DeviceKernelArguments &args;
   uint32_t work_size = 0;
   device_ptr indirect = 0;
+  uint32_t workgroups_y = 1;
 };
 
 /** Record dispatches in order on the owning worker. Stages inherit work_size

@@ -2088,8 +2088,8 @@ static void unpack_texture_row(const std::byte *source,
   const size_t component_size = pixel_size / transfer_components;
   const size_t output_size = to_bytesize(data_format);
   if (texture_format == transfer_format && texture_format != TextureFormat::UNORM_10_10_10_2 &&
-      components == channels &&
-      component_size == output_size)
+      components == channels && component_size == output_size &&
+      (!normalized || data_format == GPU_DATA_UBYTE))
   {
     std::memcpy(destination, source, width * pixel_size);
     return;
@@ -2131,7 +2131,9 @@ static void unpack_texture_row(const std::byte *source,
           value = float((pixel >> (10 * channel)) & mask) / float(mask);
         }
         else if (normalized) {
-          value = load_texture_component<uint8_t>(component) * (1.0f / 255.0f);
+          value = component_size == sizeof(uint16_t) ?
+                      load_texture_component<uint16_t>(component) * (1.0f / 65535.0f) :
+                      load_texture_component<uint8_t>(component) * (1.0f / 255.0f);
         }
         else if (component_size == sizeof(uint16_t)) {
           value = math::half_to_float(load_texture_component<uint16_t>(component));
@@ -2154,6 +2156,64 @@ static void unpack_texture_row(const std::byte *source,
       }
     }
   }
+}
+
+template<typename Unpack>
+static void read_texture_data(WebGPUContext &context,
+                              const wgpu::TexelCopyTextureInfo &source,
+                              const wgpu::Extent3D extent,
+                              const uint32_t pixel_size,
+                              const char *label,
+                              const size_t output_size,
+                              void *data,
+                              Unpack unpack)
+{
+  const uint32_t packed_row_bytes = extent.width * pixel_size;
+  /* WebGPU texture-to-buffer rows require 256-byte alignment. */
+  const uint32_t staging_stride = (packed_row_bytes + 255) & ~255u;
+  const size_t rows = size_t(extent.height) * extent.depthOrArrayLayers;
+  const uint64_t staging_size = (rows - 1) * staging_stride + ((packed_row_bytes + 3) & ~3u);
+
+  const auto &device = context.ghost.device();
+  wgpu::BufferDescriptor staging_desc{};
+  staging_desc.label = label;
+  staging_desc.size = staging_size;
+  staging_desc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+  const auto staging = device.CreateBuffer(&staging_desc);
+
+  wgpu::TexelCopyBufferInfo destination{};
+  destination.buffer = staging;
+  destination.layout.bytesPerRow = staging_stride;
+  destination.layout.rowsPerImage = extent.height;
+  context.encoder().CopyTextureToBuffer(&source, &destination, &extent);
+  context.flush();
+
+  const auto completion = emscripten_promise_create();
+  staging.MapAsync(
+      wgpu::MapMode::Read,
+      0,
+      staging_size,
+      wgpu::CallbackMode::AllowSpontaneous,
+      [=](wgpu::MapAsyncStatus status, wgpu::StringView) {
+        auto *output = static_cast<std::byte *>(data);
+        const auto *input = status == wgpu::MapAsyncStatus::Success ?
+                                static_cast<const std::byte *>(
+                                    staging.GetConstMappedRange(0, staging_size)) :
+                                nullptr;
+        if (input) {
+          unpack(input, staging_stride, output);
+        }
+        else {
+          std::fprintf(stderr, "%s mapping failed.\n", label);
+          std::memset(output, 0, output_size);
+        }
+        if (status == wgpu::MapAsyncStatus::Success) {
+          staging.Unmap();
+        }
+        emscripten_promise_resolve(completion, EM_PROMISE_FULFILL, nullptr);
+      });
+  (void)emscripten_promise_await_unchecked(completion);
+  emscripten_promise_destroy(completion);
 }
 
 static void read_color_texture(WebGPUContext &context,
@@ -2182,67 +2242,100 @@ static void read_color_texture(WebGPUContext &context,
     unsupported("converting this color texture readback format");
   }
 
-  const uint32_t packed_row_bytes = extent.width * pixel_size;
-  /* WebGPU texture-to-buffer rows require 256-byte alignment. */
-  const uint32_t staging_stride = (packed_row_bytes + 255) & ~255u;
-  const size_t rows = size_t(extent.height) * extent.depthOrArrayLayers;
-  const uint64_t staging_size = (rows - 1) * staging_stride + ((packed_row_bytes + 3) & ~3u);
   const size_t output_stride = format == GPU_DATA_2_10_10_10_REV ?
-                                   packed_row_bytes :
+                                   size_t(extent.width) * pixel_size :
                                    size_t(extent.width) * channels * to_bytesize(format);
-
-  const auto &device = context.ghost.device();
-  wgpu::BufferDescriptor staging_desc{};
-  staging_desc.label = "Blender color texture readback";
-  staging_desc.size = staging_size;
-  staging_desc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
-  const auto staging = device.CreateBuffer(&staging_desc);
-
+  const size_t rows = size_t(extent.height) * extent.depthOrArrayLayers;
   wgpu::TexelCopyTextureInfo source{};
   source.texture = texture.handle();
   source.mipLevel = mip;
   source.origin = origin;
-  wgpu::TexelCopyBufferInfo destination{};
-  destination.buffer = staging;
-  destination.layout.bytesPerRow = staging_stride;
-  destination.layout.rowsPerImage = extent.height;
-  context.encoder().CopyTextureToBuffer(&source, &destination, &extent);
-  context.flush();
+  read_texture_data(context,
+                    source,
+                    extent,
+                    pixel_size,
+                    "Blender color texture readback",
+                    rows * output_stride,
+                    data,
+                    [=](const std::byte *input, const size_t stride, std::byte *output) {
+                      for (size_t row = 0; row < rows; row++) {
+                        unpack_texture_row(input + row * stride,
+                                           output + row * output_stride,
+                                           extent.width,
+                                           texture_format,
+                                           transfer_format,
+                                           format,
+                                           channels);
+                      }
+                    });
+}
 
-  const auto completion = emscripten_promise_create();
-  staging.MapAsync(
-      wgpu::MapMode::Read,
-      0,
-      staging_size,
-      wgpu::CallbackMode::AllowSpontaneous,
-      [=](wgpu::MapAsyncStatus status, wgpu::StringView) {
-        auto *output = static_cast<std::byte *>(data);
-        const auto *input = status == wgpu::MapAsyncStatus::Success ?
-                                static_cast<const std::byte *>(
-                                    staging.GetConstMappedRange(0, staging_size)) :
-                                nullptr;
-        if (input) {
-          for (size_t row = 0; row < rows; row++) {
-            unpack_texture_row(input + row * staging_stride,
-                               output + row * output_stride,
-                               extent.width,
-                               texture_format,
-                               transfer_format,
-                               format,
-                               channels);
+static void read_depth_texture(WebGPUContext &context,
+                               const WebGPUTexture &texture,
+                               const uint32_t mip,
+                               const uint32_t layer,
+                               const int4 rect,
+                               const eGPUDataFormat format,
+                               void *data)
+{
+  const auto texture_format = texture.webgpu_format();
+  const bool unorm16 = texture_format == wgpu::TextureFormat::Depth16Unorm;
+  if ((!unorm16 && !ELEM(texture_format,
+                          wgpu::TextureFormat::Depth32Float,
+                          wgpu::TextureFormat::Depth32FloatStencil8)) ||
+      !ELEM(format, GPU_DATA_FLOAT, GPU_DATA_UINT))
+  {
+    unsupported("converting this depth texture readback format");
+  }
+
+  /* WebGPU copies depth planes one full mip at a time. Extract Blender's
+   * requested offscreen rectangle from the mapped rows without flipping Y. */
+  const auto &handle = texture.handle();
+  const wgpu::Extent3D extent = {
+      std::max(1u, handle.GetWidth() >> mip), std::max(1u, handle.GetHeight() >> mip), 1};
+  wgpu::TexelCopyTextureInfo source{};
+  source.texture = handle;
+  source.mipLevel = mip;
+  source.origin.z = layer;
+  source.aspect = wgpu::TextureAspect::DepthOnly;
+  const uint32_t pixel_size = unorm16 ? sizeof(uint16_t) : sizeof(float);
+  const size_t output_pixel_size = to_bytesize(format);
+  const size_t output_stride = size_t(rect.z) * output_pixel_size;
+  read_texture_data(
+      context,
+      source,
+      extent,
+      pixel_size,
+      "Blender depth texture readback",
+      size_t(rect.w) * output_stride,
+      data,
+      [=](const std::byte *input, const size_t stride, std::byte *output) {
+        const std::byte *row = input + size_t(rect.y) * stride + size_t(rect.x) * pixel_size;
+        for (const int y : IndexRange(rect.w)) {
+          const std::byte *input_row = row + size_t(y) * stride;
+          std::byte *output_row = output + size_t(y) * output_stride;
+          if (format == GPU_DATA_FLOAT && !unorm16) {
+            std::memcpy(output_row, input_row, output_stride);
+            continue;
+          }
+          for (const int x : IndexRange(rect.z)) {
+            const std::byte *pixel = input_row + size_t(x) * pixel_size;
+            std::byte *destination = output_row + size_t(x) * output_pixel_size;
+            const float depth = unorm16 ?
+                                    load_texture_component<uint16_t>(pixel) * (1.0f / 65535.0f) :
+                                    load_texture_component<float>(pixel);
+            if (format == GPU_DATA_FLOAT) {
+              std::memcpy(destination, &depth, sizeof(depth));
+            }
+            else {
+              /* Match the normalized integer range used by Blender's picking. */
+              const uint32_t depth_uint = uint32_t(std::clamp(double(depth), 0.0, 1.0) *
+                                                   double(UINT32_MAX));
+              std::memcpy(destination, &depth_uint, sizeof(depth_uint));
+            }
           }
         }
-        else {
-          std::fputs("WebGPU color texture readback mapping failed.\n", stderr);
-          std::memset(output, 0, rows * output_stride);
-        }
-        if (status == wgpu::MapAsyncStatus::Success) {
-          staging.Unmap();
-        }
-        emscripten_promise_resolve(completion, EM_PROMISE_FULFILL, nullptr);
       });
-  (void)emscripten_promise_await_unchecked(completion);
-  emscripten_promise_destroy(completion);
 }
 
 void WebGPUTexture::read(const int mip, const eGPUDataFormat format, void *data)
@@ -2275,10 +2368,11 @@ void WebGPUFramebuffer::read(const GPUFrameBufferBits planes,
                              const int slot,
                              void *data)
 {
-  if (planes != GPU_COLOR_BIT || is_canvas()) {
-    unsupported("framebuffer reads from non-color or canvas attachments");
+  const bool depth = planes == GPU_DEPTH_BIT;
+  if ((!depth && planes != GPU_COLOR_BIT) || is_canvas()) {
+    unsupported("framebuffer reads from stencil or canvas attachments");
   }
-  if (!update_attachments() || slot < 0 || slot >= GPU_FB_MAX_COLOR_ATTACHMENT) {
+  if (!update_attachments() || (!depth && (slot < 0 || slot >= GPU_FB_MAX_COLOR_ATTACHMENT))) {
     unsupported("reading an invalid framebuffer attachment");
   }
   if (rect[2] == 0 || rect[3] == 0) {
@@ -2286,11 +2380,15 @@ void WebGPUFramebuffer::read(const GPUFrameBufferBits planes,
   }
   if (rect[0] < 0 || rect[1] < 0 || rect[2] < 0 || rect[3] < 0 ||
       rect[0] > width_ - rect[2] || rect[1] > height_ - rect[3] || !data ||
-      channels < 1 || channels > 4)
+      channels < 1 || channels > (depth ? 1 : 4))
   {
     unsupported("reading outside framebuffer attachment bounds");
   }
-  const GPUAttachment &attachment = attachments_[GPU_FB_COLOR_ATTACHMENT0 + slot];
+  const GPUAttachmentType attachment_type = depth ?
+                                               (targets_.stencil ? GPU_FB_DEPTH_STENCIL_ATTACHMENT :
+                                                                   GPU_FB_DEPTH_ATTACHMENT) :
+                                               GPU_FB_COLOR_ATTACHMENT0 + slot;
+  const GPUAttachment &attachment = attachments_[attachment_type];
   if (!attachment.tex) {
     unsupported("reading an unattached framebuffer slot");
   }
@@ -2301,13 +2399,18 @@ void WebGPUFramebuffer::read(const GPUFrameBufferBits planes,
   if (pending_attachment_loads_) {
     begin_pass(context.encoder()).End();
   }
+  const uint32_t mip = texture.backing_mip(attachment.mip);
+  const uint32_t layer = texture.backing_layer(std::max(0, attachment.layer));
+  if (depth) {
+    read_depth_texture(context, texture, mip, layer, int4(rect), format, data);
+    return;
+  }
+
   /* Offscreen passes already map Blender's increasing Y to increasing texture rows. */
   read_color_texture(context,
                      texture,
-                     texture.backing_mip(attachment.mip),
-                     {uint32_t(rect[0]),
-                      uint32_t(rect[1]),
-                      texture.backing_layer(std::max(0, attachment.layer))},
+                     mip,
+                     {uint32_t(rect[0]), uint32_t(rect[1]), layer},
                      {uint32_t(rect[2]), uint32_t(rect[3]), 1},
                      format,
                      channels,

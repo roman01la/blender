@@ -90,8 +90,8 @@ def prepare_volume_headers(work: Path, cycles: Path, scattering: bool = False) -
                      "ccl_device_inline void bsdf_eval_accum(")
     eval_helpers += section("film/light_passes.h", "ccl_device_inline void bsdf_eval_accum(ccl_private BsdfEval *eval, Spectrum value)",
                      "ccl_device_inline bool bsdf_eval_is_zero(")
-    eval_helpers += section("film/light_passes.h", "ccl_device_inline void bsdf_eval_mul(ccl_private BsdfEval *eval, const float value)",
-                     "ccl_device_inline void bsdf_eval_mul(ccl_private BsdfEval *eval, Spectrum value)")
+    eval_helpers += section("film/light_passes.h", "ccl_device_inline bool bsdf_eval_is_zero(",
+                            "ccl_device_inline Spectrum bsdf_eval_pass_diffuse_weight(")
     segment = section("integrator/shade_volume.h", "struct VolumeShaderCoefficients {", "struct EquiangularCoefficients {")
     segment += section("integrator/shade_volume.h", "ccl_device Spectrum volume_emission_integrate(", "/* Volume Integration */")
     blackbody = section("svm/math_util.h", "ccl_device float3 svm_math_blackbody_color_rec709(",
@@ -185,6 +185,8 @@ ccl_device_inline float volume_blackbody_coefficient(const float (&table)[7][col
                      "/* Multiple importance sampling weights. */")
     light += section("light/sample.h", "ccl_device_inline float light_sample_mis_weight_nee(",
                      "/* Next event estimation sampling.")
+    light += section("light/sample.h", "/* Early path termination of shadow rays. */",
+                     "/* This function should be used to compute a modified ray start position")
     clamp = section("film/light_passes.h", "ccl_device_forceinline void film_clamp_light(",
                     "/* --------------------------------------------------------------------\n * Pass accumulation utilities.")
     (work / "volume_scatter_helpers.h").write_text(

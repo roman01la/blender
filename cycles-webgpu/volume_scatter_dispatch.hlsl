@@ -2,6 +2,7 @@
 
 #include "../blender-platform/cycles-webgpu/path_state_layout.h"
 #include "../blender-platform/cycles-webgpu/volume_layout.h"
+#include "../blender-platform/cycles-webgpu/lighting_layout.h"
 
 RWStructuredBuffer<uint> ray_words : register(u0);
 RWStructuredBuffer<uint> hit_words : register(u1);
@@ -59,7 +60,8 @@ void main(uint3 id : SV_DispatchThreadID)
   const uint steps = path_words[path + CYCLES_WEBGPU_PATH_EXTRA_RNG_STEPS];
   const uint volume_bounce = CYCLES_WEBGPU_VOLUME_BOUNCE * capacity + lane;
   const uint stack = volume_state[lane];
-  const uint active = stack & CYCLES_WEBGPU_VOLUME_MEDIA_MASK;
+  const uint active = stack & CYCLES_WEBGPU_VOLUME_MEDIA_MASK(
+      cycles_volume_word(CYCLES_WEBGPU_SURFACE_VOLUME_COUNT));
   const bool integrate = active != 0u && hit_words[hit] != 0u;
   const float4 origin = __builtin_bit_cast(
       float4, uint4(ray_words[ray], ray_words[ray + 1], ray_words[ray + 2], ray_words[ray + 3]));
@@ -89,7 +91,11 @@ void main(uint3 id : SV_DispatchThreadID)
                         );
 
   const uint shadow = 4 * lane;
-  shadow_words[shadow + 2] = shadow_options;
+  const uint metadata = cycles_volume_word(0);
+  const bool combined_shadow = metadata == CYCLES_WEBGPU_SURFACE_VOLUME_SHADOW_OFFSETS ||
+                               metadata == CYCLES_WEBGPU_SURFACE_VOLUME_SHADOW_TANGENT_OFFSETS;
+  shadow_words[shadow + 2] = uint4(
+      shadow_options.x | (combined_shadow ? CYCLES_WEBGPU_SHADOW_FROM_VOLUME : 0u), shadow_options.yzw);
 #ifdef CYCLES_WEBGPU_VOLUME_GUIDES
   /* Volume NEE has no surface offset record in this slot. The matching queued
    * shadow dispatch consumes its guide payload even without a light sample. */
@@ -144,12 +150,25 @@ void main(uint3 id : SV_DispatchThreadID)
     ray_words[ray + 8] = phase_path.z;
     ray_words[ray + 9] = 0xffffffffu;
     ray_words[ray + 10] = 0xffffffffu;
-    ray_words[CYCLES_WEBGPU_RAY_VOLUME_MIS_LENGTH(capacity, lane)] = phase_MIS.w;
+    const bool differentials = (cycles_light_word(CYCLES_WEBGPU_LIGHT_EXTENDED) &
+                                CYCLES_WEBGPU_LIGHT_VOLUME_DIFFERENTIALS) != 0u;
+    if (differentials) {
+      const uint ray_diff = CYCLES_WEBGPU_RAY_DIFFERENTIAL_BASE(capacity, lane);
+      const float dP = __builtin_bit_cast(float, ray_words[ray_diff]);
+      const float dD = __builtin_bit_cast(float, ray_words[ray_diff + 1u]);
+      // The volume phase reports hit distance and the stock angular widening.
+      ray_words[ray_diff] = __builtin_bit_cast(uint, dP + dD * next_throughput.w);
+      ray_words[ray_diff + 1u] = __builtin_bit_cast(uint, __builtin_elementwise_max(dD, emission.w));
+    }
+    ray_words[CYCLES_WEBGPU_RAY_VOLUME_MIS_LENGTH(capacity, lane, differentials)] = phase_MIS.w;
     volume_state[volume_bounce] = input_path.y + 1u;
     hit_words[hit + CYCLES_WEBGPU_HIT_SPECIAL] = CYCLES_WEBGPU_VOLUME_SCATTER_HIT;
   }
   else {
-    volume_state[lane] = volume_state[CYCLES_WEBGPU_VOLUME_NEXT_BOUNDARY * capacity + lane];
+    /* A surface BSDF must choose transmission before crossing a mixed boundary. */
+    if (hit_words[hit + CYCLES_WEBGPU_HIT_SPECIAL] != CYCLES_WEBGPU_MIXED_VOLUME_BOUNDARY) {
+      volume_state[lane] = volume_state[CYCLES_WEBGPU_VOLUME_NEXT_BOUNDARY * capacity + lane];
+    }
     if (phase_path.x == 2u) {
       hit_words[hit + CYCLES_WEBGPU_HIT_SPECIAL] = CYCLES_WEBGPU_ABSORPTION_TERMINATE;
     }

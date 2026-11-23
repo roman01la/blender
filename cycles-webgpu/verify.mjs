@@ -336,8 +336,8 @@ async function runGpuProbe({ code, payload }, verifyFilm) {
     const rayCount = hits.length / 8;
     // Each lane stores CYCLES_WEBGPU_MATERIAL_VECTORS float4 records.
     const materialWords = materials.length / Math.max(1, hits.length / 8);
-    if (materialWords !== 24) {
-      throw Error(`SVM fixture has ${materialWords} material words per lane, expected 24`);
+    if (materialWords !== 28) {
+      throw Error(`SVM fixture has ${materialWords} material words per lane, expected 28`);
     }
     const withContext = /@binding\(5\)/.test(code);
     const withCamera = /@binding\(6\)/.test(code);

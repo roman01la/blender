@@ -15,7 +15,32 @@ const build = resolve(buildPath);
 const request = JSON.parse(await readFile(requestPath, 'utf8'));
 const scriptPaths = ['catalog.py', 'probe.py'];
 if (request.cases?.some(test => test.triangle_emitter)) scriptPaths.push('triangle_fixture.py');
-if (request.cases?.some(test => test.transparent_fixture)) scriptPaths.push('transparent_fixture.py');
+if (request.cases?.some(test => test.light_falloff)) scriptPaths.push('light_falloff_fixture.py');
+if (request.cases?.some(test => test.film_ao)) scriptPaths.push('film_ao_fixture.py');
+const glassCaustics = request.cases?.some(test => test.glass_caustics);
+if (request.cases?.some(test =>
+  test.transparent_fixture || test.glossy_transparency?.shadow || test.paper_closures?.shadow) ||
+  glassCaustics) {
+  scriptPaths.push('transparent_fixture.py');
+}
+const paperFixture = request.cases?.some(test => test.paper_closures);
+const bothDisplacement = request.cases?.some(test => test.both_displacement);
+const twoPrincipled = bothDisplacement || request.cases?.some(test => test.two_principled);
+const worldGraph = request.cases?.some(test => test.world_graph);
+if (worldGraph) scriptPaths.push('world_graph_fixture.py');
+const glossyFixture = paperFixture || twoPrincipled || worldGraph ||
+  request.cases?.some(test => test.mixed_glossy || test.glossy_transparency);
+if (glossyFixture || request.cases?.some(test => test.mixed_principled)) {
+  scriptPaths.push('mixed_principled_fixture.py');
+}
+if (glossyFixture) scriptPaths.push('mixed_glossy_fixture.py');
+if (paperFixture || request.cases?.some(test => test.glossy_transparency)) {
+  scriptPaths.push('glossy_transparency_fixture.py');
+}
+if (paperFixture) scriptPaths.push('paper_closure_fixture.py');
+if (glassCaustics) scriptPaths.push('glass_caustics_fixture.py');
+if (twoPrincipled) scriptPaths.push('two_principled_fixture.py');
+if (bothDisplacement) scriptPaths.push('both_displacement_fixture.py');
 if (request.cases?.some(test => test.query_fixture)) scriptPaths.push('scene_query_fixture.py');
 if (request.cases?.some(test => test.ray_transport_fixture)) scriptPaths.push('ray_transport_fixture.py');
 if (request.cases?.some(test => test.absorption_fixture)) scriptPaths.push('absorption_fixture.py');

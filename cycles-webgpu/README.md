@@ -261,10 +261,15 @@ python3 web/cycles-webgpu/build.py --surface-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --surface-query TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-compact --svm-core TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --svm-compact --svm-core --svm-textures TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-query TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-query --extended-queries TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --svm-query --extended-queries --ao-only-queries TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --svm-query --advanced-queries TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --sampled-emission TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --film-surface TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --film-ao TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --film-ao-prepare TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --subsurface-compact TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --absorption TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --absorption-shadow TOOLCHAIN_ARGUMENTS
@@ -273,6 +278,7 @@ python3 web/cycles-webgpu/build.py --volume-scatter TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --volume-scatter-shadow TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --volume-scatter --volume-guides TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --volume-scatter-shadow --volume-guides TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --volume-scatter-shadow --volume-guides --shadow-materials TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --volume-extinction-shadow TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --volume-scatter --volume-grid TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --volume-scatter-shadow --volume-grid TOOLCHAIN_ARGUMENTS
@@ -280,6 +286,7 @@ python3 web/cycles-webgpu/build.py --volume-extinction-shadow --volume-grid TOOL
 python3 web/cycles-webgpu/build.py --volume-scatter --volume-grid --volume-guides TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --volume-scatter-shadow --volume-grid --volume-guides TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --reflection-only --light-tree --volume-forward TOOLCHAIN_ARGUMENTS
+python3 web/cycles-webgpu/build.py --wavefront-light --defer-shadow --light-tree --volume-forward TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --shade-background --light-tree --volume-forward TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --shade-background --light-tree --volume-forward --denoise-background TOOLCHAIN_ARGUMENTS
 python3 web/cycles-webgpu/build.py --shade-background TOOLCHAIN_ARGUMENTS
@@ -320,16 +327,18 @@ the core shader evaluates. The reference records a relative tolerance per lane.
 The sky models allow 2 × 10⁻⁵ for the GPU's transcendental functions, and the
 other lanes use 3 × 10⁻⁶.
 
-Use a perspective camera and the Combined pass with static flat or smooth
-triangles. The surface stage uses Cycles’ packed vertex and corner normals,
+Use a perspective or orthographic camera and the Combined pass with static flat
+or smooth triangles. Both projections support depth of field with Cycles' stock
+lens sampling. The surface stage uses Cycles’ packed vertex and corner normals,
 specular normal correction, and geometric shadow terminator offset. The path loop honors Blender’s total, diffuse,
 glossy, and transmission bounce limits independently, including their
 defaults, and uses the configured Filter Glossy and indirect clamp. A render
 slice can contain up to 2,097,152 pixels, which includes a full 1920 × 1080
 frame. For larger offline WebGPU frames, Cycles caps the render tile size at
 1024 pixels per side so its adaptive overscan fits inside the slice limit.
-Turn off path guiding and set Light Sampling Threshold to zero. In a
-browser build without a denoiser, a denoising request logs a warning and
+Turn off path guiding. The flat distribution uses the saved Light Sampling
+Threshold when sampling constant light emission. In a browser build without
+a denoiser, a denoising request logs a warning and
 returns the noisy Combined pass. CPU Cycles handles scenes outside the
 supported tracing subset.
 
@@ -347,12 +356,16 @@ equirectangular HDRI. Triangle emitters reuse Cycles' mesh subtrees, triangle
 sampler, and PDFs for direct samples and BSDF hits. The sampled-emission
 shader uses Cycles' triangle shading setup and SVM to evaluate emission at
 the light sample before shadow traversal.
-Enable Light Tree and choose Auto or Manual World sampling
-to use Cycles' world importance map. The shader uses the stock world-map CDF
-and applies the Light Tree selection PDF to direct lighting, forward light
-hits, and background misses. Forward hits are evaluated nearest first up to
-the transparent bounce limit. The supported world map uses no portals or
-separate sun sampling.
+With Light Tree disabled, the mixed-light shaders reuse Blender's flat CDF
+for point and Sun lights, area lights, and static triangle emitters. Both
+selectors support an HDRI importance map with Auto or Manual World sampling
+and use the stock selector PDF for direct and forward MIS. Forward finite
+light hits are evaluated nearest first up to the transparent bounce limit.
+The light distribution also works with supported volume-only media.
+Closed meshes can combine supported GGX transmission with homogeneous volume
+closures. A transmitted path updates the medium stack after the surface bounce.
+Volume Absorption and Volume Scatter can be combined with Add Shader on the
+same boundary.
 
 The compact query SVM runs Ambient Occlusion, Bevel and the five built-in
 Raycast outputs against the resident static triangle BVH2. It uses Cycles'
@@ -529,9 +542,19 @@ hemisphere height from the disk radius before trigonometric rounding.
 Film accumulation uses the raster coordinates stored with each completed path.
 Color and Value AOVs use the stock SVM pass offsets and accumulate directly
 into the resident film on primary paths.
+The optional film shaders write Normal, Diffuse Color, Glossy Color,
+Transmission Color, and Ambient Occlusion. They use Cycles' alpha threshold,
+closure weights, microfacet albedo tables, and AO sample sequence. AO supports
+constant transparent shadows. Diffuse, glossy, and transmission direct and
+indirect lighting passes keep the first surface's BSDF weights across bounces
+and accumulate into the resident film.
 True displacement uses Cycles' existing geometry preparation before uploading
 the displaced BVH for WebGPU tracing. Bump-only displacement can trace on
 WebGPU when Blender proves its three bump evaluations are identical.
+Surface Bump uses Cycles' ray differentials for position, UV, Generated,
+and supported packed attributes, including Pointiness. Opaque Diffuse and
+isotropic Principled closures can use the resulting normal. Diffuse and
+Translucent can also share a Mix Shader with an unperturbed normal.
 
 Image Texture supports Color and Alpha, Flat, Box, Sphere and Tube projection,
 Closest, Linear, Cubic and Smart filtering, and all four address modes.

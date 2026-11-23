@@ -1,14 +1,29 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
+uint cycles_svm_camera_word(uint index)
+{
+#ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
+  return metadata_words[metadata_words[CYCLES_WEBGPU_SURFACE_VOLUME_SHADOW_PARAMS] + index];
+#else
+  return camera_words[index];
+#endif
+}
+
 uint4 cycles_svm_scene_context(uint field, uint object, uint packed_shader)
 {
+  if (field == CYCLES_WEBGPU_SVM_PATH) {
+    const uint shader = packed_shader & CYCLES_WEBGPU_SVM_SHADER_ID_MASK;
+    return uint4(0, 0, 0, metadata_words[metadata_words[4] + shader]);
+  }
   if (field >= CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA && field < CYCLES_WEBGPU_SVM_WORLD_TO_NDC_END) {
     const uint row = CYCLES_WEBGPU_CAMERA_SVM_OFFSET + 4 * (field - CYCLES_WEBGPU_SVM_WORLD_TO_CAMERA);
-    return uint4(camera_words[row], camera_words[row + 1], camera_words[row + 2], camera_words[row + 3]);
+    return uint4(cycles_svm_camera_word(row), cycles_svm_camera_word(row + 1),
+                 cycles_svm_camera_word(row + 2), cycles_svm_camera_word(row + 3));
   }
   if (field >= CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD && field < CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD_END) {
     const uint row = CYCLES_WEBGPU_CAMERA_TO_WORLD_OFFSET + 4 * (field - CYCLES_WEBGPU_SVM_CAMERA_TO_WORLD);
-    return uint4(camera_words[row], camera_words[row + 1], camera_words[row + 2], camera_words[row + 3]);
+    return uint4(cycles_svm_camera_word(row), cycles_svm_camera_word(row + 1),
+                 cycles_svm_camera_word(row + 2), cycles_svm_camera_word(row + 3));
   }
   if (field >= CYCLES_WEBGPU_SVM_OBJECT_TRANSFORM) {
     if (field < CYCLES_WEBGPU_SVM_OBJECT_INVERSE) {

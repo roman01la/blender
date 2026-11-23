@@ -41,7 +41,14 @@ struct CyclesWebGPUScene {
   bool has_ggx = false;
   bool has_transmission = false;
   bool has_subsurface = false;
-  bool advanced_query_svm = false;
+  bool advanced_svm = false;
+  bool ao_only_queries = false;
+  bool residual_displacement_bump = false;
+  bool paired_principled_layers = false;
+  bool single_principled_coat = false;
+  bool coated_principled_emission = false;
+  bool compact_voronoi_distance = false;
+  bool has_mixed_diffuse = false;
 };
 
 /* Read the synchronized host DeviceScene under the Scene mutex. Preserve the previous output

@@ -509,6 +509,24 @@ class Fixture:
                 self.triangle_probe = TriangleProbe(self.scene)
             lighting = self.triangle_probe.configure(settings, node)
             return hashlib.sha256(json_key([graph_fingerprint(tree), lighting]).encode()).hexdigest()
+        if settings := case.get("world_graph"):
+            from world_graph_fixture import configure
+
+            world_tree = configure(self.scene, settings)
+            return hashlib.sha256(json_key([graph_fingerprint(tree), graph_fingerprint(world_tree),
+                                            settings]).encode()).hexdigest()
+        if settings := case.get("light_falloff"):
+            from light_falloff_fixture import configure
+
+            light_tree = configure(self.scene, settings)
+            return hashlib.sha256(json_key([graph_fingerprint(tree), graph_fingerprint(light_tree),
+                                            settings]).encode()).hexdigest()
+        if settings := case.get("film_ao"):
+            from film_ao_fixture import configure
+
+            graphs = [tree] + configure(self.scene, settings)
+            return hashlib.sha256(json_key([[graph_fingerprint(graph) for graph in graphs],
+                                            settings]).encode()).hexdigest()
         if query := case.get("query_fixture"):
             from scene_query_fixture import configure
 
@@ -520,6 +538,50 @@ class Fixture:
             configure(self, node, transparency)
             return hashlib.sha256(
                 json_key([graph_fingerprint(tree), transparency]).encode()).hexdigest()
+        if mixture := case.get("mixed_principled"):
+            from mixed_principled_fixture import configure
+
+            configure(tree, output, mixture)
+            return graph_fingerprint(tree)
+        if mixture := case.get("mixed_glossy"):
+            from mixed_glossy_fixture import configure
+
+            compositor = configure(self.scene, self.material, output, mixture)
+            graphs = [graph_fingerprint(tree), mixture]
+            if compositor is not None:
+                graphs.append(graph_fingerprint(compositor))
+            return hashlib.sha256(json_key(graphs).encode()).hexdigest()
+        if mixture := case.get("glossy_transparency"):
+            from glossy_transparency_fixture import configure
+
+            graphs = [graph_fingerprint(item) for item in configure(self, tree, output, mixture)]
+            return hashlib.sha256(json_key([graphs, mixture]).encode()).hexdigest()
+        if settings := case.get("glass_caustics"):
+            from glass_caustics_fixture import configure
+
+            graphs = [graph_fingerprint(item) for item in configure(self, node, settings)]
+            return hashlib.sha256(json_key([graphs, settings]).encode()).hexdigest()
+        if mixture := case.get("paper_closures"):
+            from paper_closure_fixture import configure
+
+            graphs = [graph_fingerprint(item) for item in configure(self, tree, output, mixture)]
+            return hashlib.sha256(json_key([graphs, mixture]).encode()).hexdigest()
+        if mixture := case.get("two_principled"):
+            from two_principled_fixture import configure
+
+            compositor = configure(self, tree, output, mixture)
+            graphs = [graph_fingerprint(tree), mixture]
+            if compositor is not None:
+                graphs.append(graph_fingerprint(compositor))
+            return hashlib.sha256(json_key(graphs).encode()).hexdigest()
+        if settings := case.get("both_displacement"):
+            from both_displacement_fixture import configure
+
+            compositor = configure(self, tree, output, settings)
+            graphs = [graph_fingerprint(tree), settings]
+            if compositor is not None:
+                graphs.append(graph_fingerprint(compositor))
+            return hashlib.sha256(json_key(graphs).encode()).hexdigest()
         if absorption := case.get("absorption_fixture"):
             from absorption_fixture import configure
 
@@ -590,6 +652,7 @@ class Batch:
                 self.fixture.scene.cycles.samples = case.get("cycles_samples", 2)
                 self.fixture.scene.cycles.volume_bounces = case.get(
                     "cycles_volume_bounces", self.default_volume_bounces)
+                self.fixture.scene.view_settings.exposure = case.get("cycles_exposure", 0)
             size = case.get("resolution", BOX)
             self.fixture.scene.render.resolution_x = self.fixture.scene.render.resolution_y = size
             self.signature = self.fixture.build(case)

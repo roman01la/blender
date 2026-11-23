@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Check Cycles' WebGPU shader ray queries against desktop Metal."""
+"""Check Cycles' WebGPU shader ray queries against desktop Cycles."""
 
 import argparse
 import math
 from pathlib import Path
 
+from check_surface_scattering import compare as compare_cpu
 from run import case_id, compare, dump, positive, run_side
 
 
@@ -88,20 +89,29 @@ def main():
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=positive, default=200)
+    parser.add_argument("--ao-textures", action="store_true",
+                        help="compare textured Ambient Occlusion with desktop CPU Cycles")
     args = parser.parse_args()
     args.lighting = "area-world"
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     cases = query_cases()
-    native = run_side(args, output, "cycles", "native", "METAL", 0, cases)
+    textured_ao = {"Noise with AO", "Box projection with AO", "Tube projection with AO"}
+    if args.ao_textures:
+        names = {"AO unoccluded", "AO occluded", "AO only local"} | textured_ao
+        cases = [case for case in cases if case["name"] in names]
+    native = run_side(args, output, "cycles", "native", "CPU" if args.ao_textures else "METAL",
+                      0, cases)
     browser = run_side(args, output, "cycles", "web", "WEBGPU", 0, cases)
     rows = []
     for case in cases:
         desktop = native.get(case["id"], {})
         gpu = browser.get(case["id"], {})
-        verdict = compare(desktop, gpu)
+        verdict = compare_cpu(desktop, gpu)[0] if args.ao_textures else compare(desktop, gpu)
+        if args.ao_textures and verdict == "pass" and not desktop.get("fingerprint"):
+            verdict = "missing_fixture_fingerprint"
         delta = rmse = None
-        if verdict == "both_gpu":
+        if verdict in {"both_gpu", "pass"}:
             delta = max(abs(a - b) for a, b in zip(desktop["image"]["mean_rgb"],
                                                   gpu["image"]["mean_rgb"], strict=True))
             reference, actual = (
@@ -110,6 +120,10 @@ def main():
             rmse = math.sqrt(sum((a - b) ** 2 for a, b in zip(reference, actual, strict=True))
                              / len(reference)) / 255
             verdict = "pass" if delta <= 0.005 and rmse <= 0.01 else "image_mismatch"
+        if (verdict == "pass" and args.ao_textures and case["name"] in textured_ao and
+                not any("Cycles WebGPU compiling the textured Ambient Occlusion shader" in line
+                        for line in gpu["evidence"])):
+            verdict = "ao_shader_unproven"
         print(case["name"], verdict, delta, rmse)
         rows.append({"case": case, "verdict": verdict, "max_mean_rgb_error": delta,
                      "rgba_rmse": rmse, "native": desktop, "web": gpu})
@@ -117,6 +131,13 @@ def main():
     def red(name):
         return next(row["native"] for row in rows if row["case"]["name"] == name).get(
             "image", {}).get("mean_rgb", [0])[0]
+
+    if args.ao_textures:
+        signal = {"ao": red("AO unoccluded") - red("AO occluded"),
+                  "ao_only_local": red("AO only local") - red("AO occluded")}
+        meaningful = min(signal.values()) > 0.1
+        dump(output / "results.json", {"signal": signal, "signal_pass": meaningful, "cases": rows})
+        return int(not meaningful or any(row["verdict"] != "pass" for row in rows))
 
     signal = {
         "hit": red("Raycast hit") - red("Raycast miss"),

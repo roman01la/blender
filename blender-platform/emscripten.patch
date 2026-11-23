@@ -1517,7 +1517,7 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
  void PathTrace::denoise(const RenderWork &render_work)
  {
    if (!render_work.tile.denoise) {
-@@ -669,6 +809,26 @@
+@@ -669,6 +809,31 @@
    LOG_DEBUG << "Perform denoising work.";
  
    const double start_time = time_dt();
@@ -1528,6 +1528,11 @@ diff --git a/intern/cycles/integrator/path_trace.cpp b/intern/cycles/integrator/
 +    if (buffers.params.width == full_params_.width && buffers.params.height == full_params_.height &&
 +        buffers.params.pass_stride == full_params_.pass_stride && work->has_resident_film())
 +    {
++      /* Adaptive convergence can request denoising before the scheduler queues
++       * the final tile write. Keep the film resident until that work runs. */
++      if (!render_work.tile.write) {
++        return;
++      }
 +      const uint32_t id = new_resident_frame_id();
 +      if (work->append_resident_film(id, full_params_) &&
 +          export_resident_film(
@@ -2014,7 +2019,7 @@ diff --git a/intern/cycles/session/session.cpp b/intern/cycles/session/session.c
  
      /* Unlock scene mutex before loading denoiser kernels, since that may attempt to activate
       * graphics interop, which can deadlock when the scene mutex is still being held. */
-@@ -510,11 +557,43 @@
+@@ -510,11 +557,39 @@
    /* TODO(sergey): Take available memory into account, and if there is enough memory do not
     * tile and prefer optimal performance. */
  
@@ -2023,12 +2028,11 @@ diff --git a/intern/cycles/session/session.cpp b/intern/cycles/session/session.c
 +  bool needs_device_tiles = false;
 +#ifdef WITH_CYCLES_WEBGPU_PREVIEW
 +  if (device->info.type == DEVICE_WEBGPU) {
-+    needs_device_tiles = image_area > WebGPURenderPipeline::max_crop_pixels;
 +    if (buffer_params_.pass_stride > 0) {
 +      const size_t storage = device_webgpu_prepare_compute_limits(*device).storage_buffer_bytes;
 +      if (storage) {
 +        const size_t film_bytes = size_t(buffer_params_.pass_stride) * sizeof(float);
-+        needs_device_tiles |= size_t(image_area) > storage / film_bytes;
++        needs_device_tiles = size_t(image_area) > storage / film_bytes;
 +        if (needs_device_tiles) {
 +          /* Tiled renders add a stock sample-count pass if they do not already have one. */
 +          const size_t sample_count_bytes =
@@ -2046,9 +2050,6 @@ diff --git a/intern/cycles/session/session.cpp b/intern/cycles/session/session.c
 +          }
 +        }
 +      }
-+    }
-+    if (needs_device_tiles) {
-+      tile_size = min(tile_size, 1024);
 +    }
 +  }
 +#endif
@@ -12190,3 +12191,117 @@ diff --git a/source/blender/draw/engines/eevee/shaders/eevee_surf_volume.bsl.hh 
        occupancy.bits[j] = imageLoad(srt.occupancy_img, int3(froxel.xy, j)).r;
      }
    }
+diff --git a/source/blender/draw/engines/eevee/eevee_renderbuffers.cc b/source/blender/draw/engines/eevee/eevee_renderbuffers.cc
+--- a/source/blender/draw/engines/eevee/eevee_renderbuffers.cc
++++ b/source/blender/draw/engines/eevee/eevee_renderbuffers.cc
+@@ -12,6 +12,7 @@
+  * Input needs to be jittered so that the filter converges to the right result.
+  */
+
++#include "GPU_context.hh"
+ #include "GPU_texture.hh"
+
+ #include "DRW_render.hh"
+@@ -86,7 +87,14 @@
+                                                  GPU_TEXTURE_USAGE_SHADER_WRITE;
+
+   /* TODO(fclem): Make vector pass allocation optional if no TAA or motion blur is needed. */
+-  vector_tx.acquire_2d(extent, vector_tx_format(), usage_attachment_read_write);
++  gpu::TextureFormat vector_format = vector_tx_format();
++  if (GPU_backend_get_type() == GPU_BACKEND_WEBGPU && inst_.motion_blur.postfx_enabled() &&
++      vector_format == gpu::TextureFormat::SFLOAT_16_16)
++  {
++    /* WebGPU read-write storage requires RGBA16F. Keep logical RG behavior for the viewport. */
++    vector_format = gpu::TextureFormat::SFLOAT_16_16_16_16;
++  }
++  vector_tx.acquire_2d(extent, vector_format, usage_attachment_read_write);
+   if (inst_.pipelines.has_raycast) {
+     raycast_depth_tx.acquire_2d(extent, raycast_depth_format, GPU_TEXTURE_USAGE_SHADER_READ);
+     object_id_tx.acquire_2d(extent, object_id_format, usage_attachment_read);
+diff --git a/source/blender/draw/engines/eevee/eevee_shader.cc b/source/blender/draw/engines/eevee/eevee_shader.cc
+--- a/source/blender/draw/engines/eevee/eevee_shader.cc
++++ b/source/blender/draw/engines/eevee/eevee_shader.cc
+@@ -10,6 +10,7 @@
+  */
+
+ #include "GPU_capabilities.hh"
++#include "GPU_context.hh"
+
+ #ifdef __EMSCRIPTEN__
+ #  include "DRW_engine.hh"
+@@ -415,7 +416,9 @@
+     case MOTION_BLUR_TILE_FLATTEN_RGBA:
+       return "eevee_motion_blur_tiles_flatten_rgba";
+     case MOTION_BLUR_TILE_FLATTEN_RG:
+-      return "eevee_motion_blur_tiles_flatten_rg";
++      return GPU_backend_get_type() == GPU_BACKEND_WEBGPU ?
++                 "eevee_motion_blur_tiles_flatten_rg_webgpu" :
++                 "eevee_motion_blur_tiles_flatten_rg";
+     case DEBUG_SURFELS:
+       return "eevee_debug_surfels";
+     case DEBUG_IRRADIANCE_GRID:
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_motion_blur.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_motion_blur.bsl.hh
+--- a/source/blender/draw/engines/eevee/shaders/eevee_motion_blur.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_motion_blur.bsl.hh
+@@ -122,7 +122,7 @@
+  *
+  * Adapted from G3D Innovation Engine implementation.
+  */
+-template<enum TextureWriteFormat velocity_format>
++template<enum TextureWriteFormat velocity_format, bool previous_only>
+ [[compute, local_size(MOTION_BLUR_GROUP_SIZE, MOTION_BLUR_GROUP_SIZE)]]
+ void flatten_comp([[resource_table]] Resources<velocity_format> &srt,
+                   [[resource_table]] const draw::View &views,
+@@ -150,7 +150,7 @@
+   float2 uv = (float2(texel) + 0.5f) / render_size;
+   float depth = reverse_z::read(texelFetch(srt.depth_tx, texel, 0).r);
+   float4 motion = srt.camera.resolve_local(view, imageLoad(srt.velocity_img, texel), uv, depth);
+-  if constexpr (velocity_format == SFLOAT_16_16) {
++  if constexpr (previous_only) {
+     /* imageLoad does not perform the swizzling like sampler does. Do it manually. */
+     motion = motion.xyxy;
+   }
+@@ -210,18 +210,24 @@
+   }
+ }
+
+-template void flatten_comp<SFLOAT_16_16>(Resources<SFLOAT_16_16> &,
+-                                         const draw::View &,
+-                                         const uint3,
+-                                         const uint3,
+-                                         const uint3,
+-                                         const uint);
+-template void flatten_comp<SFLOAT_16_16_16_16>(Resources<SFLOAT_16_16_16_16> &,
++template void flatten_comp<SFLOAT_16_16, true>(Resources<SFLOAT_16_16> &,
+                                                const draw::View &,
+                                                const uint3,
+                                                const uint3,
+                                                const uint3,
+                                                const uint);
++template void flatten_comp<SFLOAT_16_16_16_16, true>(Resources<SFLOAT_16_16_16_16> &,
++                                                     const draw::View &,
++                                                     const uint3,
++                                                     const uint3,
++                                                     const uint3,
++                                                     const uint);
++template void flatten_comp<SFLOAT_16_16_16_16, false>(Resources<SFLOAT_16_16_16_16> &,
++                                                      const draw::View &,
++                                                      const uint3,
++                                                      const uint3,
++                                                      const uint3,
++                                                      const uint);
+
+ }  // namespace flatten
+
+@@ -595,7 +601,9 @@
+
+ PipelineCompute eevee_motion_blur_tiles_dilate(eevee::motion_blur::dilate::dilate_comp);
+ PipelineCompute eevee_motion_blur_tiles_flatten_rg(
+-    eevee::motion_blur::flatten::flatten_comp<SFLOAT_16_16>);
++    eevee::motion_blur::flatten::flatten_comp<SFLOAT_16_16, true>);
++PipelineCompute eevee_motion_blur_tiles_flatten_rg_webgpu(
++    eevee::motion_blur::flatten::flatten_comp<SFLOAT_16_16_16_16, true>);
+ PipelineCompute eevee_motion_blur_tiles_flatten_rgba(
+-    eevee::motion_blur::flatten::flatten_comp<SFLOAT_16_16_16_16>);
++    eevee::motion_blur::flatten::flatten_comp<SFLOAT_16_16_16_16, false>);
+ PipelineCompute eevee_motion_blur_gather(eevee::motion_blur::gather::gather_comp);

@@ -16,8 +16,13 @@ StructuredBuffer<float4> materials : register(t5);
 RWStructuredBuffer<float4> radiance : register(u6);
 RWStructuredBuffer<uint> path_words : register(u7);
 
+#include "ordered_closure_access.hlsl"
+
+#define CYCLES_WEBGPU_EMISSION_DELTA 1
 #include "wavefront_queue.hlsl"
 #include "wavefront_radiance.hlsl"
+#define CYCLES_WEBGPU_LIGHT_PASS_BUFFER radiance
+#include "light_passes.hlsl"
 
 uint cycles_camera_sample_word(uint index)
 {
@@ -39,10 +44,11 @@ extern uint cycles_surface_bounce(uint rng_pixel, uint sample_index, uint4 posit
                                   uint subsurface_steps, uint ray_differentials,
                                   float min_ray_pdf, float4 material, float4 specular,
                                   float4 parameters, float4 glass, float4 hair,
-                                  float4 throughput,
+                                  float4 bump, float4 throughput,
                                   out float4 next_throughput, out float next_pdf, out uint4 origin,
                                   out uint4 direction, out uint4 next_counts, out float surface_rr,
-                                  out float roughness_squared);
+                                  out float roughness_squared, uint light_passes,
+                                  out float4 diffuse_ratio, out float4 glossy_ratio);
 
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID)
@@ -57,6 +63,8 @@ void main(uint3 id : SV_DispatchThreadID)
   const uint queued = path + CYCLES_WEBGPU_PATH_QUEUED_KERNEL;
   const uint bounce_word = path + CYCLES_WEBGPU_PATH_BOUNCE;
   const uint bounce = path_words[bounce_word];
+  const uint capacity = ray_words[0];
+  const bool light_passes = cycles_light_pass_enabled(capacity);
   const uint subsurface_steps = path_words[path + CYCLES_WEBGPU_PATH_EXTRA_RNG_STEPS];
   const uint ray = 1 + 12 * lane;
   const uint surface = 8 * lane;
@@ -76,8 +84,14 @@ void main(uint3 id : SV_DispatchThreadID)
   const bool standalone = CYCLES_WEBGPU_MATERIAL_IS_STANDALONE(material.w);
   const bool portal = material.w == CYCLES_WEBGPU_MATERIAL_RAY_PORTAL;
   const bool mixed = material.w == CYCLES_WEBGPU_MATERIAL_MIXED_TRANSPARENT;
-  const bool mixed_ggx = ggx && materials[material_base + 3].w == 0.0f &&
+  const bool mixed_ggx = ggx &&
+                         CYCLES_WEBGPU_GGX_CAN_BE_TRANSPARENT(materials[material_base + 3]) &&
                          materials[material_base + 4].w != 0.0f;
+  const bool mixed_glossy = standalone && material.w == CYCLES_WEBGPU_MATERIAL_GLOSSY_TRANSPARENT &&
+                            materials[material_base + 4].w != 0.0f;
+  const bool mixed_ordered = CYCLES_WEBGPU_MATERIAL_HAS_ORDERED_CLOSURES(material.w) &&
+                             (uint(materials[material_base + 4].w) &
+                              CYCLES_WEBGPU_ORDERED_HAS_TRANSPARENT) != 0u;
   const uint boundary = hit_words[surface + CYCLES_WEBGPU_HIT_SPECIAL];
   const bool volume = boundary == CYCLES_WEBGPU_ABSORPTION_BOUNDARY ||
                       boundary == CYCLES_WEBGPU_ABSORPTION_TERMINATE;
@@ -125,8 +139,11 @@ void main(uint3 id : SV_DispatchThreadID)
 
   /* Analytic lights contribute along the segment before the next surface
    * or world hit. Only the opaque surface applies roulette. */
+  float3 emission_delta = float3(0, 0, 0);
   if (area_hit) {
-    rgb += cycles_forward_emission(area, throughput);
+    const float3 area_contribution = cycles_forward_emission(area, throughput);
+    rgb += area_contribution;
+    emission_delta += area_contribution;
   }
   const bool transparent_background = active && trace_past_area && hit_words[surface] == 0u &&
                                       cycles_write_transparent_background(
@@ -142,22 +159,34 @@ void main(uint3 id : SV_DispatchThreadID)
   }
   /* integrate_surface_emission(): the Light Tree dispatch has already applied
    * the forward MIS weight to sampled emitters. It precedes Russian roulette, and
-   * film_clamp_light() uses bounce - 1: unclamped through the first bounce
-   * (the scene requires an unlimited direct clamp), then the indirect clamp. */
+   * film_clamp_light() uses the direct limit through the first bounce. */
   const float4 emission = materials[material_base + CYCLES_WEBGPU_MATERIAL_EMISSION_SLOT];
   if (active && trace_past_area && hit_words[surface] != 0u &&
       (emission.x != 0.0f || emission.y != 0.0f || emission.z != 0.0f)) {
-    rgb += clamp_light(throughput * emission.xyz, bounce <= 1u ? 3.40282347e+38f : emission.w);
+    const float3 contribution = clamp_light(
+        throughput * emission.xyz, bounce <= 1u ? cycles_path_direct_clamp() : emission.w);
+    rgb += contribution;
+    emission_delta += contribution;
   }
+  float3 forward_delta = emission_delta;
   if (active && trace_past_area && !transparent_background && incoming.w < 0.0f) {
-    rgb += clamp_light(throughput * incoming.xyz, -incoming.w);
+    const float3 contribution = clamp_light(throughput * incoming.xyz, -incoming.w);
+    rgb += contribution;
+    forward_delta += contribution;
   }
-  if (shade_surface && incoming.w > 0.0f && float(bounce) <= light_max_bounces) {
-    rgb += clamp_light(surface_throughput * incoming.xyz, incoming.w);
+  const bool has_nee = shade_surface && incoming.w > 0.0f && float(bounce) <= light_max_bounces;
+  float3 nee = float3(0, 0, 0);
+  if (has_nee) {
+    nee = clamp_light(surface_throughput * incoming.xyz, incoming.w);
+    rgb += nee;
+  }
+  if (light_passes) {
+    cycles_light_pass_deltas(capacity, lane, bounce, forward_delta, nee, has_nee);
   }
   const bool ordinary_bounce = shade_surface && bounce < settings.x &&
                                (material.w == 1.0f || mixed || ggx || standalone);
-  const bool terminal_mixed = mixed_ggx && active && trace_past_area && surface_rr > 0.0f &&
+  const bool terminal_mixed = (mixed_ggx || mixed_glossy || mixed_ordered) && active && trace_past_area &&
+                              surface_rr > 0.0f &&
                               (counts.w & CYCLES_WEBGPU_PATH_TERMINATE_AFTER_TRANSPARENT) != 0 &&
                               (counts.w & CYCLES_WEBGPU_PATH_TERMINATE_ON_NEXT_SURFACE) == 0;
   if (!transparent && !volume && (ordinary_bounce || terminal_mixed) &&
@@ -177,22 +206,38 @@ void main(uint3 id : SV_DispatchThreadID)
     float bounced_pdf;
     uint4 next_counts;
     float next_rr;
+    float4 diffuse_ratio, glossy_ratio;
+    const bool save_ratios = light_passes && bounce == 0u;
     visibility = cycles_surface_bounce(ray_words[ray + CYCLES_WEBGPU_RAY_RNG_PIXEL], pixels[lane].z,
                                        position, normal, geom_N, spec_N, incoming_ray,
                                        settings, cycles_path_lobe_settings(), counts, bounce,
                                        subsurface_steps, uint(ray_differentials), min_pdf,
                                        material, materials[material_base + 1],
                                        materials[material_base + 2], materials[material_base + 3],
-                                       materials[material_base + 4], float4(next_throughput, 0.0f), bounced_throughput,
+                                       materials[material_base + 4],
+                                       materials[material_base + CYCLES_WEBGPU_MATERIAL_NORMAL_SLOT],
+                                       float4(next_throughput, 0.0f), bounced_throughput,
                                        bounced_pdf, origin, direction, next_counts, next_rr,
-                                       roughness_squared);
+                                       roughness_squared, uint(save_ratios), diffuse_ratio,
+                                       glossy_ratio);
     next_throughput = bounced_throughput.xyz;
     if (visibility == CYCLES_WEBGPU_MIXED_TRANSPARENT_PENDING) {
+      if (save_ratios && (CYCLES_WEBGPU_MATERIAL_HAS_ORDERED_CLOSURES(material.w) ||
+                          (ggx && CYCLES_WEBGPU_GGX_HAS_TRANSLUCENT(materials[material_base + 3])))) {
+        const uint record = cycles_light_pass_record(capacity, lane);
+        radiance[record] = diffuse_ratio;
+        radiance[record + 1u] = glossy_ratio;
+      }
       transparent = true;
       skip_self = false;
       visibility = 0;
     }
     else if (visibility != 0 && visibility != CYCLES_WEBGPU_PATH_SUBSURFACE_PENDING) {
+      if (save_ratios) {
+        const uint record = cycles_light_pass_record(capacity, lane);
+        radiance[record] = diffuse_ratio;
+        radiance[record + 1u] = glossy_ratio;
+      }
       path_words[path + CYCLES_WEBGPU_PATH_DIFFUSE_BOUNCE] = next_counts.x;
       path_words[path + CYCLES_WEBGPU_PATH_GLOSSY_BOUNCE] = next_counts.y;
       path_words[path + CYCLES_WEBGPU_PATH_TRANSMISSION_BOUNCE] = next_counts.z;
@@ -201,9 +246,18 @@ void main(uint3 id : SV_DispatchThreadID)
       const float next_min_pdf = __builtin_elementwise_min(min_pdf, bounced_pdf);
       path_words[path + CYCLES_WEBGPU_PATH_MIN_RAY_PDF] = __builtin_bit_cast(uint, next_min_pdf);
       const uint mis_normal = path + CYCLES_WEBGPU_PATH_MIS_ORIGIN_N;
-      path_words[mis_normal] = normal.x;
-      path_words[mis_normal + 1] = normal.y;
-      path_words[mis_normal + 2] = normal.z;
+      const float4 material_normal = materials[material_base + CYCLES_WEBGPU_MATERIAL_NORMAL_SLOT];
+      uint3 mis_N = normal.xyz;
+      if (material_normal.w >= CYCLES_WEBGPU_NORMAL_SHADER) {
+        const float4 shader_normal = material_normal.w >= CYCLES_WEBGPU_NORMAL_BOTH ?
+                                         materials[material_base + 4] : material_normal;
+        mis_N = uint3(__builtin_bit_cast(uint, shader_normal.x),
+                      __builtin_bit_cast(uint, shader_normal.y),
+                      __builtin_bit_cast(uint, shader_normal.z));
+      }
+      path_words[mis_normal] = mis_N.x;
+      path_words[mis_normal + 1] = mis_N.y;
+      path_words[mis_normal + 2] = mis_N.z;
       path_words[path + CYCLES_WEBGPU_PATH_SURFACE_RR] = __builtin_bit_cast(uint, next_rr);
     }
   }
@@ -259,7 +313,18 @@ void main(uint3 id : SV_DispatchThreadID)
   path_words[sum + 1] = sum_bits.y;
   path_words[sum + 2] = sum_bits.z;
   radiance[lane] = float4(rgb, opacity);
+  cycles_write_emission_delta(ray_words[0], lane, bounce, counts.w, emission_delta);
   if (visibility == CYCLES_WEBGPU_PATH_SUBSURFACE_PENDING) {
+    if (ray_differentials) {
+      /* Stock subsurface entry preserves the surface position differential
+       * and clears the angular differential for the internal ray. */
+      const uint differential = CYCLES_WEBGPU_RAY_DIFFERENTIAL_BASE(ray_words[0], lane);
+      const float dP = __builtin_bit_cast(float, ray_words[differential]);
+      const float dD = __builtin_bit_cast(float, ray_words[differential + 1]);
+      const float t = __builtin_bit_cast(float, hit_words[surface + 4]);
+      ray_words[differential] = __builtin_bit_cast(uint, dP + t * dD);
+      ray_words[differential + 1] = 0u;
+    }
     path_words[queued] = CYCLES_WEBGPU_PATH_INTERSECT_SUBSURFACE;
     return;
   }

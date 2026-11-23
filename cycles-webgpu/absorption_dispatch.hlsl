@@ -19,13 +19,35 @@ StructuredBuffer<uint> metadata_words : register(t4);
 StructuredBuffer<uint> volume_state : register(t5);
 #  ifdef CYCLES_WEBGPU_VOLUME_GUIDES
 RWStructuredBuffer<float4> guide_state : register(u6);
+#    ifndef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
 StructuredBuffer<uint> guide_params : register(t7);
+#    endif
+#  endif
+#  ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
+#    include "../blender-platform/cycles-webgpu/material_layout.h"
+StructuredBuffer<uint> svm_words : register(t7);
+#    include "svm_context.hlsl"
+
+uint cycles_surface_word(uint index)
+{
+  return metadata_words[index];
+}
+
+uint cycles_svm_word(uint index)
+{
+  return svm_words[index];
+}
+
+uint4 cycles_svm_shadow_context(uint field, uint object, uint shader)
+{
+  return cycles_svm_scene_context(field, object, shader);
+}
 #  endif
 
 extern float4 cycles_absorption_shadow(uint4 origin, uint4 direction, uint4 options,
                                        uint4 geometric, uint state
 #  ifdef CYCLES_WEBGPU_VOLUME_EXTINCTION_SHADOW
-                                       , uint4 rng
+                                       , uint4 rng, uint transparent_bounce
 #  endif
                                        );
 #else
@@ -68,46 +90,81 @@ void main(uint3 id : SV_DispatchThreadID)
   }
 #ifdef CYCLES_WEBGPU_ABSORPTION_SHADOW
   const uint shadow = 4 * lane;
+  const uint4 options = shadow_words[shadow + 2];
+#  ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
+  const bool from_volume = (options.x & CYCLES_WEBGPU_SHADOW_FROM_VOLUME) != 0u;
+#  endif
 #  ifdef CYCLES_WEBGPU_VOLUME_GUIDES
-  const float4 guide = __builtin_bit_cast(float4, shadow_words[shadow + 3]);
-  const uint feature = 3 * lane;
-  float4 feature_throughput = guide_state[feature];
-  if ((guide.x != 0.0f || guide.y != 0.0f || guide.z != 0.0f || guide.w != 0.0f) &&
-      (feature_throughput.x != 0.0f || feature_throughput.y != 0.0f ||
-       feature_throughput.z != 0.0f))
-  {
-    float4 albedo = guide_state[feature + 1];
-    float4 normal = guide_state[feature + 2];
-    accumulate_volume_features(guide.xyz, guide.w != 0.0f, guide_params[0] != 0xffffffffu,
-                               guide_params[1] != 0xffffffffu, feature_throughput, albedo, normal);
-    guide_state[feature] = feature_throughput;
-    guide_state[feature + 1] = albedo;
-    guide_state[feature + 2] = normal;
+#    ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
+  const bool use_albedo = cycles_svm_camera_word(CYCLES_WEBGPU_CAMERA_WORDS) != 0xffffffffu;
+  const bool use_normal = cycles_svm_camera_word(CYCLES_WEBGPU_CAMERA_WORDS + 1u) != 0xffffffffu;
+#    else
+  const bool use_albedo = guide_params[0] != 0xffffffffu;
+  const bool use_normal = guide_params[1] != 0xffffffffu;
+#    endif
+  if (
+#    ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
+      from_volume &&
+#    endif
+      (use_albedo || use_normal)) {
+    const float4 guide = __builtin_bit_cast(float4, shadow_words[shadow + 3]);
+    const uint feature = 3 * lane;
+    float4 feature_throughput = guide_state[feature];
+    if ((guide.x != 0.0f || guide.y != 0.0f || guide.z != 0.0f || guide.w != 0.0f) &&
+        (feature_throughput.x != 0.0f || feature_throughput.y != 0.0f ||
+         feature_throughput.z != 0.0f))
+    {
+      float4 albedo = guide_state[feature + 1];
+      float4 normal = guide_state[feature + 2];
+      accumulate_volume_features(guide.xyz, guide.w != 0.0f, use_albedo, use_normal,
+                                 feature_throughput, albedo, normal);
+      guide_state[feature] = feature_throughput;
+      guide_state[feature + 1] = albedo;
+      guide_state[feature + 2] = normal;
+    }
   }
 #  endif
-  const uint4 options = shadow_words[shadow + 2];
-  if (options.x != 0u) {
+  if ((options.x & ~CYCLES_WEBGPU_SHADOW_FROM_VOLUME) != 0u) {
 #  ifdef CYCLES_WEBGPU_VOLUME_EXTINCTION_SHADOW
     const uint capacity = ray_words[0];
     const uint ray = 1 + 12 * lane;
     const uint path = CYCLES_WEBGPU_PATH_WORDS * lane;
     const uint bounce = path_words[path + CYCLES_WEBGPU_PATH_BOUNCE];
     const uint steps = path_words[path + CYCLES_WEBGPU_PATH_EXTRA_RNG_STEPS];
+    const uint transparent_bounce = path_words[path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE];
     const uint4 rng = uint4(ray_words[ray + CYCLES_WEBGPU_RAY_RNG_PIXEL],
                            path_words[path + CYCLES_WEBGPU_PATH_PIXEL + 2],
                            (bounce + steps + 1u) * CYCLES_WEBGPU_PRNG_BOUNCE_NUM, 0u);
 #  endif
 #  ifdef CYCLES_WEBGPU_VOLUME_SCATTER_SHADOW
-    const uint stack = volume_state[CYCLES_WEBGPU_VOLUME_SHADOW_STACK * capacity + lane];
+    uint stack = volume_state[CYCLES_WEBGPU_VOLUME_SHADOW_STACK * capacity + lane];
+    uint4 geometric = uint4(0);
+#    ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
+    if (!from_volume) {
+      stack = (options.x & CYCLES_WEBGPU_SHADOW_TRANSMIT_VOLUME) != 0u ?
+                  volume_state[CYCLES_WEBGPU_VOLUME_NEXT_BOUNDARY * capacity + lane] :
+                  volume_state[lane];
+      geometric = shadow_words[shadow + 3];
+    }
+#    endif
     const float3 T = cycles_absorption_shadow(shadow_words[shadow], shadow_words[shadow + 1],
-                                              options, uint4(0), stack, rng).xyz;
+                                              options, geometric, stack, rng, transparent_bounce).xyz;
+#    ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
+    if (!from_volume) {
+      // In the surface launch, binding 6 is the pending shadow radiance.
+      const float4 sample = guide_state[lane];
+      guide_state[lane] = float4(T * sample.xyz, sample.w);
+      return;
+    }
+#    endif
     const uint direct = CYCLES_WEBGPU_VOLUME_DIRECT * capacity + lane;
     float3 sample = T * __builtin_bit_cast(
         float3, uint3(volume_state[direct], volume_state[direct + capacity],
                       volume_state[direct + 2 * capacity]));
     const uint medium = cycles_volume_word(CYCLES_WEBGPU_SURFACE_ABSORPTION_OFFSET);
-    const float limit = options.w == 0u ? 3.402823466e38f : __builtin_bit_cast(
-        float, cycles_volume_word(medium + CYCLES_WEBGPU_VOLUME_INDIRECT_CLAMP));
+    const uint clamp_word = options.w == 0u ? CYCLES_WEBGPU_VOLUME_DIRECT_CLAMP :
+                                               CYCLES_WEBGPU_VOLUME_INDIRECT_CLAMP;
+    const float limit = __builtin_bit_cast(float, cycles_volume_word(medium + clamp_word));
     const float abs_value = __builtin_elementwise_abs(sample.x) +
                             __builtin_elementwise_abs(sample.y) +
                             __builtin_elementwise_abs(sample.z);
@@ -121,11 +178,16 @@ void main(uint3 id : SV_DispatchThreadID)
     path_words[film + 2] = __builtin_bit_cast(
         uint, __builtin_bit_cast(float, path_words[film + 2]) + sample.z);
 #  else
-    const float3 T = cycles_absorption_shadow(shadow_words[shadow], shadow_words[shadow + 1],
-                                              options, shadow_words[shadow + 3],
-                                              volume_state[lane]
+    uint stack = volume_state[lane];
 #    ifdef CYCLES_WEBGPU_VOLUME_EXTINCTION_SHADOW
-                                              , rng
+    if ((options.x & CYCLES_WEBGPU_SHADOW_TRANSMIT_VOLUME) != 0u) {
+      stack = volume_state[CYCLES_WEBGPU_VOLUME_NEXT_BOUNDARY * capacity + lane];
+    }
+#    endif
+    const float3 T = cycles_absorption_shadow(shadow_words[shadow], shadow_words[shadow + 1],
+                                              options, shadow_words[shadow + 3], stack
+#    ifdef CYCLES_WEBGPU_VOLUME_EXTINCTION_SHADOW
+                                              , rng, transparent_bounce
 #    endif
                                               ).xyz;
     const float4 sample = radiance[lane];

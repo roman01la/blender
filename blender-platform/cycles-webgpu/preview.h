@@ -55,6 +55,7 @@ class WebGPUPreview {
   unique_ptr<WebGPURenderPipeline> pipeline_;
   CyclesWebGPUScene scene_;
   std::array<float, CYCLES_WEBGPU_CAMERA_WORDS> camera_{};
+  std::array<float, CYCLES_WEBGPU_CAMERA_LENS_WORDS> camera_lens_{};
   std::array<uint32_t, 16> denoising_config_{};
   std::vector<uint32_t> sampling_;
   bool scene_checked_ = false;

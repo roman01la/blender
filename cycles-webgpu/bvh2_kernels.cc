@@ -221,7 +221,8 @@ ccl_device_inline float scene_fetch(KernelGlobals, sample_pattern_lut_tag, uint 
 #include "kernel/bvh/types.h"
 #include "kernel/bvh/util.h"
 #include "kernel/geom/triangle_intersect.h"
-#if defined(CYCLES_WEBGPU_SURFACE) && defined(CYCLES_WEBGPU_COMPACT_PATHS)
+#if defined(CYCLES_WEBGPU_COMPACT_PATHS) && \
+    (defined(CYCLES_WEBGPU_SURFACE) || defined(CYCLES_WEBGPU_SUBSURFACE))
 #  pragma push_macro("ccl_device")
 #  undef ccl_device
 #  define ccl_device static inline __attribute__((always_inline))
@@ -415,6 +416,7 @@ using Float4 = float __attribute__((ext_vector_type(4)));
                                                   , const Float4 geometric,
                                                   const unsigned int backfacing,
                                                   const Float4 shading_normal,
+                                                  const Float4 closure_normal,
                                                   Float4 &exit_origin,
                                                   unsigned int &exit_flags
 #endif
@@ -481,6 +483,14 @@ using Float4 = float __attribute__((ext_vector_type(4)));
     bssrdf.alpha = 1.0f;
   }
   const float3 Ng = make_float3(geometric.x, geometric.y, geometric.z);
+  if (closure_normal.w != 0.0f) {
+    /* Match the BSSRDF normal set by the stock Principled closure. The
+     * Random Walk geometry guide above still uses ShaderData::N. */
+    sd.Ng = Ng;
+    sd.shader_flag = (uint(closure_normal.w) & 1u) == 0u ? SD_USE_BUMP_MAP_CORRECTION : 0;
+    bssrdf.N = maybe_ensure_valid_specular_reflection(
+        &sd, make_float3(closure_normal.x, closure_normal.y, closure_normal.z));
+  }
 #else
   const float3 Ng = bssrdf.N;
 #endif
@@ -574,6 +584,8 @@ static void load_triangle_shading_offsets(ccl::TraversalGlobals &globals)
 }
 
 #  ifdef CYCLES_WEBGPU_SHADOW_SVM
+#    include "../blender-platform/cycles-webgpu/material_layout.h"
+
 using ShadowFloat4 = float __attribute__((ext_vector_type(4)));
 
 ShadowFloat4 cycles_svm_shadow_transparency(UInt4 hit,
@@ -927,4 +939,65 @@ using ShadowFloat4 = float __attribute__((ext_vector_type(4)));
 
 #ifdef CYCLES_WEBGPU_ABSORPTION
 #  include "volume_absorption.h"
+#endif
+
+#ifdef CYCLES_WEBGPU_FILM_AO
+#  include "surface_shadow.h"
+
+using AOFloat4 = float __attribute__((ext_vector_type(4)));
+
+[[gnu::always_inline]] void cycles_film_ao_ray(
+    UInt4 position,
+    UInt4 normal,
+    UInt4 geometric,
+    UInt4 shadow_along,
+    UInt4 shadow_opposite,
+    UInt4 hit,
+    AOFloat4 direction,
+    UInt4 &origin,
+    UInt4 &options)
+{
+  const auto unpack = [](const UInt4 data) {
+    return ccl::make_float3(std::bit_cast<float>(data.x), std::bit_cast<float>(data.y),
+                             std::bit_cast<float>(data.z));
+  };
+  auto P = unpack(position);
+  const auto D = ccl::make_float3(direction.x, direction.y, direction.z);
+  const bool skip_self = ccl::webgpu_shadow_ray_offset(P, D, unpack(normal), unpack(geometric),
+                                                       unpack(shadow_along),
+                                                       unpack(shadow_opposite),
+                                                       std::bit_cast<float>(shadow_along.w));
+  origin = {std::bit_cast<unsigned int>(P.x), std::bit_cast<unsigned int>(P.y),
+            std::bit_cast<unsigned int>(P.z), 0};
+  options = {ccl::PATH_RAY_VISIBILITY_SHADOW_OPAQUE,
+             skip_self ? hit.z : static_cast<unsigned int>(OBJECT_NONE),
+             skip_self ? hit.y : static_cast<unsigned int>(PRIM_NONE), 0};
+}
+
+#ifndef CYCLES_WEBGPU_FILM_AO_PREPARE
+[[gnu::always_inline]] AOFloat4 cycles_film_ao_visibility(
+    UInt4 position,
+    UInt4 normal,
+    UInt4 geometric,
+    UInt4 shadow_along,
+    UInt4 shadow_opposite,
+    UInt4 hit,
+    AOFloat4 direction,
+    unsigned int transparent,
+    unsigned int transparent_bounce)
+{
+  UInt4 origin, options;
+  cycles_film_ao_ray(
+      position, normal, geometric, shadow_along, shadow_opposite, hit, direction, origin, options);
+  const UInt4 packed_direction = std::bit_cast<UInt4>(direction);
+  if (transparent != 0) {
+    return cycles_bvh2_transparent_shadow(
+        origin, packed_direction, options, geometric, transparent_bounce);
+  }
+  UInt4 shadow_hit, coordinates;
+  cycles_bvh2_trace(origin, packed_direction, options, shadow_hit, coordinates, geometric);
+  const float visible = float(shadow_hit.x == 0);
+  return {visible, visible, visible, 0.0f};
+}
+#endif
 #endif

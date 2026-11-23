@@ -10,11 +10,8 @@ var<workgroup> workgroup_count: atomic<u32>;
 // before the X/Y filters reactivate their neighbors.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) local: u32) {
-  let width = params[2];
-  let y = id.x / width;
-  if (y < params[3]) {
-    let x = id.x - y * width;
-    let index = (params[4] + x + y * params[5]) * params[6] + params[9] + 3u;
+  if (id.x < params[2] && id.y < params[3]) {
+    let index = (params[4] + id.x + id.y * params[5]) * params[6] + params[9] + 3u;
     if (bitcast<f32>(film[index]) == 0.0) {
       atomicAdd(&workgroup_count, 1u);
     }

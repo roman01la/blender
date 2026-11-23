@@ -101,6 +101,8 @@ static PixelFormat pixel_format(const TextureFormat format)
       return {T::RG8Unorm, GPU_DATA_UBYTE, 2, 2};
     case TextureFormat::UNORM_8_8_8_8:
       return {T::RGBA8Unorm, GPU_DATA_UBYTE, 4, 4};
+    case TextureFormat::UNORM_16:
+      return {T::R16Unorm, GPU_DATA_FLOAT, 1, 2};
     case TextureFormat::UNORM_16_16:
       /* Keep enough precision for both normalized G-buffer channels in a format that
        * supports read-write storage usage. */
@@ -155,6 +157,8 @@ WebGPUStorageTextureFormat webgpu_storage_texture_format(const TextureFormat for
       return {T::R32Float, "r32f", true};
     case TextureFormat::UNORM_8_8_8_8:
       return {T::RGBA8Unorm, "rgba8"};
+    case TextureFormat::UNORM_16:
+      return {T::R16Unorm, "r16", false, true};
     case TextureFormat::UNORM_10_10_10_2:
       return {T::RGB10A2Unorm, "rgb10_a2", false, true};
     case TextureFormat::SFLOAT_16:
@@ -224,6 +228,11 @@ bool WebGPUTexture::init_internal()
   desc.format = pixel_format(format_).texture;
   if (desc.format == wgpu::TextureFormat::Depth32FloatStencil8 &&
       !webgpu_active_device().HasFeature(wgpu::FeatureName::Depth32FloatStencil8))
+  {
+    return false;
+  }
+  if (desc.format == wgpu::TextureFormat::R16Unorm &&
+      !webgpu_active_device().HasFeature(wgpu::FeatureName::TextureFormatsTier1))
   {
     return false;
   }
@@ -619,6 +628,22 @@ void WebGPUTexture::update_sub(const int mip,
     data = halves.data();
     row_length = width;
   }
+  else if (format_ == TextureFormat::UNORM_16) {
+    if (format != GPU_DATA_FLOAT) {
+      webgpu_draw_unsupported("this normalized 16-bit texture upload format");
+    }
+    const auto *source = static_cast<const float *>(data);
+    halves.resize(rows * width);
+    for (size_t row = 0; row < rows; row++) {
+      for (uint32_t x = 0; x < width; x++) {
+        const float value = source[row * row_length + x];
+        const float clamped = std::clamp(std::isnan(value) ? 0.0f : value, 0.0f, 1.0f);
+        halves[row * width + x] = uint16_t(std::lround(clamped * 65535.0f));
+      }
+    }
+    data = halves.data();
+    row_length = width;
+  }
   else if (format_ == TextureFormat::UNORM_16_16 && format == GPU_DATA_FLOAT) {
     const auto *source = static_cast<const float *>(data);
     const auto unorm16 = [](const float value) {
@@ -798,6 +823,8 @@ static const char *storage_format_wgsl(const wgpu::TextureFormat format)
       return "r8uint";
     case T::R16Uint:
       return "r16uint";
+    case T::R16Unorm:
+      return "r16unorm";
     case T::R32Uint:
       return "r32uint";
     case T::R32Sint:

@@ -42,7 +42,7 @@ struct WebGPUSvmNoSurface {
     if (field == CYCLES_WEBGPU_SVM_POSITION) {
       return {0, 0, __float_as_uint(1.0f), 0};
     }
-    if (field == CYCLES_WEBGPU_SVM_NORMAL) {
+    if (field == CYCLES_WEBGPU_SVM_NORMAL || field == CYCLES_WEBGPU_SVM_GEOMETRIC) {
       /* A unit normal keeps normal-dependent host evaluations finite. */
       return {0, 0, __float_as_uint(1.0f), 0};
     }

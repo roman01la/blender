@@ -4,6 +4,7 @@
 
 import argparse
 import json
+from math import sqrt
 from pathlib import Path
 import re
 
@@ -21,6 +22,21 @@ MODES = (
     ("overlap inside guided", "overlap-inside", True, "LINEAR"),
     ("overlap absorption raw", "overlap-absorption", False, "LINEAR"),
     ("overlap absorption guided", "overlap-absorption", True, "LINEAR"),
+    ("mixed rough glass exterior", "mixed-boundary", False, "LINEAR"),
+    ("mixed rough glass interior", "mixed-boundary-inside", False, "LINEAR"),
+    ("mixed rough glass additive", "mixed-boundary-additive", False, "LINEAR"),
+    ("mixed rough glass bump", "mixed-boundary-bump", False, "LINEAR"),
+    ("ambient occlusion with scattering", "ao-scatter", False, "LINEAR"),
+    ("ambient occlusion and bump with scattering", "ao-scatter-bump", False, "LINEAR"),
+    ("separated phase closures", "separated-volume-bounds", False, "LINEAR"),
+    ("transparent volume boundary", "transparent-volume-boundary", False, "LINEAR"),
+    ("transparent volume film", "transparent-volume-film", False, "LINEAR"),
+    ("varying transparent volume shadows", "transparent-volume-varying", False, "LINEAR"),
+    ("varying transparent volume guided", "transparent-volume-varying", True, "LINEAR"),
+    ("varying transparent volume bump", "transparent-volume-bump", False, "LINEAR"),
+    ("depth homogeneous", "homogeneous", False, "LINEAR"),
+    ("depth mixed boundary", "mixed-boundary", False, "LINEAR"),
+    ("depth varying transparency and absorption", "transparent-volume-varying", False, "LINEAR"),
     ("grid raw", "grid", False, "LINEAR"),
     ("grid guided", "grid", True, "LINEAR"),
     ("cubic grid guided", "grid", True, "CUBIC"),
@@ -33,13 +49,15 @@ def make_cases(args):
         if not re.search(args.match, name):
             continue
         surface = media == "surface"
+        depth = name.startswith("depth ")
         case = {
             "node": "ShaderNodeBsdfDiffuse" if surface else "ShaderNodeVolumeScatter",
             "output": "BSDF" if surface else "Volume",
             "settings": {},
-            "volume_transport": {"media": media, "denoise": denoise, "interpolation": interpolation},
+            "volume_transport": {"media": media, "denoise": denoise, "interpolation": interpolation,
+                                 **({"depth": True} if depth else {})},
             "cycles_samples": args.samples,
-            "cycles_volume_bounces": args.volume_bounces,
+            "cycles_volume_bounces": 0 if media == "transparent-volume-film" else args.volume_bounces,
             "resolution": args.resolution,
             "include_pixels": True,
         }
@@ -104,7 +122,9 @@ def main():
         browser = web.get(case["id"], {})
         verdict = "desktop_cpu_unproven"
         rmse = center = None
+        alpha = None
         proof = False
+        depth_signal = True
         cpu_oidn = any("Denoising on:" in line and "[CPU]" in line
                        for line in reference.get("evidence", []))
         if reference.get("execution") == "cpu_control" and (
@@ -116,12 +136,21 @@ def main():
                 if browser["fingerprint"] == reference["fingerprint"]:
                     rmse, center = image_errors(reference, browser)
                     proof = not case["volume_transport"]["denoise"] or denoising_proof(browser, case)
+                    if case["volume_transport"].get("depth"):
+                        data = bytes.fromhex(reference["image"]["rgba_hex"])[::4]
+                        depth_signal = max(data) - min(data) > 15
+                    if case["volume_transport"]["media"] == "transparent-volume-film":
+                        a = bytes.fromhex(reference["image"]["rgba_hex"])[3::4]
+                        b = bytes.fromhex(browser["image"]["rgba_hex"])[3::4]
+                        alpha = sqrt(sum((x - y) ** 2 for x, y in zip(a, b, strict=True)) / len(a)) / 255
                     verdict = ("denoising_unproven" if not proof else
-                               "pass" if rmse <= 0.035 and center <= 0.02 else "image_mismatch")
+                               "constant_depth_probe" if not depth_signal else
+                               "pass" if rmse <= 0.035 and center <= 0.02 and
+                               (alpha is None or alpha <= 0.02) else "image_mismatch")
         results.append({"case": case, "verdict": verdict, "rgb_rmse": rmse,
-                        "max_mean_rgb_error": center, "gpu_proof": proof,
+                        "max_mean_rgb_error": center, "alpha_rmse": alpha, "gpu_proof": proof,
                         "native": reference, "web": browser})
-        print(case["name"], verdict, rmse, center, flush=True)
+        print(case["name"], verdict, rmse, center, alpha, flush=True)
     dump(output / "results.json", {"cases": results})
     return int(any(row["verdict"] not in {"pass", "desktop_only"} for row in results))
 

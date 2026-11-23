@@ -101,7 +101,8 @@ void cycles_svm_material(unsigned int shader,
                          Float4 &layers,
                          Float4 &transmission,
                          Float4 &subsurface,
-                         Float4 &emission);
+                         Float4 &emission,
+                         Float4 &closure_normal);
 
 namespace {
 
@@ -1761,7 +1762,7 @@ int main()
     if (surface == 1 || surface == 2) {
       cycles_svm_material(
           shader, primitive, u, v, lane, 0, result[0], result[1], result[2], result[3], result[4],
-          result[5]);
+          result[5], result[6]);
     }
     else if (surface != 0) {
       result[0].w = 2;
@@ -1773,7 +1774,7 @@ int main()
                                                                indirect_clamp} :
                                                 MaterialVector{};
     const std::array expected_material{expected, specular, layers, transmission, MaterialVector{},
-                                       emission};
+                                       emission, MaterialVector{}};
     for (int entry = 0; entry < CYCLES_WEBGPU_MATERIAL_VECTORS; ++entry) {
       for (int channel = 0; channel < 4; ++channel) {
         const float value = expected_material[entry][channel];
@@ -1903,8 +1904,10 @@ int main()
              {principled_color.x, principled_color.y, principled_color.z, CYCLES_WEBGPU_MATERIAL_GGX},
              1.0e-6f,
              specular, {0.4f, eta_mixed, 0.02f, 1}) ||
-      !check(1, first_ggx_shader + 3, 0, 0, 0, {0, 0, 0, 2}, 0.0f) ||
-      !check(1, first_ggx_shader + 4, 0, 0, 0, {0, 0, 0, 2}, 0.0f) ||
+      !check(1, first_ggx_shader + 3, 0, 0, 0, ggx_color, 1.0e-6f,
+             {0.9f, 0.75f, 1.2f, 0.0f}, {0, 1.5f, 0.04f, 1}) ||
+      !check(1, first_ggx_shader + 4, 0, 0, 0, ggx_color, 1.0e-6f, specular,
+             {0, 1.5f, 0.04f, 1}) ||
       !check(1, first_ggx_shader + 5, 0, 0, 0, ggx_color, 1.0e-6f, specular,
              {0, eta_inside, f0_inside, 1}))
   {
@@ -1918,8 +1921,10 @@ int main()
              {principled_color.x, principled_color.y, principled_color.z,
               CYCLES_WEBGPU_MATERIAL_MULTISCATTER_GGX},
              1.0e-6f, specular, {0.4f, eta_mixed, 0.02f, 1}) ||
-      !check(1, first_multiscatter_shader + 2, 0, 0, 0, {0, 0, 0, 2}, 0.0f) ||
-      !check(1, first_multiscatter_shader + 3, 0, 0, 0, {0, 0, 0, 2}, 0.0f))
+      !check(1, first_multiscatter_shader + 2, 0, 0, 0, multiscatter_color, 1.0e-6f,
+             {0.9f, 0.75f, 1.2f, 0.0f}, {0, 1.5f, 0.04f, 1}) ||
+      !check(1, first_multiscatter_shader + 3, 0, 0, 0, multiscatter_color, 1.0e-6f, specular,
+             {0, 1.5f, 0.04f, 1}))
   {
     return 1;
   }

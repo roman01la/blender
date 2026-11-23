@@ -58,15 +58,17 @@ def package(installation: Path, output: Path, python_process: Path | None = None
             "stock-camera.wgsl", "bvh2-compact.wgsl", "surface-compact.wgsl",
             "svm-compact.wgsl", "wavefront-light.wgsl", "path-update.wgsl",
         )]
-        svm_core = cycles_webgpu.resolve() / "svm-compact-core.wgsl"
-        if svm_core.is_file():
-            shaders.append(svm_core)
+        for name in ("svm-compact-core.wgsl", "svm-compact-textures.wgsl"):
+            svm_variant = cycles_webgpu.resolve() / name
+            if svm_variant.is_file():
+                shaders.append(svm_variant)
         query_shaders = [cycles_webgpu.resolve() / name for name in (
             "svm-query.wgsl", "surface-query.wgsl",
         )]
         if all(shader.is_file() for shader in query_shaders):
             shaders.extend(query_shaders)
-            for name in ("svm-query-textures.wgsl", "svm-query-advanced.wgsl"):
+            for name in ("svm-query-textures.wgsl", "svm-query-ao-textures.wgsl",
+                         "svm-query-advanced.wgsl"):
                 query = cycles_webgpu.resolve() / name
                 if query.is_file():
                     shaders.append(query)
@@ -88,6 +90,13 @@ def package(installation: Path, output: Path, python_process: Path | None = None
         )]
         if all(shader.is_file() for shader in volume_shaders):
             shaders.extend(volume_shaders)
+            shaders.append(port / "cycles-webgpu" / "volume-transition.wgsl")
+            transmission = cycles_webgpu.resolve() / "wavefront-light-deferred-tree-volume.wgsl"
+            if transmission.is_file():
+                shaders.append(transmission)
+            shadow_materials = cycles_webgpu.resolve() / "volume-scatter-shadow-guides-materials.wgsl"
+            if shadow_materials.is_file():
+                shaders.append(shadow_materials)
         volume_guide_shaders = [cycles_webgpu.resolve() / name for name in (
             "volume-scatter-guides.wgsl", "volume-scatter-shadow-guides.wgsl",
             "shade-background-tree-guides-volume.wgsl",
@@ -108,6 +117,10 @@ def package(installation: Path, output: Path, python_process: Path | None = None
         shaders.extend(port / "cycles-webgpu" / name for name in (
             "film.wgsl", "path-state.wgsl", "wavefront-queue.wgsl",
         ))
+        for name in ("film-surface.wgsl", "film-ao.wgsl", "film-ao-prepare.wgsl"):
+            surface_pass = cycles_webgpu.resolve() / name
+            if surface_pass.is_file():
+                shaders.append(surface_pass)
         background = cycles_webgpu.resolve() / "shade-background.wgsl"
         if background.exists():
             shaders.append(background)
@@ -162,6 +175,16 @@ def package(installation: Path, output: Path, python_process: Path | None = None
         for shader in shaders:
             if not shader.is_file() or not shader.stat().st_size:
                 raise ValueError(f"missing or empty Cycles WebGPU shader: {shader}")
+            if shader.name == "adaptive-check.wgsl" or shader.name.startswith((
+                    "wavefront-light", "shade-background", "path-update", "denoise-surface",
+                    "absorption-", "volume-")):
+                if not shader.read_bytes().endswith(b"// Cycles WebGPU render buffer ABI 2\n"):
+                    raise ValueError(f"rebuild Cycles WebGPU shader with the current layout: {shader}")
+            if shader.name.startswith((
+                    "svm-", "wavefront-light", "path-update", "denoise-surface",
+                    "subsurface-compact", "film-surface")):
+                if b"// Cycles WebGPU material layout 7\n" not in shader.read_bytes():
+                    raise ValueError(f"rebuild Cycles WebGPU shader with the current materials: {shader}")
             cycle_preloads.append((shader, f"/cycles-webgpu/{shader.name}"))
 
     oidn_assets = None

@@ -19,6 +19,11 @@ def cases(samples):
                 "transparent_fixture": f"mixed-{mode}", "cycles_samples": samples,
                 "include_pixels": True}
         yield {"id": case_id(case), **case}
+    for mode in ("constant", "linked", "shadow"):
+        case = {"node": "ShaderNodeBsdfDiffuse", "settings": {}, "output": "BSDF",
+                "transparent_fixture": f"principled-alpha-{mode}", "cycles_samples": samples,
+                "include_pixels": True}
+        yield {"id": case_id(case), **case}
 
 
 def main():

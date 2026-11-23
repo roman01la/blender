@@ -312,7 +312,8 @@ bool WebGPUDevice::register_kernel(DeviceKernel kernel,
   if (gpu_failed() || !prepare_gpu()) {
     return false;
   }
-  if (kernel < 0 || kernel >= DEVICE_KERNEL_NUM || code.empty() || entry_point.empty() ||
+  /* Private dispatches follow the stock kernel range. */
+  if (kernel < 0 || kernel > webgpu_svm_ao_textures_kernel || code.empty() || entry_point.empty() ||
       workgroup_size == 0 || workgroup_size > limits_.maxComputeWorkgroupSizeX ||
       workgroup_size > limits_.maxComputeInvocationsPerWorkgroup || bindings.empty() ||
       bindings.size() > DeviceKernelArguments::MAX_ARGS ||
@@ -377,7 +378,10 @@ bool WebGPUDevice::register_kernel(DeviceKernel kernel,
     wgpu::ShaderModuleDescriptor module{};
     module.nextInChain = &source;
     wgpu::ComputePipelineDescriptor descriptor{};
-    descriptor.label = device_kernel_as_string(kernel);
+    descriptor.label = kernel == webgpu_prepare_ao_pass_kernel ? wgpu::StringView("prepare_ao_pass") :
+                       kernel == webgpu_svm_ao_textures_kernel ? wgpu::StringView("svm_ao_textures") :
+                       kernel == DEVICE_KERNEL_NUM ? wgpu::StringView(entry_point) :
+                                                     wgpu::StringView(device_kernel_as_string(kernel));
     descriptor.layout = state.device.CreatePipelineLayout(&pipeline_layout);
     descriptor.compute.module = state.device.CreateShaderModule(&module);
     descriptor.compute.entryPoint = wgpu::StringView(entry_point);
@@ -420,10 +424,16 @@ string WebGPUDevice::record_dispatch(OwnerState &state,
   if (dispatch.indirect && (!indirect || indirect->size() < 3 * sizeof(uint32_t))) {
     return "Cycles WebGPU dispatch has an invalid indirect buffer";
   }
-  if ((!indirect && workgroups > limits_.maxComputeWorkgroupsPerDimension) ||
-      args.count != kernel_pipeline.bindings.size())
+  if ((!indirect &&
+       (workgroups > limits_.maxComputeWorkgroupsPerDimension || dispatch.workgroups_y == 0 ||
+        dispatch.workgroups_y > limits_.maxComputeWorkgroupsPerDimension)) ||
+      (indirect && dispatch.workgroups_y != 1))
   {
     return "Cycles WebGPU dispatch exceeds the pipeline limits";
+  }
+  if (args.count != kernel_pipeline.bindings.size()) {
+    return "Cycles WebGPU dispatch has the wrong number of buffer bindings for kernel " +
+           std::to_string(int(dispatch.kernel));
   }
 
   std::array<wgpu::BindGroupEntry, DeviceKernelArguments::MAX_ARGS> entries;
@@ -459,7 +469,7 @@ string WebGPUDevice::record_dispatch(OwnerState &state,
     pass.DispatchWorkgroupsIndirect(indirect->handle(), 0);
   }
   else {
-    pass.DispatchWorkgroups(uint32_t(workgroups));
+    pass.DispatchWorkgroups(uint32_t(workgroups), dispatch.workgroups_y);
   }
   return {};
 }
@@ -984,6 +994,22 @@ bool device_webgpu_upload(Device &device,
 {
   auto *webgpu = dynamic_cast<WebGPUDevice *>(&device);
   return webgpu && webgpu->upload(buffer, bytes);
+}
+
+bool device_webgpu_upload(Device &device,
+                          const device_memory &buffer,
+                          const size_t byte_offset,
+                          const std::span<const std::byte> bytes)
+{
+  if ((byte_offset | bytes.size()) % sizeof(uint32_t) || byte_offset > buffer.device_size ||
+      bytes.size() > buffer.device_size - byte_offset)
+  {
+    return false;
+  }
+  return device_webgpu_with_buffer(
+      device, buffer, [&](const wgpu::Device &gpu, const wgpu::Buffer &destination) {
+        gpu.GetQueue().WriteBuffer(destination, byte_offset, bytes.data(), bytes.size());
+      });
 }
 
 bool device_webgpu_read(Device &device,

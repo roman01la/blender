@@ -1,0 +1,622 @@
+{
+  "schema": 1,
+  "registries": {
+    "DeviceKernel": {
+      "signature": "714f74fadb5a0ae04181c09c85280aa138d9e1b2aac1929b41d94db9c225fb34",
+      "groups": [
+        {
+          "status": "limited",
+          "note": "The stock scheduler calls WebGPU camera admission or iteration stages for eligible static mesh scenes.",
+          "members": [
+            "DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA", "DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST",
+            "DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE", "DEVICE_KERNEL_INTEGRATOR_SHADE_BACKGROUND",
+            "DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#WebGPURenderPipeline::enqueue_stage",
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#WebGPURenderPipeline::enqueue_camera"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Shadow intersection, next-event estimation, and forward lighting run inside adapted surface dispatches for supported geometry and materials.",
+          "members": [
+            "DEVICE_KERNEL_INTEGRATOR_INTERSECT_SHADOW", "DEVICE_KERNEL_INTEGRATOR_SHADE_LIGHT_NEE",
+            "DEVICE_KERNEL_INTEGRATOR_SHADE_LIGHT_FORWARD"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#wavefront_light_kernel",
+            "web/cycles-webgpu/wavefront_radiance.hlsl#cycles_forward_emission"
+          ]
+        },
+        {
+          "status": "ported",
+          "note": "The three stock adaptive convergence operations have a WebGPU dispatch.",
+          "members": [
+            "DEVICE_KERNEL_ADAPTIVE_SAMPLING_CONVERGENCE_CHECK",
+            "DEVICE_KERNEL_ADAPTIVE_SAMPLING_CONVERGENCE_FILTER_X",
+            "DEVICE_KERNEL_ADAPTIVE_SAMPLING_CONVERGENCE_FILTER_Y"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#WebGPURenderPipeline::adaptive_filter",
+            "web/cycles-webgpu/verify.mjs#CYCLES_WEBGPU_FILM_PASS"
+          ]
+        },
+        {
+          "status": "unsupported",
+          "note": "The render entry point routes baking to the CPU.",
+          "members": [
+            "DEVICE_KERNEL_INTEGRATOR_INIT_FROM_BAKE"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/preview.cpp#camera projection, motion blur, stereo, or baking"
+          ]
+        },
+        {
+          "status": "unsupported",
+          "note": "The tabular surface eligibility guard excludes shadow caustics. The stock MNEE slot is reserved for an unrelated WebGPU dispatch.",
+          "members": [
+            "DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/scene.cpp#shadow caustics turned off",
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#tree_transmission_kernel = DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE"
+          ]
+        },
+        {
+          "status": "native-only",
+          "note": "The stock GPU integrator uses separate wavefront stages. Blender only registers the path-tracing megakernel as a CPU function.",
+          "members": [
+            "DEVICE_KERNEL_INTEGRATOR_MEGAKERNEL"
+          ],
+          "evidence": [
+            "blender/intern/cycles/device/kernel.cpp#bool device_kernel_has_gpu_function"
+          ]
+        },
+        {
+          "status": "internal",
+          "note": "Stock count sentinel or queue bookkeeping state.",
+          "members": [
+            "DEVICE_KERNEL_NUM", "DEVICE_KERNEL_INTEGRATOR_SHADOW_PATH_MNEE_PENDING"
+          ],
+          "evidence": [
+            "blender/intern/cycles/kernel/types.h#DEVICE_GPU_KERNEL_INTEGRATOR_NUM"
+          ]
+        },
+        {
+          "status": "unverified",
+          "note": "The original stock operation still needs a mapping audit. A reused dispatch slot is separate from kernel support.",
+          "members": [
+            "DEVICE_KERNEL_INTEGRATOR_INTERSECT_VOLUME_STACK",
+            "DEVICE_KERNEL_INTEGRATOR_INTERSECT_DEDICATED_LIGHT",
+            "DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE", "DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME",
+            "DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME_RAY_MARCHING",
+            "DEVICE_KERNEL_INTEGRATOR_SHADE_SHADOW", "DEVICE_KERNEL_INTEGRATOR_SHADE_DEDICATED_LIGHT",
+            "DEVICE_KERNEL_INTEGRATOR_QUEUED_PATHS_ARRAY",
+            "DEVICE_KERNEL_INTEGRATOR_QUEUED_SHADOW_PATHS_ARRAY",
+            "DEVICE_KERNEL_INTEGRATOR_ACTIVE_PATHS_ARRAY",
+            "DEVICE_KERNEL_INTEGRATOR_TERMINATED_PATHS_ARRAY",
+            "DEVICE_KERNEL_INTEGRATOR_SORTED_PATHS_ARRAY", "DEVICE_KERNEL_INTEGRATOR_SORT_BUCKET_PASS",
+            "DEVICE_KERNEL_INTEGRATOR_SORT_WRITE_PASS", "DEVICE_KERNEL_INTEGRATOR_COMPACT_PATHS_ARRAY",
+            "DEVICE_KERNEL_INTEGRATOR_COMPACT_STATES",
+            "DEVICE_KERNEL_INTEGRATOR_TERMINATED_SHADOW_PATHS_ARRAY",
+            "DEVICE_KERNEL_INTEGRATOR_COMPACT_SHADOW_PATHS_ARRAY",
+            "DEVICE_KERNEL_INTEGRATOR_COMPACT_SHADOW_STATES", "DEVICE_KERNEL_INTEGRATOR_RESET",
+            "DEVICE_KERNEL_INTEGRATOR_SHADOW_CATCHER_COUNT_POSSIBLE_SPLITS",
+            "DEVICE_KERNEL_SHADER_EVAL_DISPLACE", "DEVICE_KERNEL_SHADER_EVAL_BACKGROUND",
+            "DEVICE_KERNEL_SHADER_EVAL_CURVE_SHADOW_TRANSPARENCY",
+            "DEVICE_KERNEL_SHADER_EVAL_VOLUME_DENSITY", "DEVICE_KERNEL_FILM_CONVERT_DEPTH",
+            "DEVICE_KERNEL_FILM_CONVERT_DEPTH_HALF_RGBA", "DEVICE_KERNEL_FILM_CONVERT_MIST",
+            "DEVICE_KERNEL_FILM_CONVERT_MIST_HALF_RGBA", "DEVICE_KERNEL_FILM_CONVERT_VOLUME_MAJORANT",
+            "DEVICE_KERNEL_FILM_CONVERT_VOLUME_MAJORANT_HALF_RGBA",
+            "DEVICE_KERNEL_FILM_CONVERT_SAMPLE_COUNT",
+            "DEVICE_KERNEL_FILM_CONVERT_SAMPLE_COUNT_HALF_RGBA", "DEVICE_KERNEL_FILM_CONVERT_FLOAT",
+            "DEVICE_KERNEL_FILM_CONVERT_FLOAT_HALF_RGBA", "DEVICE_KERNEL_FILM_CONVERT_LIGHT_PATH",
+            "DEVICE_KERNEL_FILM_CONVERT_LIGHT_PATH_HALF_RGBA", "DEVICE_KERNEL_FILM_CONVERT_RGBE",
+            "DEVICE_KERNEL_FILM_CONVERT_RGBE_HALF_RGBA", "DEVICE_KERNEL_FILM_CONVERT_FLOAT3",
+            "DEVICE_KERNEL_FILM_CONVERT_FLOAT3_HALF_RGBA", "DEVICE_KERNEL_FILM_CONVERT_MOTION",
+            "DEVICE_KERNEL_FILM_CONVERT_MOTION_HALF_RGBA", "DEVICE_KERNEL_FILM_CONVERT_CRYPTOMATTE",
+            "DEVICE_KERNEL_FILM_CONVERT_CRYPTOMATTE_HALF_RGBA",
+            "DEVICE_KERNEL_FILM_CONVERT_SHADOW_CATCHER",
+            "DEVICE_KERNEL_FILM_CONVERT_SHADOW_CATCHER_HALF_RGBA",
+            "DEVICE_KERNEL_FILM_CONVERT_SHADOW_CATCHER_MATTE_WITH_SHADOW",
+            "DEVICE_KERNEL_FILM_CONVERT_SHADOW_CATCHER_MATTE_WITH_SHADOW_HALF_RGBA",
+            "DEVICE_KERNEL_FILM_CONVERT_COMBINED", "DEVICE_KERNEL_FILM_CONVERT_COMBINED_HALF_RGBA",
+            "DEVICE_KERNEL_FILM_CONVERT_FLOAT4", "DEVICE_KERNEL_FILM_CONVERT_FLOAT4_HALF_RGBA",
+            "DEVICE_KERNEL_FILTER_GUIDING_PREPROCESS",
+            "DEVICE_KERNEL_FILTER_GUIDING_PREPROCESS_TO_SURFACE",
+            "DEVICE_KERNEL_FILTER_GUIDING_SET_FAKE_ALBEDO", "DEVICE_KERNEL_FILTER_COLOR_PREPROCESS",
+            "DEVICE_KERNEL_FILTER_COLOR_PREPROCESS_TO_SURFACE", "DEVICE_KERNEL_FILTER_COLOR_POSTPROCESS",
+            "DEVICE_KERNEL_FILTER_COLOR_POSTPROCESS_FROM_SURFACE", "DEVICE_KERNEL_FILTER_COLOR_FLIP_Y",
+            "DEVICE_KERNEL_VOLUME_GUIDING_FILTER_X", "DEVICE_KERNEL_VOLUME_GUIDING_FILTER_Y",
+            "DEVICE_KERNEL_CRYPTOMATTE_POSTPROCESS", "DEVICE_KERNEL_PREFIX_SUM"
+          ]
+        }
+      ]
+    },
+    "ShaderNodeType": {
+      "signature": "812ba2c46538ab00c6550afdad35d9bcb648aa9dc9193b3b9cc68b0b744c7428",
+      "groups": [
+        {
+          "status": "internal",
+          "note": "Bytecode markers and bookkeeping used by the SVM program rather than independent material features.",
+          "members": [
+            "NODE_END", "NODE_SHADER_JUMP", "NODE_NONE", "NODE_PAD1", "NODE_NUM"
+          ],
+          "evidence": [
+            "blender/intern/cycles/kernel/svm/types.h#enum ShaderNodeType"
+          ]
+        },
+        {
+          "status": "ported",
+          "note": "The WebGPU scalar interpreter dispatches these stock value, arithmetic and color routines.",
+          "members": [
+            "NODE_VALUE_F", "NODE_VALUE_V", "NODE_MATH", "NODE_GAMMA", "NODE_BRIGHTCONTRAST", "NODE_HSV",
+            "NODE_INVERT", "NODE_CLAMP", "NODE_MIX_COLOR", "NODE_MIX_FLOAT", "NODE_MIX_VECTOR",
+            "NODE_MIX_VECTOR_NON_UNIFORM", "NODE_COMBINE_COLOR", "NODE_SEPARATE_COLOR"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#case NODE_MATH:"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "The SVM adapter reduces eligible same-normal Lambert mixtures and retains ordered lists for Diffuse and Glossy or Diffuse and Translucent. Ordered isotropic Glossy can be singular or paired with explicit Transparent. The latter can include one explicit Transparent with a varying weight. Standalone nonsingular isotropic GGX and Beckmann can use the separate two-lobe Transparent path. One explicit Transparent closure can also share a material with Emission, preserving dynamic extinction and per-hit emission through camera and sampled triangle shading.",
+          "members": [
+            "NODE_CLOSURE_BSDF", "NODE_CLOSURE_EMISSION", "NODE_CLOSURE_BACKGROUND",
+            "NODE_CLOSURE_SET_WEIGHT", "NODE_CLOSURE_WEIGHT", "NODE_EMISSION_WEIGHT", "NODE_MIX_CLOSURE",
+            "NODE_JUMP_IF_ZERO", "NODE_JUMP_IF_ONE", "NODE_CLOSURE_HOLDOUT"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#case NODE_CLOSURE_BSDF:",
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#webgpu_svm_add_diffuse_lobe",
+            "web/material-tests/check_mixed_principled.py#def check_nested_signals",
+            "web/material-tests/check_principled_translucent.py#def cases",
+            "web/blender-platform/cycles-webgpu/ordered_principled_svm.h#webgpu_svm_capture_principled_branch",
+            "web/material-tests/check_mixed_glossy.py#def ordered_settings",
+            "web/material-tests/check_glossy_transparency.py#def cases",
+            "web/material-tests/check_paper_closures.py#def cases",
+            "web/material-tests/check_ordered_glossy_transparency.py#def cases",
+            "web/material-tests/check_triangle_emitters.py#def transparent_emitter_cases",
+            "blender/intern/cycles/kernel/svm/closure.h#svm_node_mix_closure(",
+            "blender/intern/cycles/kernel/integrator/surface_shader.h#surface_shader_bsdf_bssrdf_pick("
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Eligible main-path surface shaders run stock AO, Bevel, or Raycast through the static BVH adapter. A smaller textured shader handles scenes whose live surface queries only use AO, including Box and Tube projection. The varying transparent-shadow evaluator applies stock no-query outputs. Raycast attributes and bump filter widths are outside the accepted subset.",
+          "members": [
+            "NODE_AMBIENT_OCCLUSION", "NODE_BEVEL", "NODE_RAYCAST"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#node.num_attributes != 0",
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#volume_differential_shaders[queries ? surface_query_kernel : surface_kernel]",
+            "web/blender-platform/cycles-webgpu/svm_materials.h#transparent shadow material needs unsupported ray context",
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#svm-query-ao-textures.wgsl",
+            "blender/intern/cycles/kernel/svm/ao.h#PATH_RAY_VISIBILITY_SHADOW_OPAQUE",
+            "web/material-tests/check_scene_queries.py#def query_cases",
+            "web/material-tests/volume_transport_fixture.py#ao-scatter-bump",
+            "web/material-tests/cycles-webgpu-work-plan.md#| AO with absorption | 0.00000962 |"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "The surface adapter handles selected coordinates, attributes, and differentials. The two-normal record retains the shader-wide displacement normal and one closure-local Bump normal. Standalone Lambert, isotropic GGX, and isotropic Beckmann use it, as does a pair of Lambert and nonsingular isotropic Glossy when both closures share the same Bump. Independent closure-local normals with displacement require a third normal. The area-light Light Tree MIS guard applies to displacement bump.",
+          "members": [
+            "NODE_GEOMETRY", "NODE_GEOMETRY_DERIVATIVE", "NODE_TEX_COORD", "NODE_TEX_COORD_DERIVATIVE",
+            "NODE_ATTR", "NODE_ATTR_DERIVATIVE", "NODE_SET_BUMP", "NODE_CLOSURE_SET_NORMAL",
+            "NODE_DISPLACEMENT", "NODE_NORMAL_MAP", "NODE_TANGENT", "NODE_WIREFRAME"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#case NODE_SET_BUMP:",
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#webgpu_svm_save_paired_normal",
+            "web/material-tests/check_mixed_glossy.py#def check_signals",
+            "web/material-tests/check_mixed_glossy.py#def displacement_settings",
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#const bool lambert_bump",
+            "web/material-tests/check_mixed_glossy.py#def mixed_displacement_settings",
+            "blender/intern/cycles/kernel/svm/closure.h#svm_node_set_normal(",
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#case NODE_TEX_COORD_DERIVATIVE:"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "For eligible meshes with true displacement and bump, stock scene sync displaces the geometry before BVH construction. The GPU surface evaluator restores undisplaced position, normal, and derivatives only for residual bump evaluation and restores the hit position afterward. Tests cover smooth and flat normals, plus true-only and bump-only controls.",
+          "members": [
+            "NODE_ENTER_BUMP_EVAL", "NODE_LEAVE_BUMP_EVAL"
+          ],
+          "evidence": [
+            "blender/intern/cycles/kernel/svm/bump.h#svm_node_enter_bump_eval(",
+            "web/blender-platform/cycles-webgpu/displacement_bump_svm.h#webgpu_svm_enter_displacement_bump(",
+            "web/material-tests/check_both_displacement.py#def main"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Selected image, procedural and mapping modes dispatch through the compiled SVM variants. Regular RGBA textures admit BYTE4, FLOAT4, and USHORT4. External 16-bit RGBA textures use stock normalization before GPU filtering. The varying transparent shadow evaluator admits cubic filtering for eligible flat images. The mixed light path evaluates eligible mapped, color-processed floating-point environments with stock importance sampling.",
+          "members": [
+            "NODE_TEX_IMAGE", "NODE_TEX_IMAGE_BOX", "NODE_TEX_ENVIRONMENT", "NODE_TEX_SKY",
+            "NODE_TEX_NOISE", "NODE_TEX_GABOR", "NODE_TEX_VORONOI", "NODE_MAPPING",
+            "NODE_TEXTURE_MAPPING"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#case NODE_TEX_IMAGE:",
+            "web/blender-platform/cycles-webgpu/svm_materials.h#IMAGE_DATA_TYPE_USHORT4",
+            "blender/intern/cycles/kernel/util/image.h#read(ushort4 r)",
+            "web/material-tests/check_glossy_transparency.py#def signals",
+            "web/material-tests/check_ordered_glossy_transparency.py#def cases",
+            "web/blender-platform/cycles-webgpu/svm_world_eval.h#webgpu_svm_eval_world(",
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#case NODE_TEX_VORONOI:"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Volume bytecode is decoded into eligible homogeneous media or supported grids. The volume program has its own feature mask. Focused AO and Raycast comparisons exercise separate main-path surface queries alongside eligible volume stages.",
+          "members": [
+            "NODE_CLOSURE_VOLUME", "NODE_VOLUME_COEFFICIENTS", "NODE_PRINCIPLED_VOLUME"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_materials.h#case NODE_PRINCIPLED_VOLUME:",
+            "blender/intern/cycles/kernel/features.h#KERNEL_FEATURE_NODE_MASK_VOLUME"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "The film adapter handles eligible AOVs and layouts.",
+          "members": [
+            "NODE_AOV_START", "NODE_AOV_COLOR", "NODE_AOV_VALUE"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#case NODE_AOV_COLOR:",
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#contiguous film AOV passes"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Uses the stock Light Falloff node for eligible analytic lamp shaders. A constant emission color and direct Falloff strength input with constant Strength and Smooth are supported on Point, Area, and the supported flat Sun path. Surface direct sampling and forward hits use their stock ray lengths. Volume sampling supports threshold zero.",
+          "members": [
+            "NODE_LIGHT_FALLOFF"
+          ],
+          "evidence": [
+            "blender/intern/cycles/kernel/svm/light_path.h#svm_node_light_falloff(",
+            "web/blender-platform/cycles-webgpu/scene.cpp#pack_lamp_falloff(",
+            "web/material-tests/check_light_falloff.py#def light_settings"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "On eligible analytic lamps, Ray Length can drive a normalized Smootherstep emission mix through a constant divisor. The direct-light stage supplies the sampled shadow length and the forward stage supplies the hit distance. Other outputs and graph combinations require additional coverage.",
+          "members": [
+            "NODE_LIGHT_PATH"
+          ],
+          "evidence": [
+            "blender/intern/cycles/kernel/svm/light_path.h#svm_node_light_path(",
+            "web/blender-platform/cycles-webgpu/scene.cpp#pack_lamp_ray_length(",
+            "web/material-tests/check_light_falloff.py#def ray_length_settings"
+          ]
+        },
+        {
+          "status": "unverified",
+          "note": "This opcode still needs a source-path audit and a scoped GPU fixture.",
+          "members": [
+            "NODE_CONVERT", "NODE_CONVERT_DERIVATIVE", "NODE_VALUE_F_DERIVATIVE",
+            "NODE_VALUE_V_DERIVATIVE", "NODE_SET_DISPLACEMENT", "NODE_VECTOR_DISPLACEMENT",
+            "NODE_TEX_IMAGE_DERIVATIVE", "NODE_TEX_IMAGE_BOX_DERIVATIVE",
+            "NODE_FRESNEL", "NODE_LAYER_WEIGHT", "NODE_BOOLEAN_MATH",
+            "NODE_INTEGER_MATH", "NODE_VECTOR_MATH", "NODE_VECTOR_MATH_DERIVATIVE", "NODE_RGB_RAMP",
+            "NODE_OBJECT_INFO", "NODE_PARTICLE_INFO", "NODE_HAIR_INFO",
+            "NODE_POINT_INFO", "NODE_TEXTURE_MAPPING_DERIVATIVE", "NODE_MAPPING_DERIVATIVE",
+            "NODE_MIN_MAX", "NODE_CAMERA", "NODE_TEX_ENVIRONMENT_DERIVATIVE", "NODE_TEX_GRADIENT",
+            "NODE_TEX_WAVE", "NODE_TEX_MAGIC", "NODE_TEX_CHECKER", "NODE_TEX_BRICK",
+            "NODE_TEX_WHITE_NOISE", "NODE_NORMAL", "NODE_IES", "NODE_CURVES",
+            "NODE_TANGENT_DERIVATIVE", "NODE_RADIAL_TILING", "NODE_MIX", "NODE_SEPARATE_VECTOR",
+            "NODE_SEPARATE_VECTOR_DERIVATIVE", "NODE_COMBINE_VECTOR", "NODE_COMBINE_VECTOR_DERIVATIVE",
+            "NODE_GET_VECTOR_COMPONENT", "NODE_GET_VECTOR_COMPONENT_DERIVATIVE", "NODE_VECTOR_ROTATE",
+            "NODE_VECTOR_TRANSFORM", "NODE_WAVELENGTH", "NODE_BLACKBODY", "NODE_MAP_RANGE",
+            "NODE_VECTOR_MAP_RANGE", "NODE_FLOAT_CURVE", "NODE_SCENE_TIME"
+          ]
+        }
+      ]
+    },
+    "ClosureType": {
+      "signature": "3b04079a2658efe731b1b8954c9bc3759afd5508146e8ad721d30a07b5d3eda7",
+      "groups": [
+        {
+          "status": "internal",
+          "note": "Stock type markers and the closure count sentinel.",
+          "members": [
+            "CLOSURE_NONE_ID", "CLOSURE_BSDF_ID", "CLOSURE_VOLUME_ID", "NBUILTIN_CLOSURES"
+          ],
+          "evidence": [
+            "blender/intern/cycles/kernel/svm/types.h#enum ClosureType"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Implemented surface closure paths reuse stock evaluation and sampling. Up to four ordered records can carry Diffuse and isotropic GGX or Beckmann Glossy, or Lambert Diffuse and Translucent with at most one explicit Transparent. The latter keeps image-driven Bump normals and varying shadow extinction. Stock transparent bounce limits are retained with differential and volume metadata. Standalone Glossy supports displacement with a local Bump, or one Transparent lobe. A Lambert and isotropic Glossy pair can combine displacement with a shared Bump using two unfiltered closure slots on a surface without a volume boundary. A mix reduced to Lambert uses the same normals with one slot.",
+          "members": [
+            "CLOSURE_BSDF_DIFFUSE_ID", "CLOSURE_BSDF_SHEEN_ID", "CLOSURE_BSDF_DIFFUSE_TOON_ID",
+            "CLOSURE_BSDF_GLOSSY_TOON_ID", "CLOSURE_BSDF_TRANSLUCENT_ID",
+            "CLOSURE_BSDF_PHYSICAL_CONDUCTOR", "CLOSURE_BSDF_F82_CONDUCTOR",
+            "CLOSURE_BSDF_MICROFACET_GGX_ID", "CLOSURE_BSDF_MICROFACET_BECKMANN_ID",
+            "CLOSURE_BSDF_MICROFACET_MULTI_GGX_ID", "CLOSURE_BSDF_ASHIKHMIN_SHIRLEY_ID",
+            "CLOSURE_BSDF_ASHIKHMIN_VELVET_ID", "CLOSURE_BSDF_MICROFACET_BECKMANN_REFRACTION_ID",
+            "CLOSURE_BSDF_MICROFACET_GGX_REFRACTION_ID", "CLOSURE_BSDF_MICROFACET_BECKMANN_GLASS_ID",
+            "CLOSURE_BSDF_MICROFACET_GGX_GLASS_ID", "CLOSURE_BSDF_MICROFACET_MULTI_GGX_GLASS_ID",
+            "CLOSURE_BSDF_RAY_PORTAL_ID", "CLOSURE_BSDF_TRANSPARENT_ID", "CLOSURE_HOLDOUT_ID"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#case NODE_CLOSURE_BSDF:",
+            "web/cycles-webgpu/ggx_kernels.cc#cycles_standalone_sample",
+            "web/cycles-webgpu/ggx_closures.h#cycles_mixed_glossy_bump",
+            "web/cycles-webgpu/ggx_kernels.cc#sample_ordered_closures",
+            "web/material-tests/check_mixed_glossy.py#def ordered_settings",
+            "web/material-tests/check_mixed_glossy.py#def displacement_settings",
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#const bool lambert_bump",
+            "web/material-tests/check_mixed_glossy.py#def mixed_displacement_settings",
+            "web/cycles-webgpu/camera_kernels.cc#sample_mixed_transparent(",
+            "web/material-tests/check_glossy_transparency.py#def cases",
+            "web/blender-platform/cycles-webgpu/svm_materials.h#webgpu_shadow_bump_only_scattering_normals",
+            "web/blender-platform/cycles-webgpu/preview.cpp#const uint32_t transparent_min = transparent ?",
+            "web/material-tests/check_volume_transport.py#transparent volume film",
+            "web/material-tests/check_paper_closures.py#def cases"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Eligible Principled surfaces run through stock closure routines. Opaque Lambert-only mixtures can share the shading normal and closure budget. A compact reflective Principled branch with varying alpha can add independent Translucent. An ordered opaque pair retains independent normals, anisotropic dielectric or isotropic metallic reflection, and white Coat or eligible white Sheen. The single opaque isotropic path supports white Coat over Legacy Random Walk and uses the stock Coat albedo table for eligible camera and sampled emission.",
+          "members": [
+            "CLOSURE_BSDF_PRINCIPLED_ID"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#webgpu_svm_is_diffuse_principled",
+            "web/blender-platform/cycles-webgpu/svm_materials.h#decoded.diffuse_principled_lobes) > dscene.data.max_closures",
+            "web/material-tests/check_mixed_principled.py#def check_nested_signals",
+            "blender/intern/cycles/kernel/closure/bsdf_microfacet.h#bsdf_coat_setup(",
+            "web/cycles-webgpu/ggx_kernels.cc#setup_compact_white_coat(",
+            "web/cycles-webgpu/ordered_principled.h#sample_ordered_principled(",
+            "web/material-tests/check_two_principled.py#--metallic-only",
+            "web/material-tests/check_triangle_emitters.py#--coated-emission"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Stock hair closure evaluation and sampling on eligible mesh geometry. Curve geometry has a separate traversal restriction.",
+          "members": [
+            "CLOSURE_BSDF_HAIR_REFLECTION_ID", "CLOSURE_BSDF_HAIR_TRANSMISSION_ID",
+            "CLOSURE_BSDF_HAIR_CHIANG_ID", "CLOSURE_BSDF_HAIR_HUANG_ID"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#CLOSURE_BSDF_HAIR_HUANG_ID",
+            "web/blender-platform/cycles-webgpu/scene.cpp#bvh.have_curves"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Stock Christensen–Burley and random-walk algorithms run in the compact subsurface stage. Closure combinations and geometry remain subject to scene checks.",
+          "members": [
+            "CLOSURE_BSSRDF_BURLEY_ID", "CLOSURE_BSSRDF_RANDOM_WALK_ID",
+            "CLOSURE_BSSRDF_RANDOM_WALK_LEGACY_ID", "CLOSURE_BSSRDF_RANDOM_WALK_SKIN_ID"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#webgpu_svm_subsurface(",
+            "web/cycles-webgpu/subsurface_compact_dispatch.hlsl#cycles_subsurface_walk"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Volume absorption and stock phase evaluation run for screened volume materials and supported interpolation.",
+          "members": [
+            "CLOSURE_VOLUME_ABSORPTION_ID", "CLOSURE_VOLUME_HENYEY_GREENSTEIN_ID",
+            "CLOSURE_VOLUME_MIE_ID", "CLOSURE_VOLUME_FOURNIER_FORAND_ID", "CLOSURE_VOLUME_RAYLEIGH_ID",
+            "CLOSURE_VOLUME_DRAINE_ID"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_materials.h#phase >= CLOSURE_VOLUME_HENYEY_GREENSTEIN_ID",
+            "web/blender-platform/cycles-webgpu/scene.cpp#supported volume closures and grid attribute inputs"
+          ]
+        },
+        {
+          "status": "unverified",
+          "note": "The stock closure still needs an explicit adapter and backend verification audit.",
+          "members": [
+            "CLOSURE_BSDF_OREN_NAYAR_ID", "CLOSURE_BSDF_ROUGH_TRANSLUCENT_ID", "CLOSURE_BSDF_BURLEY_ID",
+            "CLOSURE_BSDF_DIFFUSE_RAMP_ID", "CLOSURE_BSDF_PHONG_RAMP_ID",
+            "CLOSURE_BSDF_THIN_GLASS_TRANSMISSION_ID"
+          ]
+        }
+      ]
+    },
+    "PassType": {
+      "signature": "4a8ed43f23d252c29816eae67243488b8e4bdbafea137835474cba105068f50a",
+      "groups": [
+        {
+          "status": "internal",
+          "note": "Stock pass category delimiters and count sentinel.",
+          "members": [
+            "PASS_NONE", "PASS_CATEGORY_LIGHT_END", "PASS_CATEGORY_DATA_END",
+            "PASS_CATEGORY_DENOISING_END", "PASS_CATEGORY_BAKE_END", "PASS_NUM"
+          ],
+          "evidence": [
+            "blender/intern/cycles/kernel/types.h#enum PassType"
+          ]
+        },
+        {
+          "status": "ported",
+          "note": "Combined is generated in the resident film. The film verifier checks accumulation and resolution.",
+          "members": [
+            "PASS_COMBINED"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/preview.cpp#bool supports_passes",
+            "web/cycles-webgpu/film-test.mjs#accumulate_render_buffer"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Available noisy film or guide passes with per-material, layout, and lighting constraints. The surface AO pass reuses varying SVM shadow traversal in nonvolume scenes. Depth and other geometry outputs can process eligible mixed surface and volume boundaries. Volume-only boundaries and scattering events do not produce a geometry hit.",
+          "members": [
+            "PASS_EMISSION", "PASS_AO", "PASS_DIFFUSE_DIRECT", "PASS_DIFFUSE_INDIRECT",
+            "PASS_GLOSSY_DIRECT", "PASS_GLOSSY_INDIRECT", "PASS_TRANSMISSION_DIRECT",
+            "PASS_TRANSMISSION_INDIRECT", "PASS_DEPTH", "PASS_POSITION", "PASS_NORMAL", "PASS_OBJECT_ID",
+            "PASS_MATERIAL_ID", "PASS_AOV_COLOR", "PASS_AOV_VALUE", "PASS_ADAPTIVE_AUX_BUFFER",
+            "PASS_SAMPLE_COUNT", "PASS_DIFFUSE_COLOR", "PASS_GLOSSY_COLOR", "PASS_TRANSMISSION_COLOR",
+            "PASS_DENOISING_ALBEDO", "PASS_DENOISING_NORMAL"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/preview.cpp#bool supports_passes",
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#light_passes =",
+            "web/cycles-webgpu/film.wgsl#Cycles WebGPU volume geometry passes",
+            "web/cycles-webgpu/bvh2_dispatch.hlsl#CYCLES_WEBGPU_SHADOW_AO_PASS",
+            "web/material-tests/check_film_ao.py#def cases"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "These volume-only auxiliary passes have separate eligibility.",
+          "members": [
+            "PASS_VOLUME_SCATTER", "PASS_VOLUME_TRANSMIT", "PASS_VOLUME_MAJORANT",
+            "PASS_VOLUME_MAJORANT_SAMPLE_COUNT"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/preview.cpp#bool volume_auxiliary_pass",
+            "blender/intern/cycles/scene/pass.cpp#bool is_volume_guiding_pass"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Stock pass access combines the supported direct and indirect lobe buffers.",
+          "members": [
+            "PASS_DIFFUSE", "PASS_GLOSSY", "PASS_TRANSMISSION"
+          ],
+          "evidence": [
+            "blender/intern/cycles/scene/pass.cpp#pass_info.direct_type = PASS_DIFFUSE_DIRECT",
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#light_passes =",
+            "web/cycles-webgpu/bvh2_dispatch.hlsl#CYCLES_WEBGPU_SHADOW_AO_PASS",
+            "web/material-tests/check_film_ao.py#def cases"
+          ]
+        },
+        {
+          "status": "unsupported",
+          "note": "These outputs lack a WebGPU film buffer route. The admission check screens their required buffers.",
+          "members": [
+            "PASS_BACKGROUND", "PASS_VOLUME", "PASS_VOLUME_DIRECT", "PASS_VOLUME_INDIRECT",
+            "PASS_ROUGHNESS", "PASS_UV", "PASS_MOTION", "PASS_MOTION_WEIGHT", "PASS_CRYPTOMATTE",
+            "PASS_MIST", "PASS_RENDER_TIME", "PASS_SHADOW_CATCHER", "PASS_SHADOW_CATCHER_SAMPLE_COUNT",
+            "PASS_SHADOW_CATCHER_MATTE", "PASS_GUIDING_COLOR", "PASS_GUIDING_PROBABILITY",
+            "PASS_GUIDING_AVG_ROUGHNESS", "PASS_DENOISING_SPECULAR_ALBEDO", "PASS_DENOISING_ROUGHNESS",
+            "PASS_DENOISING_DEPTH", "PASS_DENOISING_BACKWARD_MOTION", "PASS_DENOISING_SPECULAR_MOTION",
+            "PASS_BAKE_PRIMITIVE", "PASS_BAKE_SEED", "PASS_BAKE_DIFFERENTIAL", "PASS_DENOISING_PREVIOUS"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/preview.cpp#bool supports_passes"
+          ]
+        }
+      ]
+    },
+    "KernelFeature": {
+      "signature": "4a226679c9e95b6dc718f8c5a47b53ac2a91e67edd2a873e9451b544050a545c",
+      "groups": [
+        {
+          "status": "internal",
+          "note": "Stock masks group existing feature bits and add no independent capability.",
+          "members": [
+            "KERNEL_FEATURE_HAIR", "KERNEL_FEATURE_AO", "KERNEL_FEATURE_NODE_MASK_SURFACE_LIGHT",
+            "KERNEL_FEATURE_NODE_MASK_SURFACE_BACKGROUND", "KERNEL_FEATURE_NODE_MASK_SURFACE_SHADOW",
+            "KERNEL_FEATURE_NODE_MASK_SURFACE", "KERNEL_FEATURE_NODE_MASK_VOLUME",
+            "KERNEL_FEATURE_NODE_MASK_DISPLACEMENT", "KERNEL_FEATURE_NODE_MASK_BUMP"
+          ],
+          "evidence": [
+            "blender/intern/cycles/kernel/features.h#KERNEL_FEATURE_NODE_MASK_SURFACE_LIGHT"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "Eligible SVM features run through the stock-code adapters and packed material records.",
+          "members": [
+            "KERNEL_FEATURE_NODE_BSDF", "KERNEL_FEATURE_NODE_EMISSION",
+            "KERNEL_FEATURE_NODE_BUMP", "KERNEL_FEATURE_NODE_VORONOI_EXTRA",
+            "KERNEL_FEATURE_NODE_AOV", "KERNEL_FEATURE_NODE_LIGHT_PATH",
+            "KERNEL_FEATURE_NODE_PRINCIPLED_HAIR", "KERNEL_FEATURE_NODE_PORTAL"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/svm_material_eval.h#case NODE_CLOSURE_BSDF:",
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#prepare_svm("
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "The main surface path binds the BVH and reads the original triangle intersection from a query-hit tail. AO and Raycast have focused comparisons with eligible volume transport. Other volume combinations and varying transparent-shadow queries have separate boundaries.",
+          "members": [
+            "KERNEL_FEATURE_NODE_RAYTRACE"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#queries ? surface_query_kernel : surface_kernel",
+            "web/cycles-webgpu/svm_dispatch.hlsl#uint cycles_svm_hit_word",
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#volume_differential_shaders[queries ? surface_query_kernel : surface_kernel]",
+            "blender/intern/cycles/kernel/features.h#KERNEL_FEATURE_NODE_MASK_SURFACE_SHADOW"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "The stock-code adapters handle eligible absorption, homogeneous scattering, and grid media with a separate volume state buffer. Scene admission limits the volume geometry, lighting, and compatible surface features.",
+          "members": [
+            "KERNEL_FEATURE_NODE_VOLUME", "KERNEL_FEATURE_VOLUME"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/scene.cpp#unhandled_volume_materials",
+            "web/blender-platform/cycles-webgpu/volume_layout.h#CYCLES_WEBGPU_VOLUME_STATE_WORDS",
+            "web/cycles-webgpu/volume_scatter_dispatch.hlsl#CYCLES_WEBGPU_VOLUME_SCATTER_HIT"
+          ]
+        },
+        {
+          "status": "limited",
+          "note": "The stock scheduler traces eligible scenes with mesh BVH2, supported light-tree emitters, and supported film passes.",
+          "members": [
+            "KERNEL_FEATURE_PATH_TRACING", "KERNEL_FEATURE_SUBSURFACE",
+            "KERNEL_FEATURE_TRANSPARENT", "KERNEL_FEATURE_LIGHT_PASSES", "KERNEL_FEATURE_AO_PASS",
+            "KERNEL_FEATURE_DENOISING", "KERNEL_FEATURE_LIGHT_TREE"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/scene.cpp#scene_incompatibility(",
+            "web/blender-platform/cycles-webgpu/pipeline.cpp#WebGPURenderPipeline::enqueue_stage"
+          ]
+        },
+        {
+          "status": "unsupported",
+          "note": "The WebGPU traversal path requires static triangle BVH2 geometry and SVM shading.",
+          "members": [
+            "KERNEL_FEATURE_POINTCLOUD", "KERNEL_FEATURE_HAIR_RIBBON", "KERNEL_FEATURE_HAIR_THICK",
+            "KERNEL_FEATURE_OBJECT_MOTION", "KERNEL_FEATURE_OSL_SHADING"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/scene.cpp#WebGPU Cycles needs a static triangle BVH2 and SVM materials"
+          ]
+        },
+        {
+          "status": "unsupported",
+          "note": "The source explicitly routes these modes to CPU through camera, geometry, lighting, or integrator eligibility checks.",
+          "members": [
+            "KERNEL_FEATURE_BAKING", "KERNEL_FEATURE_SHADOW_CATCHER", "KERNEL_FEATURE_AO_ADDITIVE",
+            "KERNEL_FEATURE_PATH_GUIDING", "KERNEL_FEATURE_LIGHT_LINKING",
+            "KERNEL_FEATURE_SHADOW_LINKING"
+          ],
+          "evidence": [
+            "web/blender-platform/cycles-webgpu/preview.cpp#camera projection, motion blur, stereo, or baking",
+            "web/blender-platform/cycles-webgpu/scene.cpp#holdouts, or shadow catchers",
+            "web/blender-platform/cycles-webgpu/scene.cpp#Fast GI ambient occlusion disabled",
+            "web/blender-platform/cycles-webgpu/scene.cpp#path guiding turned off",
+            "web/blender-platform/cycles-webgpu/scene.cpp#does not support light or shadow linking"
+          ]
+        },
+        {
+          "status": "unverified",
+          "note": "The stock feature bit still needs an explicit WebGPU capability audit.",
+          "members": [
+            "KERNEL_FEATURE_NODE_BUMP_STATE", "KERNEL_FEATURE_MNEE", "KERNEL_FEATURE_OSL_CAMERA",
+            "KERNEL_FEATURE_GSPLATS"
+          ]
+        }
+      ]
+    }
+  }
+}

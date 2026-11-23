@@ -5,6 +5,7 @@
 #include "device/cpu/device_impl.h"
 #include "device/webgpu/svm_material_eval.h"
 #include "device/webgpu/volume_layout.h"
+#include "kernel/closure/bsdf_microfacet.h"
 #include "kernel/constants.h"
 #include "scene/mesh.h"
 #include "scene/object.h"
@@ -30,6 +31,13 @@ struct WebGPUSvmImage {
   {
     if (info.data_type == IMAGE_DATA_TYPE_BYTE4) {
       return color_uchar4_to_float4(reinterpret_cast<const uchar4 *>(uintptr_t(info.data))[index]);
+    }
+    if (info.data_type == IMAGE_DATA_TYPE_USHORT4) {
+      /* Match stock ImageInterpolator<ushort4>::read before filtering. */
+      const ushort4 rgba = reinterpret_cast<const ushort4 *>(uintptr_t(info.data))[index];
+      constexpr float normalize = 1.0f / 65535.0f;
+      return make_float4(
+          rgba.x * normalize, rgba.y * normalize, rgba.z * normalize, rgba.w * normalize);
     }
     return reinterpret_cast<const float4 *>(uintptr_t(info.data))[index];
   }
@@ -57,7 +65,8 @@ inline bool cycles_webgpu_svm_image_info(const Scene &scene, int id, KernelImage
 
   result = images.data()[texture.image_info_id];
   return result.data &&
-         (result.data_type == IMAGE_DATA_TYPE_FLOAT4 || result.data_type == IMAGE_DATA_TYPE_BYTE4) &&
+         (result.data_type == IMAGE_DATA_TYPE_FLOAT4 || result.data_type == IMAGE_DATA_TYPE_BYTE4 ||
+          result.data_type == IMAGE_DATA_TYPE_USHORT4) &&
          (result.interpolation == INTERPOLATION_CLOSEST ||
           result.interpolation == INTERPOLATION_LINEAR ||
           webgpu_svm_uses_cubic_filter(result.interpolation)) &&
@@ -296,14 +305,41 @@ inline bool cycles_webgpu_svm_synthetic_record(const DeviceScene &dscene,
   const uint object_flag = dscene.object_flag.data()[object];
   const packed_uint3 vertices = dscene.tri_vindex.data()[prim];
   std::array<float3, 3> corners;
+  bool original_normal = false;
   uint header;
-  if (kind == WEBGPU_SVM_SLOT_SMOOTH_NORMAL) {
+  if (kind == WEBGPU_SVM_SLOT_SMOOTH_NORMAL || kind == WEBGPU_SVM_SLOT_ORIGINAL_NORMAL) {
+    AttributeMap original;
+    if (kind == WEBGPU_SVM_SLOT_ORIGINAL_NORMAL) {
+      const auto lookup = cycles_webgpu_svm_find_attribute(
+          dscene, object, ATTR_STD_NORMAL_UNDISPLACED, original);
+      if (lookup == WebGPUSvmAttributeLookup::Unreadable) {
+        return false;
+      }
+      original_normal = lookup == WebGPUSvmAttributeLookup::Found;
+    }
     /* triangle_smooth_normal_unnormalized_object_space() */
+    const bool per_corner = original_normal ? (original.element & ATTR_ELEMENT_CORNER) != 0 :
+                                              (object_flag & SD_OBJECT_HAS_CORNER_NORMALS) != 0;
+    if (original_normal && (original.type != NODE_ATTR_FLOAT3 ||
+                            (original.element & (ATTR_ELEMENT_VERTEX | ATTR_ELEMENT_CORNER)) == 0))
+    {
+      return false;
+    }
     const std::array<int64_t, 3> indices =
-        (object_flag & SD_OBJECT_HAS_CORNER_NORMALS) ?
+        per_corner ?
             std::array<int64_t, 3>{int64_t(prim) * 3, int64_t(prim) * 3 + 1, int64_t(prim) * 3 + 2} :
             std::array<int64_t, 3>{vertices.x, vertices.y, vertices.z};
     for (size_t corner = 0; corner < 3; ++corner) {
+      if (original_normal) {
+        float4 value;
+        if (!cycles_webgpu_svm_fetch_attribute(
+                dscene, original, int64_t(original.offset) + indices[corner], value))
+        {
+          return false;
+        }
+        corners[corner] = make_float3(value);
+        continue;
+      }
       const int64_t index = int64_t(kobject.mesh_volume.normal_offset) + indices[corner];
       if (index < 0 || size_t(index) >= dscene.attributes_normal.size()) {
         return false;
@@ -341,6 +377,7 @@ inline bool cycles_webgpu_svm_synthetic_record(const DeviceScene &dscene,
     record[1 + 4 * corner] = std::bit_cast<uint32_t>(corners[corner].x);
     record[2 + 4 * corner] = std::bit_cast<uint32_t>(corners[corner].y);
     record[3 + 4 * corner] = std::bit_cast<uint32_t>(corners[corner].z);
+    record[4 + 4 * corner] = std::bit_cast<uint32_t>(float(original_normal));
   }
   return true;
 }
@@ -376,7 +413,8 @@ inline bool cycles_webgpu_svm_attribute_records(const Scene &scene,
                   dscene, object->get_device_index(), prim, kind, record))
           {
             /* Flat triangles do not read the smooth normals. */
-            if (kind != WEBGPU_SVM_SLOT_SMOOTH_NORMAL ||
+            if ((kind != WEBGPU_SVM_SLOT_SMOOTH_NORMAL &&
+                 kind != WEBGPU_SVM_SLOT_ORIGINAL_NORMAL) ||
                 (dscene.tri_shader.data()[prim] & SHADER_SMOOTH_NORMAL))
             {
               return false;
@@ -482,9 +520,13 @@ struct WebGPUSvmSceneHost : WebGPUSvmPackedHost {
   std::vector<uint64_t> *slots;
   std::vector<uint> *slot_types;
   std::vector<uint2> *slot_words;
+  std::vector<uint2> *displacement_words;
   uint2 *last_node;
   bool *uses_ies;
   bool *uses_shadow_path_context;
+  bool *uses_shadow_query_defaults;
+  bool *has_ao_query;
+  bool *has_general_query;
 
   bool ies(const uint slot, const float /*h_angle*/, const float /*v_angle*/, float &value) const
   {
@@ -515,8 +557,20 @@ struct WebGPUSvmSceneHost : WebGPUSvmPackedHost {
   void visit(const uint type, const uint word) const
   {
     *last_node = make_uint2(type, word);
-    *uses_shadow_path_context |= type == NODE_LIGHT_PATH || type == NODE_AMBIENT_OCCLUSION ||
-                                 type == NODE_RAYCAST || type == NODE_BEVEL;
+    *has_ao_query |= type == NODE_AMBIENT_OCCLUSION;
+    *has_general_query |= type == NODE_RAYCAST || type == NODE_BEVEL;
+    *uses_shadow_query_defaults |= type == NODE_AMBIENT_OCCLUSION || type == NODE_RAYCAST ||
+                                   type == NODE_BEVEL;
+    if (type == NODE_LIGHT_PATH) {
+      /* Shadow shading already supplies Blender's shadow visibility, geometric
+       * backfacing, and ray hit length. Bounce queries need more path state. */
+      const auto fetch = [&](const uint index) { return uint(dscene->svm_nodes.data()[index]); };
+      uint offset = word + 1;
+      SVMNodeLightPath node;
+      *uses_shadow_path_context |= !webgpu_svm_read(
+                                       fetch, offset, uint(dscene->svm_nodes.size()), node) ||
+                                   node.path_type >= NODE_LP_ray_depth;
+    }
   }
 
   int attribute(const uint word, const int attr) const
@@ -550,20 +604,21 @@ struct WebGPUSvmSceneHost : WebGPUSvmPackedHost {
     return int(webgpu_svm_attribute_slot | index);
   }
 
-  int synthetic(const uint word, const int packed, const WebGPUSvmSyntheticSlot kind) const
+  int synthetic(const uint word, const int packed, WebGPUSvmSyntheticSlot kind) const
   {
     if (objects->empty()) {
       return -1;
     }
     if (kind == WEBGPU_SVM_SLOT_SMOOTH_NORMAL && packed) {
-      /* Normal Map's Original base reads undisplaced normals when present. */
       for (const int object : *objects) {
         AttributeMap desc;
-        if (cycles_webgpu_svm_find_attribute(
-                *dscene, object, ATTR_STD_NORMAL_UNDISPLACED, desc) !=
-            WebGPUSvmAttributeLookup::Missing)
-        {
+        const auto lookup = cycles_webgpu_svm_find_attribute(
+            *dscene, object, ATTR_STD_NORMAL_UNDISPLACED, desc);
+        if (lookup == WebGPUSvmAttributeLookup::Unreadable) {
           return -1;
+        }
+        if (lookup == WebGPUSvmAttributeLookup::Found) {
+          kind = WEBGPU_SVM_SLOT_ORIGINAL_NORMAL;
         }
       }
     }
@@ -575,7 +630,52 @@ struct WebGPUSvmSceneHost : WebGPUSvmPackedHost {
     return int(webgpu_svm_attribute_slot | index);
   }
 
-  bool attribute_sample(const uint slot, WebGPUSvmAttributeSample &sample) const
+  uint displacement_bump_slots(const uint word, const uint packed) const
+  {
+    const auto slot = [&](const AttributeStandard attr, const bool required, uint &index) {
+      bool found = false;
+      for (const int object : *objects) {
+        AttributeMap desc;
+        const auto lookup = cycles_webgpu_svm_find_attribute(*dscene, object, attr, desc);
+        if (lookup == WebGPUSvmAttributeLookup::Unreadable ||
+            (required && lookup != WebGPUSvmAttributeLookup::Found))
+        {
+          return false;
+        }
+        if (lookup == WebGPUSvmAttributeLookup::Found) {
+          const uint elements = required ? ATTR_ELEMENT_VERTEX :
+                                           (ATTR_ELEMENT_VERTEX | ATTR_ELEMENT_CORNER);
+          if (desc.type != NODE_ATTR_FLOAT3 || (desc.element & elements) == 0 ||
+              (desc.element & ATTR_ELEMENT_IS_MOTION) != 0)
+          {
+            return false;
+          }
+          found = true;
+        }
+      }
+      index = 0u;
+      if (found && !slot_index(attr, NODE_ATTR_FLOAT3, index)) {
+        return false;
+      }
+      index += uint(found); /* zero means absent */
+      return !required || found;
+    };
+    uint positions, normals;
+    if (!slot(ATTR_STD_POSITION_UNDISPLACED, true, positions) ||
+        !slot(ATTR_STD_NORMAL_UNDISPLACED, false, normals))
+    {
+      return 0u;
+    }
+    const uint context = (packed & 0xffu) | (positions << 8u) | (normals << 16u);
+    displacement_words->push_back(make_uint2(word, context));
+    return context;
+  }
+
+  bool attribute_sample(const uint slot,
+                        WebGPUSvmAttributeSample &sample,
+                        const float /*du*/ = 0.0f,
+                        const float /*dv*/ = 0.0f,
+                        const float /*filter_width*/ = 0.0f) const
   {
     /* Packing validates each stored value. Values vary across the surface, and a
      * unit value keeps tangent projections finite during eligibility. */
@@ -602,8 +702,8 @@ struct WebGPUSvmSceneHost : WebGPUSvmPackedHost {
   }
 };
 
-/* Keep one stock SVM volume closure in its typed encoding. Scene eligibility
- * guarantees the kernel can evaluate it without a stack or grid attributes. */
+/* Keep a stock SVM volume closure in its typed encoding. An Add Shader may
+ * pair a literal scattering closure with a separate literal absorption closure. */
 inline bool webgpu_svm_literal_volume(const DeviceScene &scene,
                                      const uint shader,
                                      const int object,
@@ -720,19 +820,119 @@ inline bool webgpu_svm_literal_volume(const DeviceScene &scene,
     default:
       return false;
   }
+  uint primary_start = start;
+  uint primary_end = offset;
+  float3 primary_color = color;
+  uint opcode = type;
+  if (offset < end && fetch(offset) == NODE_CLOSURE_SET_WEIGHT) {
+    if (type != NODE_CLOSURE_VOLUME) {
+      return false;
+    }
+    ++offset;
+    SVMNodeClosureSetWeight second_weight;
+    if (!webgpu_svm_read(fetch, offset, end, second_weight) || offset == end ||
+        fetch(offset++) != NODE_CLOSURE_VOLUME)
+    {
+      return false;
+    }
+    const uint second_start = offset;
+    const float3 second_color = make_float3(second_weight.rgb);
+    SVMNodeClosureVolume second;
+    if (!webgpu_svm_finite(second_color.x) || !webgpu_svm_finite(second_color.y) ||
+        !webgpu_svm_finite(second_color.z) || reduce_min(second_color) < 0.0f ||
+        !webgpu_svm_read(fetch, offset, end, second) ||
+        second.mix_weight_offset != SVM_STACK_INVALID ||
+        !webgpu_svm_inputs_valid(empty_stack, second.density, second.param1, second.param_extra))
+    {
+      return false;
+    }
+    if (absorption) {
+      if (!valid_phase(second.closure_type)) {
+        return false;
+      }
+      words[CYCLES_WEBGPU_VOLUME_ADD_ABSORPTION_DENSITY] =
+          words[CYCLES_WEBGPU_ABSORPTION_DENSITY];
+      primary_start = second_start;
+      primary_end = offset;
+      primary_color = second_color;
+      phase_slots = phase_count(second.closure_type);
+    }
+    else {
+      if (second.closure_type != CLOSURE_VOLUME_ABSORPTION_ID ||
+          reduce_max(second_color) > 1.0f || __uint_as_float(second.density.bits) < 0.0f)
+      {
+        return false;
+      }
+      words[CYCLES_WEBGPU_ABSORPTION_COLOR] = std::bit_cast<uint32_t>(second_color.x);
+      words[CYCLES_WEBGPU_ABSORPTION_COLOR + 1] = std::bit_cast<uint32_t>(second_color.y);
+      words[CYCLES_WEBGPU_ABSORPTION_COLOR + 2] = std::bit_cast<uint32_t>(second_color.z);
+      words[CYCLES_WEBGPU_VOLUME_ADD_ABSORPTION_DENSITY] = second.density.bits;
+    }
+    opcode |= CYCLES_WEBGPU_VOLUME_ADD_ABSORPTION;
+    absorption = false;
+    static_assert(sizeof(SVMNodeClosureVolume) / sizeof(uint32_t) <=
+                  CYCLES_WEBGPU_VOLUME_ADD_ABSORPTION_DENSITY - CYCLES_WEBGPU_VOLUME_DATA);
+  }
   if (offset + 1 != end || fetch(offset) != NODE_END ||
-      offset - start > CYCLES_WEBGPU_VOLUME_MAX_BOUNCES - CYCLES_WEBGPU_VOLUME_DATA)
+      primary_end - primary_start > CYCLES_WEBGPU_VOLUME_MAX_BOUNCES - CYCLES_WEBGPU_VOLUME_DATA)
   {
     return false;
   }
-  words[CYCLES_WEBGPU_VOLUME_OPCODE] = type;
-  words[CYCLES_WEBGPU_VOLUME_WEIGHT] = std::bit_cast<uint32_t>(color.x);
-  words[CYCLES_WEBGPU_VOLUME_WEIGHT + 1] = std::bit_cast<uint32_t>(color.y);
-  words[CYCLES_WEBGPU_VOLUME_WEIGHT + 2] = std::bit_cast<uint32_t>(color.z);
-  for (uint index = start; index < offset; ++index) {
-    words[CYCLES_WEBGPU_VOLUME_DATA + index - start] = fetch(index);
+  words[CYCLES_WEBGPU_VOLUME_OPCODE] = opcode;
+  words[CYCLES_WEBGPU_VOLUME_WEIGHT] = std::bit_cast<uint32_t>(primary_color.x);
+  words[CYCLES_WEBGPU_VOLUME_WEIGHT + 1] = std::bit_cast<uint32_t>(primary_color.y);
+  words[CYCLES_WEBGPU_VOLUME_WEIGHT + 2] = std::bit_cast<uint32_t>(primary_color.z);
+  for (uint index = primary_start; index < primary_end; ++index) {
+    words[CYCLES_WEBGPU_VOLUME_DATA + index - primary_start] = fetch(index);
   }
   return true;
+}
+
+/* Surface BSDF normal overrides are discarded by stock shadow shading.
+ * If a bump output also feeds the composition or tint, its derivatives matter. */
+static inline bool webgpu_shadow_bump_only_scattering_normals(const Shader &material)
+{
+  for (const ShaderNode *node : material.graph->nodes) {
+    if (node->type != BumpNode::get_node_type()) {
+      continue;
+    }
+    for (const ShaderOutput *output : node->outputs) {
+      for (const ShaderInput *input : output->links) {
+        if (input->name() != "Normal" ||
+            (input->parent->type != PrincipledBsdfNode::get_node_type() &&
+             input->parent->type != DiffuseBsdfNode::get_node_type() &&
+             input->parent->type != TranslucentBsdfNode::get_node_type()))
+        {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+inline bool webgpu_svm_sampled_mesh_emitter(const DeviceScene &dscene, const uint shader)
+{
+  const auto uses_shader = [&](const int prim) {
+    return prim >= 0 && size_t(prim) < dscene.tri_shader.size() &&
+           (dscene.tri_shader.data()[prim] & SHADER_MASK) == shader;
+  };
+  if (dscene.data.integrator.use_light_tree) {
+    return std::ranges::any_of(
+        std::span(dscene.light_tree_emitters.data(), dscene.light_tree_emitters.size()),
+        [&](const KernelLightTreeEmitter &entry) {
+          return entry.object_id != OBJECT_NONE && uses_shader(entry.triangle.id);
+        });
+  }
+  const std::span distribution(dscene.light_distribution.data(), dscene.light_distribution.size());
+  if (distribution.size() <= dscene.lights.size() + 1) {
+    return false;
+  }
+  /* The stock flat distribution places mesh triangles before the analytic
+   * lights and terminal CDF entry. */
+  return std::ranges::any_of(
+      distribution.first(distribution.size() - dscene.lights.size() - 1),
+      [&](const KernelLightDistribution &entry) { return uses_shader(entry.prim); });
 }
 
 /* Keep the synchronized scene bytecode verbatim and snapshot the texture inputs
@@ -741,15 +941,51 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
                                                std::vector<uint32_t> &words,
                                                std::vector<uint32_t> &transparent_shadows,
                                                bool &varying_transparency,
+                                               bool &cubic_transparent_shadows,
+                                               bool &shadow_extended_svm,
+                                               bool &has_principled_alpha,
                                                bool &has_ggx,
                                                bool &has_transmission,
                                                bool &has_subsurface,
-                                               bool &advanced_query_svm,
+                                               bool &advanced_svm,
+                                               bool &ao_only_queries,
+                                               bool &residual_displacement_bump,
+                                               bool &paired_principled_layers,
+                                               bool &single_principled_coat,
+                                               bool &coated_principled_emission,
+                                               bool &compact_voronoi_distance,
+                                               bool &has_mixed_diffuse,
+                                               bool &has_diffuse_principled_mix,
+                                               bool &has_independent_mixed_bump,
+                                               bool &has_glossy_displacement_bump,
+                                               bool &has_mixed_displacement_bump,
+                                               bool &has_glossy_transparent,
+                                               bool &has_transparent_emission,
+                                               bool &has_ordered_transparency,
+                                               uint32_t &closure_compositions,
+                                               std::vector<bool> &ordered_closure_shaders,
                                                std::span<const uint> volume_shaders,
                                                std::string &reason,
                                                size_t max_words)
 {
   const DeviceScene &dscene = scene.dscene;
+  cubic_transparent_shadows = false;
+  shadow_extended_svm = false;
+  has_diffuse_principled_mix = false;
+  has_independent_mixed_bump = false;
+  has_glossy_displacement_bump = false;
+  has_mixed_displacement_bump = false;
+  has_glossy_transparent = false;
+  has_transparent_emission = false;
+  has_ordered_transparency = false;
+  paired_principled_layers = false;
+  single_principled_coat = false;
+  coated_principled_emission = false;
+  closure_compositions = 0u;
+  constexpr int fresnel_slots = (sizeof(FresnelGeneralizedSchlick) + sizeof(ShaderClosure) - 1) /
+                                sizeof(ShaderClosure);
+  constexpr int metallic_fresnel_slots = (sizeof(FresnelF82Tint) + sizeof(ShaderClosure) - 1) /
+                                         sizeof(ShaderClosure);
   max_words = std::min(max_words, size_t(std::numeric_limits<uint32_t>::max()));
   const size_t count = dscene.svm_nodes.size();
   const size_t shader_count = dscene.shaders.size();
@@ -761,12 +997,16 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     reason = "WebGPU Cycles needs synchronized SVM bytecode within the scene budget";
     return false;
   }
+  ordered_closure_shaders.assign(shader_count, false);
 
   std::vector<WebGPUSvmImage> images;
   size_t image_slots = 0;
   size_t remaining = max_words - header - count;
   bool requires_extended_svm = false;
   bool requires_advanced_procedural_svm = false;
+  compact_voronoi_distance = false;
+  bool has_ao_query = false;
+  bool has_general_query = false;
   bool shader_uses_cubic = false;
   bool has_aov = false;
   const auto fetch = [&](const uint index) { return uint(dscene.svm_nodes.data()[index]); };
@@ -831,6 +1071,7 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   std::vector<uint64_t> attribute_slots;
   std::vector<uint> attribute_slot_types;
   std::vector<uint2> attribute_slot_words;
+  std::vector<uint2> displacement_words;
   uint2 last_node = make_uint2(0, 0);
   bool uses_ies = false;
 
@@ -844,6 +1085,8 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   bool have_subsurface = false;
   bool have_standalone = false;
   bool have_hair = false;
+  bool have_mixed_diffuse = false;
+  bool have_bump = false;
   bool have_portal = false;
   bool have_mixed_transparent = false;
   bool pixel_wireframe = false;
@@ -859,8 +1102,11 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
       reason = "WebGPU Cycles found an invalid SVM material";
       return false;
     }
+    const bool has_volume_record =
+        std::ranges::find(volume_shaders, shader) != volume_shaders.end();
     if (checked[shader] ||
-        std::ranges::find(volume_shaders, shader) != volume_shaders.end()) {
+        (has_volume_record && (dscene.shaders.data()[shader].flags & SD_HAS_ONLY_VOLUME)))
+    {
       continue;
     }
 
@@ -868,61 +1114,231 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     last_node = make_uint2(0, 0);
     WebGPUSvmMaterial decoded;
     bool uses_shadow_path_context = false;
+    bool uses_shadow_query_defaults = false;
     shader_uses_cubic = false;
     bool uses_uv = false;
     bool uses_generated = false;
     /* GeometryManager has already evaluated true displacement on the host and
-     * synchronized the displaced BVH. Bump-only materials need surface bump
-     * evaluation only if the finalized graph still has a bump output. */
+     * synchronized the displaced BVH. The surface interpreter evaluates the
+     * residual bump when the finalized graph still has a bump output. */
     const auto displacement_method = material.get_displacement_method();
-    const bool unsupported_displacement =
-        displacement_method != DISPLACE_TRUE &&
-        (displacement_method == DISPLACE_BUMP ?
-             material.has_bump_from_displacement && material.graph->output()->input("Normal")->link :
-             material.has_displacement || material.has_bump_from_displacement);
-    if (material.id != shader || material.has_volume_connected || material.has_volume ||
-        unsupported_displacement || material.has_bump_from_surface ||
-        !webgpu_svm_eval_material(fetch,
-                                 image,
-                                 WebGPUSvmUv{0.25f, 0.25f},
-                                 make_float3(0.25f, 0.25f, 0.25f),
-                                 color_space,
-                                 uses_uv,
-                                 uses_generated,
-                                 uint(count),
-                                 uint(shader_count),
-                                 shader,
-                                 decoded,
-                                 WebGPUSvmNoSurface{},
-                                 WebGPUSvmSceneHost{{}, &dscene, &shader_objects[shader],
-                                                    &missing_attributes, &attribute_slots,
-                                                    &attribute_slot_types, &attribute_slot_words,
-                                                    &last_node, &uses_ies,
-                                                    &uses_shadow_path_context}))
+    if (material.id != shader ||
+        ((material.has_volume_connected || material.has_volume) && !has_volume_record))
     {
-      reason = "WebGPU Cycles needs supported Lambert, Principled or Glass SVM materials (" +
-               material.name.string() + " stops at SVM node " + std::to_string(last_node.x) +
-               ", word " + std::to_string(last_node.y) + ")";
+      reason = "WebGPU Cycles needs a synchronized surface material (" + material.name.string() +
+               ")";
       return false;
     }
+    const WebGPUSvmSceneHost host{{}, &dscene, &shader_objects[shader],
+                                 &missing_attributes, &attribute_slots,
+                                 &attribute_slot_types, &attribute_slot_words,
+                                 &displacement_words,
+                                 &last_node, &uses_ies, &uses_shadow_path_context,
+                                 &uses_shadow_query_defaults,
+                                 &has_ao_query, &has_general_query};
+    const auto evaluate = [&](const bool ordered) {
+      return webgpu_svm_eval_material(fetch,
+                                      image,
+                                      WebGPUSvmUv{0.25f, 0.25f},
+                                      make_float3(0.25f, 0.25f, 0.25f),
+                                      color_space,
+                                      uses_uv,
+                                      uses_generated,
+                                      uint(count),
+                                      uint(shader_count),
+                                      shader,
+                                      decoded,
+                                      WebGPUSvmNoSurface{},
+                                      host,
+                                      {},
+                                      ordered);
+    };
+    const size_t preceding_missing = missing_attributes.size();
+    const size_t preceding_attribute_slots = attribute_slots.size();
+    const size_t preceding_attribute_words = attribute_slot_words.size();
+    const size_t preceding_displacement_words = displacement_words.size();
+    if (!evaluate(false)) {
+      const uint2 legacy_node = last_node;
+      missing_attributes.resize(preceding_missing);
+      attribute_slots.resize(preceding_attribute_slots);
+      attribute_slot_types.resize(preceding_attribute_slots);
+      attribute_slot_words.resize(preceding_attribute_words);
+      displacement_words.resize(preceding_displacement_words);
+      uses_uv = uses_generated = uses_shadow_path_context = shader_uses_cubic = false;
+      uses_shadow_query_defaults = false;
+      if (!evaluate(true)) {
+        const uint2 rejected = last_node.y >= legacy_node.y ? last_node : legacy_node;
+        reason = "WebGPU Cycles rejected material " + material.name.string() + " at SVM node " +
+                 std::to_string(rejected.x) + ", word " + std::to_string(rejected.y);
+        return false;
+      }
+      /* Stock surface_shader_prepare() classifies Translucent as diffuse. */
+      const uint filtered = FILTER_CLOSURE_DIFFUSE | FILTER_CLOSURE_DIRECT_LIGHT |
+          ((decoded.ordered_lobe_types == 0u || decoded.ordered_glossy_mix) ?
+               FILTER_CLOSURE_GLOSSY : 0u);
+      const int extra_closures = int(decoded.ordered_principled_specular_candidates) *
+                                     fresnel_slots +
+                                 int(decoded.ordered_principled_metal_candidates) *
+                                     metallic_fresnel_slots;
+      if (int(decoded.ordered_lobe_candidates) + extra_closures > dscene.data.max_closures ||
+          has_volume_record || (dscene.data.integrator.filter_closures & filtered) != 0)
+      {
+        reason = "WebGPU Cycles ordered surface lobes need enough unfiltered stock closure slots "
+                 "and a surface without a volume boundary (" + material.name.string() + ")";
+        return false;
+      }
+      ordered_closure_shaders[shader] = true;
+      has_ordered_transparency |= decoded.ordered_lobe_types != 0u;
+    }
+    const bool ordered_principled =
+        decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_ORDERED_PRINCIPLED;
+    if (ordered_principled) {
+      closure_compositions |= CYCLES_WEBGPU_SHADER_ORDERED_PRINCIPLED;
+      paired_principled_layers |= decoded.ordered_principled_layers;
+    }
+    if (decoded.coat.possible) {
+      const uint filtered = FILTER_CLOSURE_DIFFUSE | FILTER_CLOSURE_GLOSSY |
+                            FILTER_CLOSURE_DIRECT_LIGHT |
+                            (decoded.coated_principled_emission ? FILTER_CLOSURE_EMISSION : 0u);
+      const int closure_slots = 1 + int(decoded.subsurface > 0.0f) +
+                                int(decoded.subsurface < 1.0f) +
+                                int(decoded.single_principled_specular_candidate) *
+                                    (1 + fresnel_slots);
+      if (dscene.data.max_closures < closure_slots || has_volume_record ||
+          (dscene.data.integrator.filter_closures & filtered) != 0u)
+      {
+        reason = "WebGPU Cycles coated Principled needs enough unfiltered stock closure slots "
+                 "and a surface without a volume boundary (" + material.name.string() + ")";
+        return false;
+      }
+      single_principled_coat = true;
+      coated_principled_emission |= decoded.coated_principled_emission;
+    }
+    if (decoded.ordered_glossy_mix) {
+      closure_compositions |= CYCLES_WEBGPU_SHADER_ORDERED_GLOSSY_MIX;
+    }
+    if (decoded.principled_translucent) {
+      const uint filtered = FILTER_CLOSURE_DIFFUSE | FILTER_CLOSURE_GLOSSY |
+                            FILTER_CLOSURE_TRANSPARENT | FILTER_CLOSURE_DIRECT_LIGHT;
+      if (dscene.data.max_closures < 4 + fresnel_slots || has_volume_record ||
+          (dscene.data.integrator.filter_closures & filtered) != 0)
+      {
+        reason = "WebGPU Cycles Principled and Translucent needs enough unfiltered closure slots "
+                 "and a surface without a volume boundary (" + material.name.string() + ")";
+        return false;
+      }
+      closure_compositions |= CYCLES_WEBGPU_SHADER_PRINCIPLED_TRANSLUCENT;
+    }
+    if (material.has_bump_from_surface && !decoded.surface_bump &&
+        !decoded.closure_normal_overridden && !decoded.ordered_principled_normal)
+    {
+      reason = "WebGPU Cycles does not support the surface normal graph on " + material.name.string();
+      return false;
+    }
+    if (displacement_method != DISPLACE_TRUE && material.has_bump_from_displacement &&
+        material.graph->output()->input("Normal")->link && !decoded.displacement_bump)
+    {
+      reason = "WebGPU Cycles could not evaluate displacement bump on " + material.name.string();
+      return false;
+    }
+    /* The displaced MIS origin is not yet consistent with the area-light
+     * forward selection PDF. The delta-light path does not use that PDF. */
+    if (decoded.displacement_bump && dscene.data.integrator.use_light_tree &&
+        std::ranges::any_of(std::span(dscene.lights.data(), dscene.lights.size()),
+                            [](const KernelLight &light) {
+                              return light.type == LIGHT_AREA && (light.shader_id & SHADER_USE_MIS);
+                            }))
+    {
+      reason = "WebGPU Cycles forward area-light MIS does not support displacement bump on " +
+               material.name.string();
+      return false;
+    }
+    if (decoded.diffuse_principled_lobes != 0 &&
+        int(decoded.diffuse_principled_lobes) > dscene.data.max_closures)
+    {
+      reason = "WebGPU Cycles mixed diffuse Principled exceeds the available stock closure slots";
+      return false;
+    }
+    if (decoded.diffuse_principled_lobes != 0 &&
+        std::ranges::any_of(shader_objects[shader], [&](const int object) {
+          return dscene.objects.data()[object].shadow_terminator_shading_offset > 1.0f;
+        }))
+    {
+      reason = "WebGPU Cycles mixed diffuse Principled needs the default shadow terminator "
+               "shading offset";
+      return false;
+    }
+    has_diffuse_principled_mix |= decoded.diffuse_principled_lobes != 0;
+    const bool dual_bump = decoded.displacement_bump && decoded.closure_normal_overridden;
+    has_glossy_displacement_bump |= dual_bump &&
+        decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_GLOSSY;
+    const bool mixed_glossy = decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_DIFFUSE_GLOSSY;
+    const bool lambert = decoded.surface_closure == 0.0f && !decoded.ggx;
+    const bool mixed_displacement_bump = dual_bump && (mixed_glossy || lambert);
+    if (mixed_displacement_bump &&
+        (dscene.data.max_closures < (mixed_glossy ? 2 : 1) || has_volume_record ||
+         (dscene.data.integrator.filter_closures &
+          (FILTER_CLOSURE_DIFFUSE | FILTER_CLOSURE_DIRECT_LIGHT)) != 0))
+    {
+      reason = "WebGPU Cycles Diffuse with displacement Bump needs enough unfiltered "
+               "closure slots and a surface without a volume boundary (" + material.name.string() + ")";
+      return false;
+    }
+    has_mixed_displacement_bump |= mixed_displacement_bump;
+    const bool glossy_transparent =
+        decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_GLOSSY_TRANSPARENT;
+    if (glossy_transparent && (dscene.data.max_closures < 2 || has_volume_record)) {
+      reason = "WebGPU Cycles mixed Glossy and Transparent needs two closure slots "
+               "and no volume boundary";
+      return false;
+    }
+    has_glossy_transparent |= glossy_transparent;
+    if (decoded.transparent_emission != 0u) {
+      const uint filtered = FILTER_CLOSURE_EMISSION | FILTER_CLOSURE_TRANSPARENT;
+      if (dscene.data.max_closures < 1 || has_volume_record ||
+          (dscene.data.integrator.filter_closures & filtered) != 0)
+      {
+        reason = "WebGPU Cycles Transparent with Emission needs an unfiltered closure slot "
+                 "and a surface without a volume boundary (" + material.name.string() + ")";
+        return false;
+      }
+      has_transparent_emission = true;
+    }
+    /* The sampled triangle-emission shader does not carry the shadow ray's
+     * position differential. Other surfaces still use the main path's data. */
+    if ((decoded.pixel_wireframe || decoded.surface_bump) &&
+        material.emission_sampling != EMISSION_SAMPLING_NONE &&
+        (dscene.shaders.data()[shader].flags & SD_HAS_CONSTANT_EMISSION) == 0 &&
+        webgpu_svm_sampled_mesh_emitter(dscene, shader))
+    {
+      reason = "WebGPU Cycles needs ray differentials for sampled mesh emission on " +
+               material.name.string();
+      return false;
+    }
+    have_bump |= decoded.surface_bump;
     checked[shader] = true;
     uv_shaders[shader] = uses_uv;
     generated_shaders[shader] = uses_generated;
     have_uv |= uses_uv;
     have_generated |= uses_generated;
     const bool huang_hair = decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_HAIR_HUANG;
-    have_ggx |= decoded.ggx || huang_hair || decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_GLOSSY;
+    have_ggx |= decoded.ggx || huang_hair || ordered_principled ||
+                CYCLES_WEBGPU_MATERIAL_IS_GLOSSY(decoded.surface_closure);
     have_transmission |= huang_hair || (decoded.ggx && decoded.transmission > 0.0f);
     have_subsurface |= decoded.subsurface > 0.0f;
     requires_extended_svm |= decoded.requires_extended_svm;
     requires_advanced_procedural_svm |= decoded.requires_advanced_procedural_svm;
+    compact_voronoi_distance |= decoded.uses_compact_voronoi_distance;
     pixel_wireframe |= decoded.pixel_wireframe;
-    uses_sheen_ltc |= decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_SHEEN;
-    have_sheen |= decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_SHEEN ||
+    const bool sheen = decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_SHEEN ||
+                       decoded.ordered_principled_sheen;
+    uses_sheen_ltc |= sheen;
+    have_sheen |= sheen ||
                   decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_VELVET;
     const bool portal = decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_RAY_PORTAL;
     have_portal |= portal;
     const bool mixed = decoded.mixed_transparency;
+    has_principled_alpha |= decoded.principled_alpha;
     have_mixed_transparent |= mixed;
     if (mixed && (dscene.data.integrator.filter_closures & FILTER_CLOSURE_TRANSPARENT)) {
       reason = "WebGPU Cycles needs unfiltered Transparent closures for mixed materials";
@@ -950,8 +1366,18 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
             reason = "WebGPU Cycles transparent shadow material needs unsupported ray context";
             return false;
           }
-          if (decoded.requires_full_svm || shader_uses_cubic) {
-            reason = "WebGPU Cycles varying transparent shadows need supported texture projections and filters";
+          if (decoded.requires_full_svm) {
+            reason = "WebGPU Cycles varying transparent shadows need supported texture projections "
+                     "and filters (" + material.name.string() + ")";
+            return false;
+          }
+          cubic_transparent_shadows |= shader_uses_cubic;
+          shadow_extended_svm |= uses_shadow_query_defaults ||
+                                 decoded.uses_compact_voronoi_distance;
+          if (decoded.pixel_wireframe || decoded.displacement_bump ||
+              (decoded.surface_bump && !webgpu_shadow_bump_only_scattering_normals(material)))
+          {
+            reason = "WebGPU Cycles needs ray differentials in varying transparent shadows";
             return false;
           }
         }
@@ -964,13 +1390,33 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
       }
     }
     have_hair |= CYCLES_WEBGPU_MATERIAL_IS_HAIR(decoded.surface_closure);
-    if (CYCLES_WEBGPU_MATERIAL_IS_STANDALONE(decoded.surface_closure)) {
+    const bool ordered = ordered_closure_shaders[shader];
+    const bool independent_mixed_bump = mixed_glossy &&
+        (decoded.mixed_glossy_flags & CYCLES_WEBGPU_MIXED_BUMP_INDEPENDENT) != 0u;
+    if (independent_mixed_bump && dscene.data.max_closures < 2) {
+      reason = "WebGPU Cycles independently bumped Diffuse and Glossy needs two closure slots";
+      return false;
+    }
+    has_independent_mixed_bump |= independent_mixed_bump;
+    have_mixed_diffuse |= mixed_glossy || ordered ||
+                          decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_DIFFUSE_TRANSLUCENT;
+    const bool ordered_reflection =
+        ordered && (decoded.ordered_lobe_types == 0u || decoded.ordered_glossy_mix);
+    if ((mixed_glossy || ordered_reflection || decoded.principled_translucent) && std::ranges::any_of(
+            std::span(dscene.lights.data(), dscene.lights.size()),
+            [](const KernelLight &light) { return (light.shader_id & SHADER_EXCLUDE_GLOSSY) != 0; }))
+    {
+      reason = "WebGPU Cycles mixed Diffuse and Glossy needs glossy lighting enabled";
+      return false;
+    }
+    if (ordered || glossy_transparent ||
+        CYCLES_WEBGPU_MATERIAL_IS_STANDALONE(decoded.surface_closure))
+    {
       have_standalone = true;
       const auto &integrator = dscene.data.integrator;
       if (((decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_GLOSSY_TOON ||
-            decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_GLOSSY) &&
-           (!integrator.caustics_reflective ||
-            (integrator.filter_closures & FILTER_CLOSURE_GLOSSY))) ||
+            CYCLES_WEBGPU_MATERIAL_IS_GLOSSY(decoded.surface_closure) || mixed_glossy) &&
+           (integrator.filter_closures & FILTER_CLOSURE_GLOSSY)) ||
           (decoded.surface_closure == CYCLES_WEBGPU_MATERIAL_TRANSLUCENT &&
            (integrator.filter_closures & FILTER_CLOSURE_TRANSMISSION)))
       {
@@ -1019,7 +1465,8 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   }
   remaining -= ies_words;
   static_assert(CYCLES_WEBGPU_SHEEN_LTC_WORDS == 3 * SHEEN_RES_MU * SHEEN_RES_ROUGH);
-  const size_t lookup_words = have_sheen ? webgpu_svm_lookup_words : 0;
+  const bool has_lookup_tables = have_sheen || coated_principled_emission;
+  const size_t lookup_words = has_lookup_tables ? webgpu_svm_lookup_words : 0;
   const size_t sheen_words = uses_sheen_ltc ? CYCLES_WEBGPU_SHEEN_LTC_WORDS : 0;
   const int sheen_offset = dscene.data.tables.sheen_ltc;
   if (lookup_words > remaining || sheen_words > remaining - lookup_words ||
@@ -1031,18 +1478,32 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     return false;
   }
   remaining -= lookup_words + sheen_words;
-  const bool queries = (dscene.data.kernel_features & KERNEL_FEATURE_NODE_RAYTRACE) != 0;
+  const size_t coat_words = coated_principled_emission ?
+      GGX_GEN_SCHLICK_IOR_S_RES_ROUGH * GGX_GEN_SCHLICK_IOR_S_RES_MU *
+          GGX_GEN_SCHLICK_IOR_S_RES_IOR : 0;
+  const int coat_offset = dscene.data.tables.ggx_gen_schlick_ior_s;
+  if (coat_words && (coat_words > remaining || coat_offset < 0 ||
+                     size_t(coat_offset) > dscene.lookup_table.size() ||
+                     coat_words > dscene.lookup_table.size() - size_t(coat_offset)))
+  {
+    reason = "WebGPU Cycles needs the synchronized dielectric Coat lookup table within the scene budget";
+    return false;
+  }
+  remaining -= coat_words;
   std::vector<uint32_t> packed(max_words - remaining);
   packed[0] = uint32_t(count);
   packed[1] = uint32_t(shader_count) | (requires_extended_svm ? CYCLES_WEBGPU_SVM_EXTENDED : 0);
   if (have_standalone) {
     packed[1] |= CYCLES_WEBGPU_SVM_STANDALONE;
   }
+  if (have_bump) {
+    packed[1] |= CYCLES_WEBGPU_SVM_BUMP;
+  }
   if (have_hair) {
     packed[1] |= CYCLES_WEBGPU_SVM_HAIR;
   }
-  if (have_sheen) {
-    packed[1] |= CYCLES_WEBGPU_SVM_SHEEN;
+  if (has_lookup_tables) {
+    packed[1] |= CYCLES_WEBGPU_SVM_LOOKUP_TABLES;
   }
   if (has_aov) {
     packed[1] |= CYCLES_WEBGPU_SVM_AOV;
@@ -1067,6 +1528,9 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
   }
   for (const uint2 slot : attribute_slot_words) {
     packed[webgpu_svm_header_words + slot.x] = webgpu_svm_attribute_slot | slot.y;
+  }
+  for (const uint2 displacement : displacement_words) {
+    packed[webgpu_svm_header_words + displacement.x] = displacement.y;
   }
   const size_t texture = webgpu_svm_header_words + count;
   packed[texture] = uint32_t(triangles);
@@ -1144,7 +1608,7 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
       packed[texel++] = std::bit_cast<uint32_t>(dscene.ies_lights.data()[i]);
     }
   }
-  if (have_sheen) {
+  if (has_lookup_tables) {
     packed[texel + webgpu_svm_lookup_ies] = packed[texture + webgpu_svm_ies_offset];
     packed[texel + webgpu_svm_lookup_sheen] = sheen_words ?
                                                 uint32_t(texel + lookup_words - texture) : 0;
@@ -1153,13 +1617,21 @@ inline bool cycles_webgpu_encode_svm_materials(const Scene &scene,
     for (size_t i = 0; i < sheen_words; ++i) {
       packed[texel++] = std::bit_cast<uint32_t>(dscene.lookup_table.data()[size_t(sheen_offset) + i]);
     }
+    for (size_t i = 0; i < coat_words; ++i) {
+      packed[texel++] = std::bit_cast<uint32_t>(dscene.lookup_table.data()[size_t(coat_offset) + i]);
+    }
   }
 
   words = std::move(packed);
   has_ggx = have_ggx;
   has_transmission = have_transmission;
   has_subsurface = have_subsurface;
-  advanced_query_svm = queries && requires_advanced_procedural_svm;
+  advanced_svm = requires_advanced_procedural_svm;
+  ao_only_queries = has_ao_query && !has_general_query;
+  residual_displacement_bump = !displacement_words.empty() ||
+      std::ranges::find(attribute_slots, webgpu_svm_synthetic_id + WEBGPU_SVM_SLOT_ORIGINAL_NORMAL) !=
+          attribute_slots.end();
+  has_mixed_diffuse = have_mixed_diffuse;
   reason.clear();
   return true;
 }

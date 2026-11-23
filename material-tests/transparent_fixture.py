@@ -78,7 +78,39 @@ def configure_mixed(fixture, material_node, mode):
     tree.links.new(mix.outputs[0], output.inputs["Surface"])
 
 
+def configure_principled_alpha(fixture, material_node, mode):
+    scene = fixture.scene
+    samples = scene.cycles.samples
+    shadow = mode == "shadow"
+    configure(fixture, material_node, "colored-shadow" if shadow else "alpha")
+    scene.cycles.samples = samples
+    tree = material_node.id_data
+    if shadow:
+        plate = bpy.data.objects["Transparent proof plate"]
+        tree = plate.data.materials[0].node_tree
+    output = next(node for node in tree.nodes if node.bl_idname == "ShaderNodeOutputMaterial")
+    material = tree.nodes.new("ShaderNodeBsdfPrincipled")
+    material.inputs["Base Color"].default_value = (0.29, 0.47, 0.69, 1.0)
+    material.inputs["Roughness"].default_value = 0.32
+    material.inputs["Metallic"].default_value = 0.2
+    material.inputs["Alpha"].default_value = 0.53
+    tree.links.new(material.outputs[0], output.inputs["Surface"])
+    if mode != "constant":
+        image = bpy.data.images.new("Principled Alpha proof", width=4, height=4, alpha=True)
+        levels = (0.0, 0.23, 0.71, 1.0)
+        image.pixels = [v for i in range(16) for v in (0.4, 0.5, 0.6, levels[i % 4])]
+        image.pack()
+        texture = tree.nodes.new("ShaderNodeTexImage")
+        texture.image = image
+        uv = tree.nodes.new("ShaderNodeTexCoord")
+        tree.links.new(uv.outputs["UV"], texture.inputs["Vector"])
+        tree.links.new(texture.outputs["Alpha"], material.inputs["Alpha"])
+
+
 def configure(fixture, material_node, mode):
+    if mode.startswith("principled-alpha-"):
+        configure_principled_alpha(fixture, material_node, mode.removeprefix("principled-alpha-"))
+        return
     if mode.startswith("mixed-"):
         configure_mixed(fixture, material_node, mode.removeprefix("mixed-"))
         return

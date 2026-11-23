@@ -82,20 +82,36 @@ void main(uint3 id : SV_DispatchThreadID)
   }
 #ifdef CYCLES_WEBGPU_INTERSECT_SHADOW
   const uint shadow = 4 * lane;
-  const uint4 options = shadow_words[shadow + 2];
+  uint4 options = shadow_words[shadow + 2];
   if (options.x == 0u) {
     return;
   }
 #  ifdef CYCLES_WEBGPU_TRANSPARENT_SHADOW
+#    if defined(CYCLES_WEBGPU_SHADOW_SVM) && !defined(CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS)
+  const bool ao_pass = (options.x & CYCLES_WEBGPU_SHADOW_AO_PASS) != 0u;
+  options.x &= ~CYCLES_WEBGPU_SHADOW_AO_PASS;
+  /* AO reuses this dispatch with the surface pass buffer at binding 3. */
+  const uint output = ao_pass ? 6 * lane + 4 : lane;
+  const float4 forward = radiance[ao_pass ? output + 1 : ray_words[0] + lane];
+  const uint forward_hits = ao_pass ? uint(forward.w) : cycles_forward_light_hits(forward);
+#    else
   const uint forward_hits = cycles_forward_light_hits(radiance[ray_words[0] + lane]);
+#    endif
   const uint transparent_bounce = (path_words[CYCLES_WEBGPU_PATH_WORDS * lane +
                                               CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE] &
                                    CYCLES_WEBGPU_TRANSPARENT_BOUNCE_MASK) + forward_hits;
   const float4 visibility = cycles_bvh2_transparent_shadow(
       shadow_words[shadow], shadow_words[shadow + 1], options, shadow_words[shadow + 3],
       transparent_bounce);
+#    if defined(CYCLES_WEBGPU_SHADOW_SVM) && !defined(CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS)
+  const float4 sample = radiance[output];
+  const float3 weighted = sample.xyz * visibility.xyz;
+  radiance[output] = ao_pass ? float4(clamp_light(weighted, sample.w), 0.0f) :
+                              float4(weighted, sample.w);
+#    else
   const float4 sample = radiance[lane];
   radiance[lane] = float4(sample.xyz * visibility.xyz, sample.w);
+#    endif
 #  else
   uint4 hit, coordinates;
   cycles_bvh2_trace(shadow_words[shadow], shadow_words[shadow + 1], options,

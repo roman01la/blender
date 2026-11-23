@@ -28,10 +28,8 @@ void main(uint3 id : SV_DispatchThreadID)
 {
   const uint4 layout = uint4(params[5], params[6], params[7], params[9]);
 #if defined(CYCLES_WEBGPU_ADAPTIVE_CHECK)
-  const uint width = params[2];
-  const uint y = id.x / width;
-  if (y < params[3]) {
-    const uint4 pixel = uint4(id.x - y * width, y, params[12], params[4]);
+  if (id.x < params[2] && id.y < params[3]) {
+    const uint4 pixel = uint4(id.xy, params[12], params[4]);
     cycles_adaptive_check(
         pixel, layout, params[8], __builtin_bit_cast(float, params[10]),
         __builtin_bit_cast(float, params[11]));

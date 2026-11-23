@@ -92,11 +92,6 @@ bool PathTraceWorkWebGPU::render_on_gpu(RenderStatistics &statistics,
   if (is_cancel_requested() || params.width <= 0 || params.height <= 0) {
     return false;
   }
-  const uint64_t pixels = uint64_t(params.width) * params.height;
-  if (pixels > WebGPURenderPipeline::max_crop_pixels) {
-    return false;
-  }
-
   uint32_t capacity = uint32_t(max_num_paths_);
   if (!renderer_.begin_batch(
           params, start_sample, samples_num, capacity, buffers_->buffer.data_size))

@@ -74,12 +74,42 @@ def prepare_light_tree_headers(work, cycles):
     source = cycles / "kernel" / "light"
     (light / "tree.h").write_text(_light_tree_header((source / "tree.h").read_text()))
     background = (source / "background.h").read_text()
-    # The synchronized host scene admits only map sampling. Omit portal and
-    # procedural-sun branches without changing stock map sampling or its PDF.
+    # WebGPU rejects portals on the host. Keep the actual stock sun/map
+    # sampling, mixture weights and MIS PDFs.
     background = _remove_between(
         background,
         "ccl_device_inline bool background_portal_data_fetch_and_check_side",
-        "template<bool in_volume_segment>")
+        "ccl_device_inline float3 background_sun_sample",
+        """ccl_device_inline int background_num_possible_portals(KernelGlobals, const float3)
+{
+  return 0;
+}
+
+ccl_device_inline float background_portal_pdf(KernelGlobals,
+                                              const float3,
+                                              const float3,
+                                              const int,
+                                              bool *is_possible)
+{
+  if (is_possible) {
+    *is_possible = false;
+  }
+  return 0.0f;
+}
+
+ccl_device_inline float3 background_portal_sample(KernelGlobals,
+                                                  const float3,
+                                                  const float2,
+                                                  const int,
+                                                  int *portal,
+                                                  float *pdf)
+{
+  *portal = -1;
+  *pdf = 0.0f;
+  return zero_float3();
+}
+
+""")
     (light / "background.h").write_text(background)
     # The Wasm C++ ABI would otherwise pass vectors by aggregate pointers
     # across functions after retargeting the code to Vulkan.

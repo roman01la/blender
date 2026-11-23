@@ -15,6 +15,7 @@ StructuredBuffer<uint> path_words : register(t5);
 RWStructuredBuffer<float4> guide_state : register(u6);
 StructuredBuffer<uint> guide_params : register(t7);
 
+#include "ordered_closure_access.hlsl"
 #include "wavefront_queue.hlsl"
 #include "wavefront_radiance.hlsl"
 
@@ -32,7 +33,7 @@ extern void cycles_surface_denoise_guides(float4 material,
                                           float4 normal,
                                           float4 specular_normal,
                                           float4 geometric_normal,
-                                          float4 view,
+                                          float4 bump, float4 view,
                                           float blur_alpha,
                                           uint options,
                                           float4 feature_throughput,
@@ -89,7 +90,7 @@ void main(uint3 id : SV_DispatchThreadID)
     const float4 surface_emission = materials[material_base + CYCLES_WEBGPU_MATERIAL_EMISSION_SLOT];
     const uint bounce = path_words[path + CYCLES_WEBGPU_PATH_BOUNCE];
     emission += clamp_light(throughput * surface_emission.xyz,
-                            bounce <= 1u ? 3.40282347e+38f : surface_emission.w);
+                            bounce <= 1u ? cycles_path_direct_clamp() : surface_emission.w);
   }
 
   float4 albedo = float4(feature_throughput.xyz * emission, 0.0f);
@@ -103,9 +104,18 @@ void main(uint3 id : SV_DispatchThreadID)
     if (material.w == CYCLES_WEBGPU_MATERIAL_MIXED_TRANSPARENT) {
       material = float4(materials[material_base + 1].xyz, CYCLES_WEBGPU_MATERIAL_TRANSPARENT);
     }
+    else if (material.w == CYCLES_WEBGPU_MATERIAL_GLOSSY_TRANSPARENT &&
+             packed_transparency.w != 0.0f) {
+      material = float4(packed_transparency.xyz, CYCLES_WEBGPU_MATERIAL_TRANSPARENT);
+    }
+    else if (CYCLES_WEBGPU_MATERIAL_HAS_ORDERED_CLOSURES(material.w) &&
+             (uint(packed_transparency.w) & CYCLES_WEBGPU_ORDERED_HAS_TRANSPARENT) != 0u) {
+      material = float4(packed_transparency.xyz, CYCLES_WEBGPU_MATERIAL_TRANSPARENT);
+    }
     else if ((material.w == CYCLES_WEBGPU_MATERIAL_GGX ||
               material.w == CYCLES_WEBGPU_MATERIAL_MULTISCATTER_GGX) &&
-             materials[material_base + 3].w == 0.0f && packed_transparency.w != 0.0f) {
+             CYCLES_WEBGPU_GGX_CAN_BE_TRANSPARENT(materials[material_base + 3]) &&
+             packed_transparency.w != 0.0f) {
       material = float4(packed_transparency.xyz, CYCLES_WEBGPU_MATERIAL_TRANSPARENT);
     }
   }
@@ -140,6 +150,7 @@ void main(uint3 id : SV_DispatchThreadID)
     cycles_surface_denoise_guides(material, materials[material_base + 1],
                                   materials[material_base + 2], materials[material_base + 3],
                                   materials[material_base + 4], normal, specular_N, geometric_N,
+                                  materials[material_base + CYCLES_WEBGPU_MATERIAL_NORMAL_SLOT],
                                   wi, cycles_denoise_blur_alpha(min_pdf),
                                   guide_params[2], feature_throughput,
                                   next_feature_throughput, surface_albedo, surface_normal);

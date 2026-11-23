@@ -2,6 +2,9 @@
 
 #pragma once
 
+/* Varying shadow traversal also resolves the film AO pass after direct lighting. */
+#define CYCLES_WEBGPU_SHADOW_AO_PASS (1u << 29u)
+
 /* The last word of each live wavefront ray carries the camera's RNG seed.
  * It belongs to the path and is preserved as the ray advances. */
 #define CYCLES_WEBGPU_RAY_RNG_PIXEL 11u
@@ -9,9 +12,9 @@
 #define CYCLES_WEBGPU_HIT_SUBSURFACE_EXIT 1u
 /* Optional differentials follow the compact queue and the adaptive sample class. */
 #define CYCLES_WEBGPU_RAY_DIFFERENTIAL_BASE(capacity, slot) (2u + 14u * (capacity) + 2u * (slot))
-/* The volume segment length for forward Light Tree MIS. Volume scenes use
- * this tail in place of the differential buffer. */
-#define CYCLES_WEBGPU_RAY_VOLUME_MIS_LENGTH(capacity, slot) (2u + 14u * (capacity) + (slot))
+/* Volume Light Tree MIS length follows the optional ray differential tail. */
+#define CYCLES_WEBGPU_RAY_VOLUME_MIS_LENGTH(capacity, slot, differentials) \
+  (2u + ((differentials) ? 16u : 14u) * (capacity) + (slot))
 #define CYCLES_WEBGPU_VOLUME_SCATTER_VISIBILITY (1u << 4u)
 #define CYCLES_WEBGPU_PATH_SETTINGS_DIFFERENTIALS (1u << 31u)
 
@@ -43,6 +46,7 @@
 
 #define CYCLES_WEBGPU_PATH_MIS_HAD_TRANSMISSION (1u << 6u)
 #define CYCLES_WEBGPU_PATH_MIS_SKIP (1u << 7u)
+#define CYCLES_WEBGPU_PATH_SINGLE_PASS_DONE (1u << 8u)
 #define CYCLES_WEBGPU_PATH_TRANSPARENT_BACKGROUND (1u << 9u)
 #define CYCLES_WEBGPU_PATH_TERMINATE_ON_NEXT_SURFACE (1u << 10u)
 #define CYCLES_WEBGPU_PATH_TERMINATE_AFTER_TRANSPARENT (1u << 12u)

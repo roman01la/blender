@@ -54,6 +54,9 @@ def retarget(source: Path, wrapper: Path, output: Path) -> None:
                        r"\1 spir_func ", shader_ir)
     shader_ir = re.sub(r"\b(call|declare) (?=<4 x i32> @_Z18cycles_svm_contextjj)",
                        r"\1 spir_func ", shader_ir)
+    shader_ir = re.sub(r"\b(call|declare) (?=(?:noundef )?(?:"
+                       r"void @_Z29cycles_svm_write_ordered_lobe|<4 x float> @_Z20cycles_material_lobej\b))",
+                       r"\1 spir_func ", shader_ir)
     shader_ir = re.sub(r"\b(call|declare) (?=(?:noundef )?(?:float|void|<4 x float>) "
                        r"@_Z\d+cycles_query_(?:ao|bevel|raycast))",
                        r"\1 spir_func ", shader_ir)
@@ -61,7 +64,8 @@ def retarget(source: Path, wrapper: Path, output: Path) -> None:
     shader_ir = re.sub(
         r"\b(call|declare) (?=(?:noundef )?(?:float @_Z17cycles_ggx_lookupj\b|"
         r"<4 x float> @_Z(?:15cycles_ggx_eval|\d+cycles_standalone_eval)|"
-        r"i32 @_Z(?:17cycles_ggx_sample|\d+cycles_standalone_sample)))",
+        r"i32 @_Z(?:17cycles_ggx_sample|\d+cycles_standalone_sample)|"
+        r"float @_Z\d+cycles_bump_shadowing|<4 x float> @_Z\d+cycles_bump_specular_normal))",
         r"\1 spir_func ",
         shader_ir,
     )
@@ -174,8 +178,8 @@ def normalize_spirv(code: bytes) -> bytes:
                     opcode, operands = truncate_byte(result, value)
                 elif result_type == uint_type and integer_value_types[value] in byte_types:
                     opcode = 83  # OpCopyObject
-            elif opcode == 128 and operands[0] in byte_types:  # OpIAdd
-                # Keep byte overflow for packed SVM stack offset comparisons.
+            elif opcode in {128, 196} and operands[0] in byte_types:  # OpIAdd, OpShiftLeftLogical
+                # Preserve byte truncation for SVM stack offsets and feature flags.
                 _, result, *arguments = operands
                 widened = new_id()
                 normalized.append((opcode, (uint_type, widened, *arguments)))
@@ -313,6 +317,10 @@ def build(options) -> None:
         kernel, dispatch = "direct_light", "shade_background"
     elif options.denoise_surface:
         kernel, dispatch = "camera", "denoise_surface"
+    elif options.film_surface:
+        kernel, dispatch = "camera", "film_surface"
+    elif options.film_ao:
+        kernel, dispatch = "bvh2", "film_ao"
     elif options.sampled_emission:
         kernel, dispatch = "svm", "sampled_emission"
     elif options.svm or options.svm_compact or options.svm_query:
@@ -333,13 +341,18 @@ def build(options) -> None:
     adaptive_camera = ("slots" if options.adaptive_camera_slots else
                        "rays" if options.adaptive_camera_rays else None)
     shader_name = f"{dispatch.replace('_', '-')}{'-compact' if compact else ''}.wgsl"
+    if options.film_ao_prepare:
+        shader_name = "film-ao-prepare.wgsl"
     if options.svm_core:
-        shader_name = "svm-compact-core.wgsl"
+        shader_name = ("svm-compact-textures.wgsl" if options.svm_textures else
+                       "svm-compact-core.wgsl")
     if options.sampled_emission:
         shader_name = "sampled-emission.wgsl"
     if options.svm_query:
         if options.advanced_queries:
             shader_name = "svm-query-advanced.wgsl"
+        elif options.ao_only_queries:
+            shader_name = "svm-query-ao-textures.wgsl"
         else:
             shader_name = "svm-query-textures.wgsl" if extended_queries else "svm-query.wgsl"
     if options.surface_query:
@@ -375,7 +388,8 @@ def build(options) -> None:
     if options.volume_guides:
         shader_name = shader_name.removesuffix(".wgsl") + "-guides.wgsl"
     if options.shadow_materials:
-        shader_name = "intersect-shadow-transparent-materials.wgsl"
+        shader_name = (shader_name.removesuffix(".wgsl") + "-materials.wgsl" if volume_shadow else
+                       "intersect-shadow-transparent-materials.wgsl")
     if options.reflection_only:
         shader_name = shader_name.removesuffix(".wgsl") + "-reflection.wgsl"
 
@@ -392,6 +406,11 @@ def build(options) -> None:
         shader_name = shader_name.removesuffix(".wgsl") + "-volume.wgsl"
 
     shader_flags = []
+    ordered_closures = (options.svm_compact or options.svm_query or options.wavefront_light or
+                        options.film_surface or
+                        (options.standalone_closures and (options.path_update or options.denoise_surface)))
+    if ordered_closures:
+        shader_flags.append("-DCYCLES_WEBGPU_ORDERED_CLOSURES=1")
     if options.volume_grid:
         shader_flags.append("-DCYCLES_WEBGPU_VOLUME_GRID=1")
     if options.volume_guides:
@@ -404,9 +423,9 @@ def build(options) -> None:
         shader_flags.append("-DCYCLES_WEBGPU_EXCLUDE_HAIR=1")
     if options.svm_core or options.svm_query or options.shadow_materials:
         shader_flags.append("-DCYCLES_WEBGPU_SVM_CORE=1")
-    if extended_queries or options.shadow_materials:
+    if extended_queries or options.shadow_materials or options.svm_textures:
         shader_flags.append("-DCYCLES_WEBGPU_SVM_TEXTURES=1")
-    if extended_queries:
+    if extended_queries or options.svm_textures:
         shader_flags.append("-DCYCLES_WEBGPU_SVM_PROJECTED_IMAGES=1")
     if options.advanced_queries:
         shader_flags.append("-DCYCLES_WEBGPU_SVM_ADVANCED_QUERIES=1")
@@ -414,10 +433,25 @@ def build(options) -> None:
         shader_flags.extend(("-DCYCLES_WEBGPU_SAMPLED_EMISSION=1", "-DCYCLES_WEBGPU_SURFACE=1"))
     if options.svm_query:
         shader_flags.extend(("-DCYCLES_WEBGPU_SCENE_QUERIES=1", "-DCYCLES_WEBGPU_SURFACE=1"))
+    if options.ao_only_queries:
+        shader_flags.append("-DCYCLES_WEBGPU_AO_ONLY_QUERIES=1")
     if options.surface_query:
         shader_flags.append("-DCYCLES_WEBGPU_QUERY_HITS=1")
     if options.denoise_background:
         shader_flags.append("-DCYCLES_WEBGPU_DENOISE_BACKGROUND=1")
+    if options.film_ao:
+        shader_flags.extend(("-DCYCLES_WEBGPU_FILM_AO=1",
+                             "-DCYCLES_WEBGPU_INTERSECT_SHADOW=1",
+                             "-DCYCLES_WEBGPU_TRANSPARENT_SHADOW=1",
+                             "-DCYCLES_PRIMARY_RAY_QUEUE=1",
+                             "-DCYCLES_WEBGPU_COMPACT_PATHS=1"))
+    if options.film_ao_prepare:
+        shader_flags.append("-DCYCLES_WEBGPU_FILM_AO_PREPARE=1")
+    if options.film_surface:
+        shader_flags.extend(("-DCYCLES_WEBGPU_FILM_SURFACE=1",
+                             "-DCYCLES_PRIMARY_RAY_QUEUE=1",
+                             "-DCYCLES_WEBGPU_EXCLUDE_HAIR=1",
+                             "-DCYCLES_WEBGPU_COMPACT_PATHS=1"))
     if options.denoise_surface:
         shader_flags.extend(("-DCYCLES_WEBGPU_DENOISE_SURFACE=1",
                              "-DCYCLES_WEBGPU_COMPACT_PATHS=1"))
@@ -447,6 +481,8 @@ def build(options) -> None:
         shader_flags.append("-DCYCLES_WEBGPU_TRANSPARENT_SHADOW=1")
     if options.shadow_materials:
         shader_flags.extend(("-DCYCLES_WEBGPU_SHADOW_SVM=1", "-DCYCLES_WEBGPU_SURFACE=1"))
+        if volume_shadow:
+            shader_flags.append("-DCYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS=1")
     if options.bvh2_compact:
         shader_flags.append("-DCYCLES_WEBGPU_OFFSET_CLOSEST=1")
     if options.subsurface or options.subsurface_compact:
@@ -458,6 +494,9 @@ def build(options) -> None:
     if (options.primary_camera or options.stock_camera or adaptive_camera or options.path_update or
             options.denoise_surface):
         shader_flags.append("-DCYCLES_PRIMARY_RAY_QUEUE=1")
+    if options.primary_camera or options.stock_camera or options.adaptive_camera_rays:
+        shader_flags.append("-DCYCLES_WEBGPU_CAMERA_SAMPLE=1")
+        cxx_flags += ("-I", CYCLES.parent / "atomic")
     if options.stock_camera or adaptive_camera:
         shader_flags.append("-DCYCLES_WEBGPU_STOCK_CAMERA=1")
     if adaptive_camera:
@@ -476,14 +515,26 @@ def build(options) -> None:
                              "-DCYCLES_PRIMARY_RAY_QUEUE=1"))
     structured_dispatch = (kernel != "camera" or options.primary_camera or
                            options.stock_camera or adaptive_camera or options.path_update or
-                           options.denoise_surface)
+                           options.denoise_surface or options.film_surface)
     with tempfile.TemporaryDirectory(prefix="cycles-webgpu-", dir=options.output) as temporary:
         work = Path(temporary)
         wrapper_ir = work / "dispatch.ll"
         build_cxx_flags = cxx_flags
-        if extended_queries or options.shadow_materials:
+        if (extended_queries or options.shadow_materials or options.svm_textures or
+                options.sampled_emission or (options.svm_compact and not options.svm_core)):
             # Share the stock Perlin arithmetic across SVM call sites.
             noise_path = Path("kernel/svm/noise.h")
+            if options.sampled_emission:
+                stock_closure = (CYCLES / "kernel/svm/closure.h").read_text()
+                closure_skip = re.search(
+                    r"ccl_device_inline int svm_node_closure_bsdf_skip\(.*?^}", stock_closure,
+                    re.M | re.S)
+                if closure_skip is None:
+                    raise ValueError("Cannot find stock SVM closure bytecode skip")
+                header = work / "kernel/svm/webgpu_sampled_closure_skip.h"
+                header.parent.mkdir(parents=True, exist_ok=True)
+                header.write_text("CCL_NAMESPACE_BEGIN\n" + closure_skip[0] +
+                                  "\nCCL_NAMESPACE_END\n")
             stock_noise = (CYCLES / noise_path).read_text()
             outlined, count = re.subn(r"ccl_device_noinline_cpu float perlin_[1-4]d\(",
                                       r"__attribute__((noinline)) \g<0>", stock_noise)
@@ -523,6 +574,11 @@ def build(options) -> None:
 
             prepare_subsurface_headers(work, CYCLES)
             build_cxx_flags = ("-I", work, *build_cxx_flags)
+        if (options.path_update or options.wavefront_light or options.denoise_surface or
+                options.film_surface):
+            from bump_headers import prepare_bump_header
+
+            prepare_bump_header(work, CYCLES)
         if options.denoise_surface:
             from denoising_headers import prepare_denoising_header
 
@@ -537,7 +593,7 @@ def build(options) -> None:
 
             prepare_transparent_ray_header(work, CYCLES)
             build_cxx_flags = ("-I", work, *build_cxx_flags)
-        if options.path_update:
+        if options.path_update or options.film_surface:
             # A purely reflective Fresnel closure leaves cos_HO unused. Initialize
             # it so LLVM cannot fold the unsampled refraction branch to a WGSL NaN.
             microfacet_path = Path("kernel/closure/bsdf_microfacet.h")
@@ -545,9 +601,18 @@ def build(options) -> None:
             declaration = "  float cos_HO;"
             if source.count(declaration) != 1:
                 raise ValueError("Expected one stock microfacet refraction cosine")
+            source = source.replace(declaration, "  float cos_HO = 0.0f;")
+            if options.path_update:
+                # Packed surface closures have zero film thickness. LLVM's
+                # SPIR-V backend cannot lower the conductor iridescence
+                # temporaries that survive in the generic sampler.
+                thin_film_guard = "if (fresnel->thin_film.thickness > THINFILM_THICKNESS_CUTOFF)"
+                if source.count(thin_film_guard) != 6:
+                    raise ValueError("Expected six stock Fresnel thin-film guards")
+                source = source.replace(thin_film_guard, "if constexpr (false)")
             header = work / microfacet_path
             header.parent.mkdir(parents=True, exist_ok=True)
-            header.write_text(source.replace(declaration, "  float cos_HO = 0.0f;"))
+            header.write_text(source)
             build_cxx_flags = ("-I", work, *build_cxx_flags)
         if options.standalone_closures or options.wavefront_light:
             from hair_headers import prepare_hair_headers
@@ -557,7 +622,7 @@ def build(options) -> None:
         if options.svm_query:
             from scene_query_headers import prepare_scene_query_headers
 
-            overlay = prepare_scene_query_headers(work, CYCLES, advanced=options.advanced_queries)
+            overlay = prepare_scene_query_headers(work, CYCLES, outline_noise=extended_queries)
             build_cxx_flags = ("-I", overlay, *build_cxx_flags)
         run(
             options.llvm_bin / "clang",
@@ -576,7 +641,7 @@ def build(options) -> None:
         shader_modules = [wrapper_ir]
         kernels = ([dispatch] if options.defer_shadow else
                    [kernel, dispatch] if light else [kernel])
-        if options.shade_background:
+        if options.shade_background or options.film_ao:
             kernels.append("camera")
         if options.volume_scatter:
             kernels.append("direct_light")
@@ -586,7 +651,7 @@ def build(options) -> None:
             kernels.append("bvh2")
         if options.shadow_materials:
             kernels.append("svm")
-        if options.wavefront_light or options.path_update or options.denoise_surface:
+        if options.wavefront_light or options.path_update or options.denoise_surface or options.film_surface:
             kernels.append("ggx")
         # Keep scanline induction variables at 32 bits for the WebGPU backend.
         hair_bsdf = options.standalone_closures or options.hair_closures
@@ -635,7 +700,7 @@ def build(options) -> None:
         else:
             # Keep storage handles and the private closure payloads within the entry point.
             inline_all = (svm or light or options.shade_background or options.path_update or
-                          options.denoise_surface or options.transparent_shadow or
+                          options.denoise_surface or options.film_surface or options.film_ao or options.transparent_shadow or
                           options.subsurface_compact or volume or absorption)
             opt_plugin = (f"-load-pass-plugin={plugin}",) if inline_all else ()
             inline_helpers = "cycles-webgpu-inline-helpers,always-inline," if inline_all else ""
@@ -664,7 +729,7 @@ def build(options) -> None:
                                                  options.bvh2_compact or intersect_shadow or
                                                  options.surface_compact or options.surface_query or svm or
                                                  options.path_update or options.wavefront_light or
-                                                 options.denoise_surface or options.subsurface or
+                                                 options.denoise_surface or options.film_surface or options.film_ao or options.subsurface or
                                                  options.subsurface_compact or
                                                  volume or absorption),
                                  canonicalize_loops=svm or volume_shadow)
@@ -733,16 +798,73 @@ def build(options) -> None:
                 coalesced = "// Cycles WebGPU shadow targets\n" + coalesced
             if coalesced != source:
                 shader_path.write_text(coalesced)
+        if svm and not (options.sampled_emission or options.shadow_materials):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU reflective caustics visibility\n")
+                shader.write("// Cycles WebGPU glass caustics visibility\n")
+                shader.write("// Cycles WebGPU compact Voronoi Distance\n")
+                shader.write("// Cycles WebGPU weighted diffuse Principled mixtures\n")
+        if options.svm_compact or options.svm_query or options.film_surface:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU Glossy displacement Bump\n")
+                shader.write("// Cycles WebGPU Diffuse and Glossy displacement Bump\n")
+        if svm and not (options.sampled_emission or options.shadow_materials):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU residual displacement bump\n")
+        if (options.svm_compact or options.svm_query or options.shadow_materials or
+                options.wavefront_light or options.standalone_closures or options.film_surface):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU Glossy and Transparent\n")
+        if options.wavefront_light and options.light_tree:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU lamp sampling flags\n")
+        if ((options.wavefront_light or options.shade_background) and options.light_tree or
+                options.volume_scatter):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU analytic Light Falloff\n")
+                shader.write("// Cycles WebGPU ray-length lamp emission\n")
+                shader.write("// Cycles WebGPU mapped world SVM\n")
+        if (options.svm_compact or options.svm_query or options.sampled_emission or
+                options.shadow_materials):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU Transparent emission\n")
+        if (options.svm_compact or options.svm_query or options.shadow_materials or
+                options.wavefront_light or options.path_update or options.film_surface or
+                options.denoise_surface):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU closure compositions\n")
+        if (options.svm_compact or options.svm_query or options.wavefront_light or
+                options.path_update or options.film_surface or options.denoise_surface):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU single Principled Coat\n")
+        if options.svm_compact or options.svm_query or options.sampled_emission:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU coated Principled emission\n")
         if (svm and not options.shadow_materials or options.wavefront_light or
                 options.standalone_closures):
             with (work / shader_name).open("a") as shader:
                 shader.write("\n// Cycles WebGPU standalone surface closures v2\n")
+        if (svm and not options.shadow_materials or options.wavefront_light or
+                options.standalone_closures or options.film_surface):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU mixed Diffuse closures v4\n")
+                shader.write("// Cycles WebGPU independent mixed Bump normals\n")
+        if ordered_closures:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU ordered closures\n")
+                shader.write("// Cycles WebGPU paired Principled layers with metallic\n")
+        if ordered_closures or options.shadow_materials:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU ordered Transparent and Translucent closures\n")
         if svm or surface or options.hair_closures or options.standalone_closures:
             with (work / shader_name).open("a") as shader:
                 shader.write("\n// Cycles WebGPU hair BSDFs\n")
         if svm or options.subsurface_compact or options.path_update or options.denoise_surface:
             with (work / shader_name).open("a") as shader:
                 shader.write("\n// Cycles WebGPU Christensen-Burley subsurface\n")
+        if (options.svm_compact or options.svm_query or options.subsurface_compact):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU subsurface bump normals\n")
         if options.path_update:
             with (work / shader_name).open("a") as shader:
                 shader.write("\n// Cycles WebGPU homogeneous absorption bounds\n")
@@ -762,13 +884,75 @@ def build(options) -> None:
                 options.wavefront_light or options.transparent_shadow):
             with (work / shader_name).open("a") as shader:
                 shader.write("\n// Cycles WebGPU ray portals\n")
+        if options.volume_scatter or (
+                options.light_tree and (options.wavefront_light or options.shade_background)):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU stock mixed-light distribution\n")
+        if options.stock_camera or options.adaptive_camera_rays:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU camera lens\n")
         if (svm and not options.shadow_materials or options.path_update or
                 options.stock_camera or options.adaptive_camera_rays):
             with (work / shader_name).open("a") as shader:
                 shader.write("\n// Cycles WebGPU ray differentials\n")
+        if options.wavefront_light or options.shade_background or options.volume_scatter:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU procedural sky world\n")
+        if options.path_update or options.shade_background:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU Emission pass deltas\n")
+        if options.wavefront_light or options.path_update or options.shade_background:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU per-lobe film lighting\n")
+        if options.film_surface or options.film_ao:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU filtered film layout 6\n")
+                if options.film_surface:
+                    shader.write("// Cycles WebGPU volume geometry passes\n")
+        if options.shadow_materials:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU cubic transparent shadows\n")
+                shader.write("// Cycles WebGPU extended shadow SVM\n")
+                if not volume_shadow:
+                    shader.write("// Cycles WebGPU varying Ambient Occlusion shadows\n")
+        if (options.volume_interval or options.volume_scatter or options.volume_extinction_shadow or
+                (options.volume_scatter_shadow and options.shadow_materials) or
+                (options.wavefront_light and options.volume_forward) or
+                (svm and not options.sampled_emission and not options.shadow_materials)):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU mixed surface volume boundaries\n")
+        if ((svm and not options.sampled_emission and not options.shadow_materials) or
+                options.wavefront_light or options.path_update or options.denoise_surface or
+                options.subsurface_compact or options.film_surface):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU material layout 7\n")
+        if options.volume_scatter or volume_shadow:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU literal additive volume\n")
+        if options.volume_interval or options.volume_scatter or volume_shadow:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU extended volume stack\n")
+        if options.volume_scatter:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU varying volume shadow dispatch\n")
+        if (options.volume_scatter or options.volume_forward or options.surface_compact or
+                options.surface_query):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU volume ray differentials\n")
+        if svm:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU Principled Alpha\n")
+        if volume_shadow:
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU transparent volume shadows\n")
+        if (adaptive == "check" or options.wavefront_light or options.shade_background or
+                options.path_update or options.denoise_surface or absorption or
+                options.volume_interval or options.volume_scatter or volume_shadow):
+            with (work / shader_name).open("a") as shader:
+                shader.write("\n// Cycles WebGPU render buffer ABI 2\n")
         if (compact or options.surface or options.path_update or options.wavefront_light or
                 adaptive or adaptive_camera or options.adaptive_film or options.shade_background or
-                options.denoise_surface):
+                options.denoise_surface or options.film_surface or options.film_ao):
             shutil.move(work / shader_name, options.output / shader_name)
             return
         if options.direct_light:
@@ -872,6 +1056,12 @@ if __name__ == "__main__":
                        help="shade sampled triangle emission with SVM")
     modes.add_argument("--wavefront-light", action="store_true",
                        help="compile direct lighting with per-path SVM materials")
+    modes.add_argument("--film-ao", action="store_true",
+                       help="compile the Ambient Occlusion render pass shadow rays")
+    modes.add_argument("--film-ao-prepare", action="store_true",
+                       help="prepare Ambient Occlusion rays for varying transparent shadows")
+    modes.add_argument("--film-surface", action="store_true",
+                       help="compile filtered Normal and closure color passes")
     modes.add_argument("--shade-background", action="store_true",
                        help="compile environment and forward area emission for miss paths")
     modes.add_argument("--path-update", action="store_true",
@@ -906,10 +1096,14 @@ if __name__ == "__main__":
                        help="compile Cycles' vertical convergence filter")
     modes.add_argument("--adaptive-film", action="store_true",
                        help="compile Cycles' adaptive film pass writers")
+    parser.add_argument("--svm-textures", action="store_true",
+                        help="include common textures and color nodes in the compact core SVM")
     parser.add_argument("--extended-queries", action="store_true",
                         help="include selected texture and color nodes with SVM ray queries")
     parser.add_argument("--advanced-queries", action="store_true",
                         help="include Gabor and advanced Voronoi with SVM ray queries")
+    parser.add_argument("--ao-only-queries", action="store_true",
+                        help="build the textured SVM query pipeline for Ambient Occlusion")
     parser.add_argument("--hair-closures", action="store_true",
                         help="include stock Hair BSDFs in the deferred direct light shader")
     parser.add_argument("--volume-forward", action="store_true",
@@ -921,12 +1115,16 @@ if __name__ == "__main__":
     parser.add_argument("--shadow-materials", action="store_true",
                         help="evaluate SVM tint at transparent shadow hits")
     options = parser.parse_args()
-    if options.shadow_materials and not options.transparent_shadow:
-        parser.error("--shadow-materials requires --transparent-shadow")
+    options.film_ao |= options.film_ao_prepare
+    if options.shadow_materials and not (options.transparent_shadow or
+                                        (options.volume_scatter_shadow and options.volume_guides)):
+        parser.error("--shadow-materials requires transparent or guided volume shadows")
     if options.extended_queries and not options.svm_query:
         parser.error("--extended-queries requires --svm-query")
     if options.advanced_queries and not options.svm_query:
         parser.error("--advanced-queries requires --svm-query")
+    if options.ao_only_queries and not (options.extended_queries and not options.advanced_queries):
+        parser.error("--ao-only-queries requires --extended-queries without --advanced-queries")
     if options.hair_closures and not (options.wavefront_light and options.defer_shadow):
         parser.error("--hair-closures requires --wavefront-light --defer-shadow")
     if options.volume_forward and not (options.light_tree and
@@ -939,6 +1137,8 @@ if __name__ == "__main__":
         parser.error("--volume-grid requires a volume transport mode")
     if options.svm_core and not options.svm_compact:
         parser.error("--svm-core requires --svm-compact")
+    if options.svm_textures and not options.svm_core:
+        parser.error("--svm-textures requires --svm-core")
     if options.standalone_closures and not (options.path_update or options.denoise_surface):
         parser.error("--standalone-closures requires --path-update or --denoise-surface")
     if options.reflection_only and not (options.wavefront_light or options.path_update):

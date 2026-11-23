@@ -4,7 +4,7 @@
 import struct
 
 
-def prepare_scene_query_headers(work, cycles, *, advanced=False):
+def prepare_scene_query_headers(work, cycles, *, outline_noise=False):
     """Keep the stock geometric kernels and supply WebGPU traversal and SVM adapters."""
     overlay = work / "scene-query"
     svm = overlay / "kernel" / "svm"
@@ -21,7 +21,7 @@ def prepare_scene_query_headers(work, cycles, *, advanced=False):
         end_at = source.index(end, start_at)
         parts.append("CCL_NAMESPACE_BEGIN\n" + source[start_at:end_at] + "CCL_NAMESPACE_END")
     (svm / "webgpu_scene_queries.h").write_text("\n\n".join(parts) + "\n")
-    if advanced:
+    if outline_noise:
         stock = (cycles / "kernel" / "svm" / "noisetex.h").read_text()
         (svm / "noisetex.h").write_text(outline_noise_selection(stock))
     return overlay

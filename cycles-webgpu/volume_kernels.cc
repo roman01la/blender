@@ -82,9 +82,11 @@ const uint &volume_svm_word(KernelGlobals, uint);
 #include "volume_helpers.h"
 
 #ifdef CYCLES_WEBGPU_VOLUME_SCATTER
+#  include "../blender-platform/cycles-webgpu/lighting_layout.h"
 #  include "../blender-platform/cycles-webgpu/path_state_layout.h"
 
 __attribute__((pure)) unsigned int cycles_camera_sample_word(unsigned int index);
+__attribute__((pure)) unsigned int cycles_light_word(unsigned int index);
 
 static float volume_sample_pattern_lut(unsigned int index)
 {
@@ -197,10 +199,21 @@ void volume_eval_record(ccl::VolumeGlobals &globals, ccl::ShaderData &sd, const 
   const Spectrum weight = make_float3(volume_float_word(record + CYCLES_WEBGPU_VOLUME_WEIGHT),
                                      volume_float_word(record + CYCLES_WEBGPU_VOLUME_WEIGHT + 1),
                                      volume_float_word(record + CYCLES_WEBGPU_VOLUME_WEIGHT + 2));
-  volume_evaluate_closure(&globals, sd,
-                          VolumeUInt4{cycles_volume_word(record + CYCLES_WEBGPU_VOLUME_OPCODE),
-                                      uint(visibility), flags, 0u},
-                          weight, words);
+  const uint opcode = cycles_volume_word(record + CYCLES_WEBGPU_VOLUME_OPCODE);
+  if (opcode & CYCLES_WEBGPU_VOLUME_ADD_ABSORPTION) {
+    SVMNodeClosureVolume absorption{};
+    absorption.closure_type = CLOSURE_VOLUME_ABSORPTION_ID;
+    absorption.mix_weight_offset = SVM_STACK_INVALID;
+    absorption.density.bits = cycles_volume_word(record + CYCLES_WEBGPU_VOLUME_ADD_ABSORPTION_DENSITY);
+    const Spectrum color = make_float3(volume_float_word(record + CYCLES_WEBGPU_ABSORPTION_COLOR),
+                                        volume_float_word(record + CYCLES_WEBGPU_ABSORPTION_COLOR + 1),
+                                        volume_float_word(record + CYCLES_WEBGPU_ABSORPTION_COLOR + 2));
+    svm_node_closure_volume<SHADER_TYPE_VOLUME>(&globals, &sd, nullptr, color, absorption);
+  }
+  volume_evaluate_closure(
+      &globals, sd, VolumeUInt4{opcode & ~CYCLES_WEBGPU_VOLUME_ADD_ABSORPTION,
+                                uint(visibility), flags, 0u},
+      weight, words);
 }
 
 void volume_eval_stack(ccl::VolumeGlobals &globals, ccl::ShaderData &sd, const uint active,
@@ -428,9 +441,16 @@ void cycles_volume_scatter(VolumeFloat4 origin,
   VolumeGlobals globals{};
   globals.data.film.is_rec709 = true;
   KernelIntegrator &integrator = globals.data.integrator;
-  integrator.sample_clamp_direct = FLT_MAX;
+  integrator.sample_clamp_direct = volume_float_word(record + CYCLES_WEBGPU_VOLUME_DIRECT_CLAMP);
   integrator.sample_clamp_indirect = volume_float_word(record + CYCLES_WEBGPU_VOLUME_INDIRECT_CLAMP);
+  integrator.differential_widen_scale = fminf(
+      1.0f, std::bit_cast<float>(cycles_light_word(CYCLES_WEBGPU_LIGHT_FILTER_GLOSSY)));
   integrator.direct_light_sampling_type = DIRECT_LIGHT_SAMPLING_MIS;
+  const uint lighting = cycles_light_word(CYCLES_WEBGPU_LIGHT_TREE_OFFSET);
+  if (cycles_light_word(lighting + CYCLES_WEBGPU_TREE_NODE_COUNT) == 0) {
+    integrator.light_inv_rr_threshold =
+        std::bit_cast<float>(cycles_light_word(CYCLES_WEBGPU_LIGHT_INV_RR_THRESHOLD));
+  }
 
   ShaderData sd;
   sd.wi = -make_float3(direction.x, direction.y, direction.z);
@@ -590,9 +610,11 @@ void cycles_volume_scatter(VolumeFloat4 origin,
           &sd, &phases, ls.D, -1, &eval, 0.0f, 0.0f);
       const float mis = light_sample_mis_weight_nee(
           &globals, point_pdf.w, (sampled.y & SHADER_USE_MIS) ? phase_pdf : 0.0f);
-      const Spectrum direct_l = result.direct_throughput * eval.sum *
-                                make_float3(strength.x, strength.y, strength.z) *
-                                (throughput.w * mis / point_pdf.w);
+      bsdf_eval_mul(&eval, make_float3(strength.x, strength.y, strength.z) * (mis / point_pdf.w));
+      const float terminate = path_state_rng_light_termination(&globals, &rng);
+      const Spectrum direct_l = light_sample_terminate(&globals, &eval, terminate) ?
+                                    zero_spectrum() :
+                                    result.direct_throughput * bsdf_eval_sum(&eval) * throughput.w;
       if (!is_zero(direct_l)) {
         Ray shadow{};
         light_sample_to_volume_shadow_ray(&sd, &ls, P, &shadow);
@@ -642,7 +664,8 @@ void cycles_volume_scatter(VolumeFloat4 origin,
   const bool accepted = p == 1.0f ||
                         (p > 0.0f && path_rng_1D(&globals, sampling.x, int(sampling.y),
                           state.path.rng_offset + PRNG_TERMINATE) < p);
-  next_throughput = packed(next, 0.0f);
+  next_throughput = packed(next, result.indirect_t);
+  emission.w = volume_phase_widen_dD(&globals, 0.0f, sampled_roughness);
   phase_path = {1u, state.path.flag, path_state_ray_visibility(&state), state.path.bounce};
   phase_origin = packed(P, accepted ? 1.0f / p : 0.0f);
   phase_direction = packed(normalize(wo), phase_pdf);

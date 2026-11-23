@@ -137,6 +137,12 @@ ccl_device_inline KernelLight light_fetch(KernelGlobals kg, lights_tag, uint ind
     lamp.area.normalize_spread = light_tree_word_float(word +
                                                        CYCLES_WEBGPU_TREE_LAMP_NORMALIZE_SPREAD);
   }
+  else if (lamp.type == LIGHT_SUN) {
+    lamp.sun.angle = light_tree_word_float(word + CYCLES_WEBGPU_LAMP_SUN_ANGLE);
+    lamp.sun.one_minus_cosangle = light_tree_word_float(word + CYCLES_WEBGPU_LAMP_SUN_ONE_MINUS_COS);
+    lamp.sun.pdf = light_tree_word_float(word + CYCLES_WEBGPU_LAMP_SUN_PDF);
+    lamp.sun.eval_fac = light_tree_word_float(word + CYCLES_WEBGPU_LAMP_SUN_EVAL);
+  }
   else if (lamp.type == LIGHT_POINT) {
     const uint point_word = word + CYCLES_WEBGPU_TREE_LAMP_AXIS_U;
     lamp.spot.radius = light_tree_word_float(point_word);
@@ -199,7 +205,16 @@ ccl_device_inline void setup_light_tree(LightGlobals &globals, const uint descri
 {
   globals.data.kernel_features = 0;
   globals.data.integrator.use_direct_light = true;
-  globals.data.integrator.use_light_tree = true;
+  auto &integrator = globals.data.integrator;
+  integrator.use_light_tree = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_NODE_COUNT) != 0;
+  if (!integrator.use_light_tree) {
+    globals.distribution_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_DISTRIBUTION_OFFSET);
+    integrator.num_distribution = int(cycles_light_word(descriptor + CYCLES_WEBGPU_DISTRIBUTION_COUNT));
+    integrator.distribution_pdf_lights = light_tree_word_float(
+        descriptor + CYCLES_WEBGPU_DISTRIBUTION_LAMP_PDF);
+    integrator.distribution_pdf_triangles = light_tree_word_float(
+        descriptor + CYCLES_WEBGPU_DISTRIBUTION_TRIANGLE_PDF);
+  }
   globals.tree_lamp_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_LAMPS);
   globals.tree_node_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_NODES);
   globals.tree_emitter_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_EMITTERS);

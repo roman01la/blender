@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 from catalog import cases, json_key
+import source_coverage
 
 
 ROOT = Path(__file__).resolve().parent
@@ -85,8 +86,10 @@ def parse_log(lines, engine, target):
                 evidence.append(line.strip())
         elif active and (CPU_FALLBACK.search(line) or TRACE_DEVICE.search(line) or
                          "Cycles WebGPU stock scheduler completed" in line or
+                         "Cycles WebGPU compiling the textured Ambient Occlusion shader" in line or
                          "Denoising on:" in line or
                          "Cycles WebGPU OIDN dispatched" in line or
+                         "Cycles WebGPU writing denoising guides" in line or
                          "Cycles WebGPU writing volume denoising guides" in line or
                          "Cycles WebGPU resident film export" in line or
                          line.startswith("VOLUME_WEBGPU_PROOF ")):
@@ -294,6 +297,7 @@ def main():
     commands = cli.add_subparsers(dest="action", required=True)
     generate = commands.add_parser("inventory")
     compare_runs = commands.add_parser("run")
+    source_coverage.add_parser(commands)
     for command in (generate, compare_runs):
         command.add_argument("--browser-build", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
@@ -317,6 +321,8 @@ def main():
     compare_runs.add_argument("--allow-different-revision", action="store_true")
     compare_runs.add_argument("--fail-on-fallback", action="store_true")
     args = cli.parse_args()
+    if args.action == "source-coverage":
+        return source_coverage.run(args)
     if args.action == "inventory":
         inventory(args)
         return 0

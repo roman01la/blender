@@ -26,6 +26,17 @@ def cases(samples):
         yield {"id": case_id(fixture), "name": name, **fixture}
 
 
+def rgb_rmse(first, second):
+    first_pixels = bytes.fromhex(first["rgba_hex"])
+    second_pixels = bytes.fromhex(second["rgba_hex"])
+    squared_rgb_error = sum(
+        ((a - b) / 255) ** 2
+        for i, (a, b) in enumerate(zip(first_pixels, second_pixels, strict=True))
+        if i % 4 != 3
+    )
+    return sqrt(squared_rgb_error / (3 * len(first_pixels) / 4))
+
+
 def compare(cpu, browser):
     if cpu.get("execution") != "cpu_control":
         return "desktop_cpu_unproven", None
@@ -33,15 +44,8 @@ def compare(cpu, browser):
         return browser.get("execution", "browser_unproven"), None
     if cpu["fingerprint"] != browser["fingerprint"]:
         return "different_fixture", None
-    cpu_pixels = bytes.fromhex(cpu["image"]["rgba_hex"])
-    web_pixels = bytes.fromhex(browser["image"]["rgba_hex"])
-    squared_rgb_error = sum(
-        ((a - b) / 255) ** 2
-        for i, (a, b) in enumerate(zip(cpu_pixels, web_pixels, strict=True))
-        if i % 4 != 3
-    )
-    rgb_rmse = sqrt(squared_rgb_error / (3 * len(cpu_pixels) / 4))
-    return ("pass" if rgb_rmse <= 0.005 else "image_mismatch"), rgb_rmse
+    error = rgb_rmse(cpu["image"], browser["image"])
+    return ("pass" if error <= 0.005 else "image_mismatch"), error
 
 
 def main():

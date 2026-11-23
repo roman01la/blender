@@ -40,7 +40,9 @@ uint4 cycles_svm_context(uint lane, uint field)
                  path_words[path + CYCLES_WEBGPU_PATH_TRANSMISSION_BOUNCE]);
   }
   if (field == CYCLES_WEBGPU_SVM_PATH) {
-    return uint4(0, 0, path_words[path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE], 0);
+    const uint shader_flags = cycles_svm_scene_context(
+        field, shadow_words[4 * lane + 2].w, shadow_words[4 * ray_words[0] + lane].y).w;
+    return uint4(0, 0, path_words[path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE], shader_flags);
   }
   return cycles_svm_scene_context(field, shadow_words[4 * lane + 2].w,
                                  shadow_words[4 * ray_words[0] + lane].y);

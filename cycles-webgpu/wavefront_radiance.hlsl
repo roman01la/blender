@@ -5,6 +5,7 @@
 
 extern uint cycles_path_transparent_max_bounce();
 extern uint cycles_film_transparent();
+extern float cycles_path_direct_clamp();
 
 bool cycles_trace_past_area_limit(uint transparent_bounce)
 {
@@ -16,7 +17,8 @@ uint cycles_forward_light_hits(float4 light)
   return light.w < 0.0f ? uint(-light.w) : uint(light.w > 0.0f);
 }
 
-#if !defined(CYCLES_WEBGPU_DENOISE_SURFACE) && !defined(CYCLES_WEBGPU_TRANSPARENT_SHADOW)
+#if !defined(CYCLES_WEBGPU_DENOISE_SURFACE) && !defined(CYCLES_WEBGPU_TRANSPARENT_SHADOW) && \
+    !defined(CYCLES_WEBGPU_FILM_SURFACE) && !defined(CYCLES_WEBGPU_FILM_AO)
 bool cycles_trace_past_area(uint path, uint hits)
 {
   /* Cycles counts a light hit as transparent without advancing the RNG. */
@@ -58,5 +60,20 @@ float3 cycles_forward_emission(float4 light, float3 throughput)
 {
   return light.w < 0.0f ? light.xyz : clamp_light(throughput * light.xyz, light.w);
 }
+
+#ifdef CYCLES_WEBGPU_EMISSION_DELTA
+void cycles_write_emission_delta(
+    uint capacity, uint lane, uint bounce, uint flags, float3 contribution)
+{
+  const uint header = 2u * capacity;
+  if (radiance[header].w != 0.0f) {
+    /* film_write_emission_or_background_pass routes camera-visible lighting
+     * to the Emission pass. The light passes own non-camera contributions. */
+    const bool camera = bounce == 0u &&
+                        (flags & CYCLES_WEBGPU_PATH_TRANSPARENT_BACKGROUND) != 0u;
+    radiance[header + 1u + lane] = float4(camera ? contribution : float3(0, 0, 0), 0.0f);
+  }
+}
+#endif
 
 #endif

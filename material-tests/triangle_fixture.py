@@ -4,6 +4,7 @@
 from math import pi
 
 import bpy
+from mathutils import Quaternion
 
 
 def add_triangle(scene, name, position, size, color, strength, sampling):
@@ -37,6 +38,9 @@ def texture_emission(obj, pattern, flip_uv=False):
     for node in list(tree.nodes):
         if node.type not in {"EMISSION", "OUTPUT_MATERIAL"}:
             tree.nodes.remove(node)
+    output = tree.nodes.get("Material Output").inputs["Surface"]
+    if not output.is_linked:
+        tree.links.new(emission.outputs[0], output)
     if pattern is None:
         return
 
@@ -76,8 +80,80 @@ def texture_emission(obj, pattern, flip_uv=False):
         tree.links.new(coord.outputs["Generated"], noise.inputs["Vector"])
         tree.links.new(noise.outputs["Fac"], multiply.inputs[0])
         tree.links.new(multiply.outputs[0], emission.inputs["Strength"])
+    elif pattern == "sky":
+        sky = tree.nodes.new("ShaderNodeTexSky")
+        sky.sky_type = "HOSEK_WILKIE"
+        sky.sun_direction = (-0.946154, 0.061538, 0.317814)
+        sky.turbidity = 2.9
+        sky.ground_albedo = 0.3
+        tree.links.new(coord.outputs["Reflection"], sky.inputs["Vector"])
+        curves = tree.nodes.new("ShaderNodeRGBCurve")
+        curves.mapping.curves[3].points.new(0.4, 0.34)
+        curves.mapping.update()
+        tree.links.new(sky.outputs["Color"], curves.inputs["Color"])
+        hsv = tree.nodes.new("ShaderNodeHueSaturation")
+        hsv.inputs["Saturation"].default_value = 0.73
+        tree.links.new(curves.outputs["Color"], hsv.inputs["Color"])
+        tree.links.new(hsv.outputs["Color"], emission.inputs["Color"])
+    elif pattern == "pixel-wireframe":
+        wireframe = tree.nodes.new("ShaderNodeWireframe")
+        wireframe.use_pixel_size = True
+        wireframe.inputs["Size"].default_value = 2
+        tree.links.new(wireframe.outputs["Factor"], emission.inputs["Strength"])
     else:
         raise ValueError(f"Unknown emitter texture {pattern}")
+
+
+def mix_transparent_emission(obj, mode):
+    tree = obj.data.materials[0].node_tree
+    transparent = tree.nodes.new("ShaderNodeBsdfTransparent")
+    emission = tree.nodes.get("Emission")
+    mix = tree.nodes.new("ShaderNodeMixShader")
+    if mode == "backface":
+        factor = tree.nodes.new("ShaderNodeNewGeometry").outputs["Backfacing"]
+    else:
+        coord = tree.nodes.new("ShaderNodeTexCoord")
+        split = tree.nodes.new("ShaderNodeSeparateXYZ")
+        tree.links.new(coord.outputs["Generated"], split.inputs[0])
+        weight = tree.nodes.new("ShaderNodeMath")
+        weight.operation = "MULTIPLY_ADD"
+        weight.inputs[1].default_value = 0.6
+        weight.inputs[2].default_value = 0.2
+        tree.links.new(split.outputs["X"], weight.inputs[0])
+        factor = weight.outputs[0]
+    tree.links.new(factor, mix.inputs[0])
+    tree.links.new(transparent.outputs[0], mix.inputs[1])
+    tree.links.new(emission.outputs[0], mix.inputs[2])
+    tree.links.new(mix.outputs[0], tree.nodes.get("Material Output").inputs["Surface"])
+
+
+def set_principled_emission(obj, coat_weight):
+    tree = obj.data.materials[0].node_tree
+    emission = tree.nodes.get("Emission")
+    principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
+    principled.inputs["Base Color"].default_value = (0, 0, 0, 1)
+    principled.inputs["Specular IOR Level"].default_value = 0
+    principled.inputs["Coat Weight"].default_value = coat_weight
+    principled.inputs["Coat Roughness"].default_value = 0.24
+    principled.inputs["Coat IOR"].default_value = 2.2
+    for name in ("Color", "Strength"):
+        source = emission.inputs[name]
+        target = principled.inputs[f"Emission {name}"]
+        if source.is_linked:
+            tree.links.new(source.links[0].from_socket, target)
+        else:
+            target.default_value = source.default_value
+    tree.links.new(principled.outputs[0], tree.nodes.get("Material Output").inputs["Surface"])
+
+
+def add_receiver_bump(receiver):
+    tree = receiver.id_data
+    noise = tree.nodes.new("ShaderNodeTexNoise")
+    noise.inputs["Scale"].default_value = 6
+    bump = tree.nodes.new("ShaderNodeBump")
+    bump.inputs["Strength"].default_value = 0.37
+    tree.links.new(noise.outputs["Factor"], bump.inputs["Height"])
+    tree.links.new(bump.outputs["Normal"], receiver.inputs["Normal"])
 
 
 def add_benchmark_emitters(scene, *, textured=False):
@@ -120,7 +196,9 @@ class TriangleProbe:
         scene = self.scene
         scene.cycles.samples = 128
         scene.render.dither_intensity = 0
-        scene.cycles.use_light_tree = True
+        scene.cycles.use_light_tree = settings.get("light_tree", True)
+        camera_hit = settings.get("camera_hit", False)
+        scene.render.film_transparent = camera_hit
         self.light.data.energy = 4
         self.light.hide_render = settings.get("mesh_only", False)
         self.point.hide_render = not settings.get("point_fill", False)
@@ -128,16 +206,27 @@ class TriangleProbe:
         sampling = settings["sampling"]
         glossy = settings.get("glossy", False)
         obj = self.emitter
-        if glossy:
+        if camera_hit:
+            obj.location = scene.camera.location * 0.46
+            orientation = scene.camera.location.to_track_quat("-Z", "Y")
+            if settings.get("reverse_facing"):
+                orientation = orientation @ Quaternion((1, 0, 0), pi)
+            obj.rotation_euler = orientation.to_euler()
+            obj.scale = (0.77, 0.77, 0.77)
+        elif glossy:
             obj.location = (1.65, -2.04, 1.02)
             obj.rotation_euler = (-obj.location).to_track_quat("-Z", "Y").to_euler()
             obj.scale = (1.3, 1.3, 1)
         else:
             obj.location = (-2.45, -1.9, 2.5)
-            obj.rotation_euler = (pi, 0, 0) if sampling == "BACK" else (0, 0, 0)
+            reverse = sampling == "BACK" or settings.get("reverse_facing")
+            obj.rotation_euler = (pi, 0, 0) if reverse else (0, 0, 0)
             obj.scale = (1, 1, 1)
         hidden = glossy or settings.get("camera_hidden", False)
         obj.visible_camera = not hidden
+        sampled = not settings.get("camera_only", False)
+        obj.visible_diffuse = obj.visible_glossy = obj.visible_transmission = sampled
+        obj.visible_volume_scatter = obj.visible_shadow = sampled
         self.instance.visible_camera = not settings.get("camera_hidden", False)
         self.instance.hide_render = not settings.get("instanced", False)
         material = obj.data.materials[0]
@@ -147,6 +236,13 @@ class TriangleProbe:
         texture = settings.get("texture")
         flip_uv = settings.get("flip_uv", False)
         texture_emission(obj, texture, flip_uv)
+        coat = settings.get("principled_coat")
+        if coat is not None:
+            set_principled_emission(obj, coat)
+        if mode := settings.get("transparent_emission"):
+            mix_transparent_emission(obj, mode)
+        if settings.get("receiver_bump"):
+            add_receiver_bump(receiver)
         if glossy:
             receiver.inputs["Metallic"].default_value = 1
             receiver.inputs["Roughness"].default_value = 0.17
@@ -164,4 +260,13 @@ class TriangleProbe:
         }
         if texture:
             result["texture"] = {"pattern": texture, "flip_uv": flip_uv}
+        if coat is not None:
+            result["principled_coat"] = coat
+            result["light_tree"] = scene.cycles.use_light_tree
+        if mode:
+            result["transparent_emission"] = mode
+            result["light_tree"] = scene.cycles.use_light_tree
+            result["emitter_graph"] = [(node.bl_idname, [(link.from_node.name, link.from_socket.identifier)
+                                                       for socket in node.inputs for link in socket.links])
+                                       for node in material.node_tree.nodes]
         return result

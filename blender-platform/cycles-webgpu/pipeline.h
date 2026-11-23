@@ -31,9 +31,6 @@ struct WebGPURenderShaders {
  * pthread distinct from the WebGPU owner. The device must outlive the pipeline. */
 class WebGPURenderPipeline {
  public:
-  /* Keep one full HD slice within the film binding budget while camera work is tiled by the
-   * scheduler. A 64-thread adaptive dispatch needs at most 32,768 workgroups. */
-  static constexpr uint32_t max_crop_pixels = 2 * 1024 * 1024;
   static constexpr uint32_t max_path_capacity = 64 * 1024;
 
   explicit WebGPURenderPipeline(Device &device);
@@ -47,9 +44,17 @@ class WebGPURenderPipeline {
                     std::span<const uint32_t> svm,
                     std::span<const uint32_t> sampling,
                     bool has_subsurface,
-                    bool advanced_query_svm);
+                    bool advanced_svm,
+                    bool ao_only_queries,
+                    bool residual_displacement_bump,
+                    bool paired_principled_layers,
+                    bool single_principled_coat,
+                    bool coated_principled_emission,
+                    bool compact_voronoi_distance,
+                    bool has_mixed_diffuse);
   /** Reset the GPU film and return the allocated capacity for the stock path scheduler. */
   bool reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WORDS> camera,
+             std::span<const float, CYCLES_WEBGPU_CAMERA_LENS_WORDS> camera_lens,
              std::span<const uint32_t, 16> denoising_config,
              const BufferParams &params,
              size_t film_words,

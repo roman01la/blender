@@ -6,7 +6,12 @@
  * descriptor after the GGX lookup tables. The world image starts at word 18
  * of the descriptor and contains linear RGB float words in row-major order. */
 #define CYCLES_WEBGPU_LIGHT_EXTENDED 7u
+/* Volume Light Tree descriptors do not use the compact area descriptor word. */
+#define CYCLES_WEBGPU_LIGHT_VOLUME_DIFFERENTIALS (1u << 31u)
 #define CYCLES_WEBGPU_LIGHT_FILTER_GLOSSY 11u
+#define CYCLES_WEBGPU_LIGHT_INV_RR_THRESHOLD 12u
+#define CYCLES_WEBGPU_LIGHT_RR_SAMPLING 13u
+#define CYCLES_WEBGPU_LIGHT_DIRECT_CLAMP 14u
 #define CYCLES_WEBGPU_AREA_AXIS_U 0u
 #define CYCLES_WEBGPU_AREA_AXIS_V 4u
 #define CYCLES_WEBGPU_AREA_DIRECTION 8u
@@ -18,6 +23,20 @@
 #define CYCLES_WEBGPU_LIGHT_SAMPLING 17u
 #define CYCLES_WEBGPU_EXTENDED_LIGHT_WORDS 18u
 #define CYCLES_WEBGPU_LIGHT_SAMPLING_WORDS 8u
+
+/* A procedural world stores the synchronized Nishita SVM record before the
+ * stock Sky Texture LUT. Its image interpolation retains the low bits. */
+#define CYCLES_WEBGPU_WORLD_SKY_FLAG (1u << 31u)
+#define CYCLES_WEBGPU_WORLD_SVM_FLAG (1u << 30u)
+#define CYCLES_WEBGPU_WORLD_SVM_WORD_COUNT 0u
+#define CYCLES_WEBGPU_WORLD_SVM_RGB_TO_Y 1u
+#define CYCLES_WEBGPU_WORLD_SVM_HEADER_WORDS 4u
+#define CYCLES_WEBGPU_SKY_STRENGTH 0u
+#define CYCLES_WEBGPU_SKY_XYZ_TO_RGB 1u
+#define CYCLES_WEBGPU_SKY_SUN 10u
+#define CYCLES_WEBGPU_SKY_SUN_WEIGHT 14u
+#define CYCLES_WEBGPU_SKY_PARAMETERS 15u
+#define CYCLES_WEBGPU_SKY_HEADER_WORDS (CYCLES_WEBGPU_SKY_PARAMETERS + 12u)
 
 /* Multiple point lights use a separate descriptor after the GGX tables.
  * The tag occupies the first position word, which is finite for a single light. */
@@ -36,6 +55,19 @@
  * indices in the light buffer, and all floating-point values are bit-cast. */
 #define CYCLES_WEBGPU_LIGHT_TREE_MARKER 0x7fc00001u
 #define CYCLES_WEBGPU_LIGHT_TREE_OFFSET 1u
+/* Optional tail lookup, used only by the mixed-light packet. Each record holds
+ * the mode (zero means constant emission), emission color, strength, and a falloff
+ * parameter. Modes 1 through 3 use stock Light Falloff smoothing. The Ray Length
+ * modes use the same word for the divisor. The lamp record keeps its usual stride. */
+#define CYCLES_WEBGPU_TREE_LAMP_FALLOFF_OFFSET 2u
+#define CYCLES_WEBGPU_LAMP_FALLOFF_WORDS 6u
+#define CYCLES_WEBGPU_LAMP_FALLOFF_MODE 0u
+#define CYCLES_WEBGPU_LAMP_FALLOFF_COLOR 1u
+#define CYCLES_WEBGPU_LAMP_FALLOFF_STRENGTH 4u
+#define CYCLES_WEBGPU_LAMP_FALLOFF_SMOOTH 5u
+#define CYCLES_WEBGPU_LAMP_RAY_LENGTH 4u
+#define CYCLES_WEBGPU_LAMP_RAY_LENGTH_INVERTED 5u
+#define CYCLES_WEBGPU_LAMP_RAY_LENGTH_DIVISOR CYCLES_WEBGPU_LAMP_FALLOFF_SMOOTH
 #define CYCLES_WEBGPU_TREE_LAMP_COUNT 0u
 #define CYCLES_WEBGPU_TREE_LAMPS 1u
 #define CYCLES_WEBGPU_TREE_NODE_COUNT 2u
@@ -68,6 +100,13 @@
 #define CYCLES_WEBGPU_TREE_TRIANGLE_TO_TREE 29u
 #define CYCLES_WEBGPU_TREE_TEXTURED_EMITTERS 30u
 #define CYCLES_WEBGPU_TREE_DESCRIPTOR_WORDS 31u
+/* Zero tree nodes select the stock flat distribution. Its descriptor extends
+ * the shared lamp, mesh and world offsets without moving any tree fields. */
+#define CYCLES_WEBGPU_DISTRIBUTION_OFFSET 31u
+#define CYCLES_WEBGPU_DISTRIBUTION_COUNT 32u
+#define CYCLES_WEBGPU_DISTRIBUTION_LAMP_PDF 33u
+#define CYCLES_WEBGPU_DISTRIBUTION_TRIANGLE_PDF 34u
+#define CYCLES_WEBGPU_DISTRIBUTION_DESCRIPTOR_WORDS 35u
 
 /* One uint4 after the shadow-ray array, indexed by the same path slot. */
 #define CYCLES_WEBGPU_TEXTURED_LIGHT_SAMPLE_WORDS 4u
@@ -85,6 +124,10 @@
 #define CYCLES_WEBGPU_TREE_LAMP_SPREAD 22u
 #define CYCLES_WEBGPU_TREE_LAMP_NORMALIZE_SPREAD 23u
 #define CYCLES_WEBGPU_TREE_LAMP_WORDS 24u
+#define CYCLES_WEBGPU_LAMP_SUN_ANGLE CYCLES_WEBGPU_TREE_LAMP_AXIS_U
+#define CYCLES_WEBGPU_LAMP_SUN_ONE_MINUS_COS (CYCLES_WEBGPU_TREE_LAMP_AXIS_U + 1u)
+#define CYCLES_WEBGPU_LAMP_SUN_PDF (CYCLES_WEBGPU_TREE_LAMP_AXIS_U + 2u)
+#define CYCLES_WEBGPU_LAMP_SUN_EVAL (CYCLES_WEBGPU_TREE_LAMP_AXIS_U + 3u)
 
 #define CYCLES_WEBGPU_TREE_NODE_MIN 0u
 #define CYCLES_WEBGPU_TREE_NODE_MAX 3u

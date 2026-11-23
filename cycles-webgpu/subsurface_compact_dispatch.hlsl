@@ -36,7 +36,7 @@ extern void cycles_subsurface_walk(float4 entry, float4 direction, float4 normal
                                    uint4 rng, uint4 surface, out uint4 hit, out float4 coordinates,
                                    out float4 exit_direction, out float4 throughput,
                                    float4 geometric, uint backfacing, float4 shading_normal,
-                                   out float4 exit_origin, out uint exit_flags);
+                                   float4 closure_normal, out float4 exit_origin, out uint exit_flags);
 
 float4 load_point(uint offset, float w)
 {
@@ -63,6 +63,9 @@ void main(uint3 id : SV_DispatchThreadID)
   const float4 specular = materials[material + 1];
   const float4 glass = materials[material + 3];
   const float4 radius = materials[material + 4];
+  const float4 closure_normal = materials[material + CYCLES_WEBGPU_MATERIAL_NORMAL_SLOT];
+  const float4 shading_normal = closure_normal.w >= CYCLES_WEBGPU_NORMAL_SHADER ?
+                                    closure_normal : load_point(surface + 4, 0.0f);
   const float4 input_throughput = __builtin_bit_cast(
       float4, uint4(path_words[weight], path_words[weight + 1], path_words[weight + 2],
                    __builtin_bit_cast(uint, specular.w)));
@@ -83,7 +86,7 @@ void main(uint3 id : SV_DispatchThreadID)
                          float4(__builtin_elementwise_min(base.xyz, float3(1, 1, 1)), glass.y),
                          radius, input_throughput, rng, entry_hit, hit, coordinates, direction,
                          throughput, load_point(normals, 0.0f), points[surface + 3] == 2u,
-                         load_point(surface + 4, 0.0f), origin, exit_flags);
+                         shading_normal, closure_normal, origin, exit_flags);
 
   const uint queued = path + CYCLES_WEBGPU_PATH_QUEUED_KERNEL;
   if (hit.x == 0u) {

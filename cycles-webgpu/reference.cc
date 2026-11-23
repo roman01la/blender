@@ -44,7 +44,7 @@ static void set_sampling(const unsigned int pattern, const bool fixed_jitter)
 
 struct TestCase {
   std::array<unsigned int, 6> tile;
-  std::array<Float4, 8> camera;
+  std::array<Float4, 12> camera;
   unsigned int visibility = 1;
 };
 
@@ -81,7 +81,7 @@ int main(int argc, char **argv)
   };
   // View the packed CPU BVH fixture from above. The cameras cover all three
   // instances and the gaps between them, with both work tile orderings.
-  const std::array<Float4, 8> overhead{
+  const std::array<Float4, 12> overhead{
       Float4{0.0577f, 0, 0, -1.401f}, Float4{0, 0.0713f, 0, -0.611f},
       Float4{0, 0, 0, 1}, Float4{0, 0, 0, 1},
       Float4{1, 0, 0, 0.132f}, Float4{0, -1, 0, -0.172f}, Float4{0, 0, -1, 17.7f},
@@ -110,11 +110,30 @@ int main(int argc, char **argv)
   if (argc != 1 && !primary) {
     return 2;
   }
+  auto perspective_dof = overhead;
+  perspective_dof[8] = {0, 0.26f, 12.0f, 1.0f};
+  auto perspective_polygon = perspective_dof;
+  perspective_polygon[8].w = 0.67f;
+  perspective_polygon[9] = {5, 0.21f, 0, 0};
+
+  auto orthographic = overhead;
+  orthographic[7].x = 0.25f;
+  orthographic[2] = {};
+  orthographic[8] = {float(ccl::CAMERA_ORTHOGRAPHIC), 0, 15.0f, 1.0f};
+  auto orthographic_dof = orthographic;
+  orthographic_dof[8].y = 0.46f;
+  orthographic_dof[8].w = 1.4f;
+  orthographic_dof[9] = {7, -0.15f, 0, 0};
+
   const TestCase sampled_cases[] = {
       {{3, 2, 43, 13, 0, 3}, overhead, 1},
       {{3, 2, 43, 13, 2, 3}, diffuse_view, 4},
       {{5, 3, 37, 12, 2, 3}, overhead, 1},
       {{5, 3, 37, 12, 0, 1}, below_view, 1},
+      {{18, 5, 13, 8, 0, 4}, perspective_dof, 1},
+      {{18, 5, 13, 8, 0, 4}, perspective_polygon, 1},
+      {{9, 3, 10, 7, 0, 3}, orthographic, 1},
+      {{9, 3, 10, 7, 0, 5}, orthographic_dof, 1},
   };
   const unsigned int patterns[] = {ccl::SAMPLING_PATTERN_BLUE_NOISE_PURE,
                                    ccl::SAMPLING_PATTERN_SOBOL_BURLEY,
@@ -148,7 +167,8 @@ int main(int argc, char **argv)
       write_range(std::array{r.x, r.y, r.z, r.w});
     }
     if (sampled) {
-      set_sampling(patterns[i], i == 3);
+      const size_t pattern_index = i % std::size(patterns);
+      set_sampling(patterns[pattern_index], pattern_index == 3);
       std::cout << "],\"sampling\":";
       write_range(sampling);
       std::cout << ",\"expected\":[";
@@ -164,9 +184,10 @@ int main(int argc, char **argv)
                                            index, camera[7].z);
       Float4 origin, direction;
       unsigned int rng_pixel;
-      float dD;
+      float dP, dD;
       cycles_camera_ray(pixel, camera[0], camera[1], camera[2], camera[3], camera[4], camera[5],
-                        camera[6], camera[7], origin, direction, rng_pixel, dD);
+                        camera[6], camera[7], camera[8], camera[9], camera[10], camera[11],
+                        origin, direction, rng_pixel, dP, dD);
       std::cout << '[';
       write_range(std::array{pixel.x, pixel.y, pixel.z, pixel.w});
       std::cout << ',';

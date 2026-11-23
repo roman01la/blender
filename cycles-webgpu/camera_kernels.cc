@@ -52,6 +52,12 @@ static float camera_sample_pattern_lut(unsigned int i)
 #include "kernel/camera/camera.h"
 #ifdef CYCLES_PRIMARY_RAY_QUEUE
 #  include "kernel/sample/pattern.h"
+#  ifdef CYCLES_WEBGPU_CAMERA_SAMPLE
+#    define __KERNEL_GPU__
+#    include "kernel/util/profiler.h"
+#    undef __KERNEL_GPU__
+#    include "kernel/integrator/init_from_camera.h"
+#  endif
 
 #  ifdef CYCLES_WEBGPU_ADAPTIVE_CAMERA_RAYS
 unsigned int cycles_adaptive_sample_class(const unsigned int sample)
@@ -77,7 +83,8 @@ static void load_sampling(ccl::KernelIntegrator &integrator,
 #endif
 
 #if defined(CYCLES_WEBGPU_PATH_UPDATE) || defined(CYCLES_WEBGPU_SHADE_BACKGROUND) || \
-    defined(CYCLES_WEBGPU_DENOISE_SURFACE)
+    defined(CYCLES_WEBGPU_DENOISE_SURFACE) || defined(CYCLES_WEBGPU_FILM_SURFACE) || \
+    defined(CYCLES_WEBGPU_FILM_AO)
 static unsigned int path_settings_offset()
 {
   unsigned int offset = sampling_header_words + FILTER_TABLE_SIZE;
@@ -98,9 +105,15 @@ unsigned int cycles_film_transparent()
   return cycles_camera_sample_word(path_settings_offset() + 9);
 }
 
+float cycles_path_direct_clamp()
+{
+  return std::bit_cast<float>(cycles_camera_sample_word(path_settings_offset() + 10));
+}
+
 #endif
 
-#if defined(CYCLES_WEBGPU_PATH_UPDATE) || defined(CYCLES_WEBGPU_DENOISE_SURFACE)
+#if defined(CYCLES_WEBGPU_PATH_UPDATE) || defined(CYCLES_WEBGPU_DENOISE_SURFACE) || \
+    defined(CYCLES_WEBGPU_FILM_SURFACE)
 #  include "../blender-platform/cycles-webgpu/material_layout.h"
 
 float cycles_ggx_lookup(const unsigned int index)
@@ -201,6 +214,23 @@ UInt4 cycles_path_lobe_settings()
           std::bit_cast<uint>(next_rr)};
 }
 
+static bool sample_mixed_transparent(ccl::float3 &random,
+                                     const ccl::ClosureType opaque_type,
+                                     const float opaque_weight,
+                                     const float transparent_weight,
+                                     const bool transparent_first)
+{
+  using namespace ccl;
+  ShaderData sd{};
+  sd.num_closure = 2;
+  const int first = transparent_first ? 0 : 1;
+  sd.closure[first].type = CLOSURE_BSDF_TRANSPARENT_ID;
+  sd.closure[first].sample_weight = transparent_weight;
+  sd.closure[1 - first].type = opaque_type;
+  sd.closure[1 - first].sample_weight = opaque_weight;
+  return surface_shader_bsdf_bssrdf_pick(&sd, &random)->type == CLOSURE_BSDF_TRANSPARENT_ID;
+}
+
 [[gnu::always_inline]] Float4 cycles_sample_mixed_transparency(UInt4 rng,
                                                              Float4 diffuse,
                                                              Float4 transparent,
@@ -222,14 +252,8 @@ UInt4 cycles_path_lobe_settings()
                 std::bit_cast<float>(cycles_path_settings().z));
   float3 random = path_rng_3D(
       &globals, rng.x, int(rng.y), rng.z * PRNG_BOUNCE_NUM + PRNG_SURFACE_BSDF);
-  const int first = weights.y != 0.0f ? 0 : 1;
-  ShaderData sd{};
-  sd.num_closure = 2;
-  sd.closure[first].type = CLOSURE_BSDF_TRANSPARENT_ID;
-  sd.closure[first].sample_weight = transparent.w;
-  sd.closure[1 - first].type = CLOSURE_BSDF_DIFFUSE_ID;
-  sd.closure[1 - first].sample_weight = weights.x;
-  if (surface_shader_bsdf_bssrdf_pick(&sd, &random)->type != CLOSURE_BSDF_TRANSPARENT_ID) {
+  if (!sample_mixed_transparent(
+          random, CLOSURE_BSDF_DIFFUSE_ID, weights.x, transparent.w, weights.y != 0.0f)) {
     return {};
   }
 
@@ -304,6 +328,7 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
                                    Float4 parameters,
                                    Float4 glass,
                                    Float4 hair,
+                                   Float4 bump,
                                    Float4 throughput,
                                    Float4 &next_throughput,
                                    float &next_pdf,
@@ -311,7 +336,10 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
                                    UInt4 &direction,
                                    UInt4 &next_counts,
                                    float &surface_rr,
-                                   float &roughness_squared)
+                                   float &roughness_squared,
+                                   unsigned int light_passes,
+                                   Float4 &diffuse_ratio,
+                                   Float4 &glossy_ratio)
 {
   ccl::CameraGlobals globals;
   auto &integrator = globals.data.integrator;
@@ -324,66 +352,124 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
 
   const int sample = int(sample_index);
   const int rng_offset = (int(bounce + subsurface_steps) + 1) * ccl::PRNG_BOUNCE_NUM;
-  const auto random = ccl::path_rng_3D(
+  auto random = ccl::path_rng_3D(
       &globals, rng_pixel, sample, rng_offset + ccl::PRNG_SURFACE_BSDF);
   surface_rr = 0.0f;
   roughness_squared = 1.0f;
+  diffuse_ratio = glossy_ratio = {};
   next_throughput = throughput;
   next_pdf = 0.0f;
   origin = {};
   direction = {};
   next_counts = path_counts;
 
-  const auto N = ccl::make_float3(std::bit_cast<float>(normal.x),
-                                 std::bit_cast<float>(normal.y),
-                                 std::bit_cast<float>(normal.z));
+  const auto N = bump.w >= CYCLES_WEBGPU_NORMAL_BOTH ?
+                     ccl::make_float3(hair.x, hair.y, hair.z) :
+                 bump.w >= CYCLES_WEBGPU_NORMAL_SHADER ?
+                     ccl::make_float3(bump.x, bump.y, bump.z) :
+                     ccl::make_float3(std::bit_cast<float>(normal.x),
+                                      std::bit_cast<float>(normal.y),
+                                      std::bit_cast<float>(normal.z));
   const auto Ng = ccl::make_float3(std::bit_cast<float>(geometric_normal.x),
                                   std::bit_cast<float>(geometric_normal.y),
                                   std::bit_cast<float>(geometric_normal.z));
-  const auto Ns = ccl::make_float3(std::bit_cast<float>(specular_normal.x),
-                                  std::bit_cast<float>(specular_normal.y),
-                                  std::bit_cast<float>(specular_normal.z));
+  const Float4 wi{-std::bit_cast<float>(ray.x),
+                  -std::bit_cast<float>(ray.y),
+                  -std::bit_cast<float>(ray.z),
+                  0};
+  const bool mixed_glossy = material.w == CYCLES_WEBGPU_MATERIAL_DIFFUSE_GLOSSY;
+  const unsigned int mixed_flags = mixed_glossy ? static_cast<unsigned int>(parameters.z) : 0u;
+  const Float4 glossy_bump = cycles_mixed_glossy_bump(bump, hair, mixed_flags);
+  const Float4 corrected = cycles_bump_specular_normal(
+      glossy_bump, Float4{Ng.x, Ng.y, Ng.z, 0}, wi, std::bit_cast<Float4>(specular_normal));
+  const auto Ns = ccl::make_float3(corrected.x, corrected.y, corrected.z);
   ccl::float3 D;
   float pdf;
   int label;
   const bool standalone = CYCLES_WEBGPU_MATERIAL_IS_STANDALONE(material.w);
-  const bool translucent = standalone && material.w == CYCLES_WEBGPU_MATERIAL_TRANSLUCENT;
+  const bool ordered = CYCLES_WEBGPU_MATERIAL_HAS_ORDERED_CLOSURES(material.w);
+  const bool ggx = material.w == CYCLES_WEBGPU_MATERIAL_GGX ||
+                   material.w == CYCLES_WEBGPU_MATERIAL_MULTISCATTER_GGX;
+  const bool mixed_diffuse_translucent = material.w == CYCLES_WEBGPU_MATERIAL_DIFFUSE_TRANSLUCENT;
+  const bool translucent =
+      (ggx && CYCLES_WEBGPU_GGX_HAS_TRANSLUCENT(glass)) ||
+      (standalone && (material.w == CYCLES_WEBGPU_MATERIAL_TRANSLUCENT ||
+                      (mixed_diffuse_translucent && parameters.y > 0.0f) ||
+                      (ordered && (unsigned(hair.w) & CYCLES_WEBGPU_ORDERED_HAS_TRANSLUCENT))));
   if (standalone) {
+    if (ordered && (path_counts.w & ccl::PATH_RAY_TERMINATE_AFTER_TRANSPARENT)) {
+      if (!(unsigned(hair.w) & CYCLES_WEBGPU_ORDERED_HAS_TRANSPARENT)) {
+        return 0;
+      }
+      next_throughput *= Float4{hair.x, hair.y, hair.z, 0.0f};
+      return CYCLES_WEBGPU_MIXED_TRANSPARENT_PENDING;
+    }
+    float glossy_probability = 1.0f;
+    if (material.w == CYCLES_WEBGPU_MATERIAL_GLOSSY_TRANSPARENT) {
+      const bool only_transparent =
+          (path_counts.w & ccl::PATH_RAY_TERMINATE_AFTER_TRANSPARENT) != 0;
+      ccl::Spectrum glossy = ccl::make_float3(material.x, material.y, material.z);
+      const float glossy_weight = ccl::closure_sample_weight(0, glossy);
+      const float transparent_weight = fabsf(hair.w);
+      const Float4 transparent{hair.x, hair.y, hair.z, 0.0f};
+      if (only_transparent || !(glossy_weight > 0.0f)) {
+        if (!(transparent_weight > 0.0f)) {
+          return 0;
+        }
+        next_throughput *= transparent;
+        return CYCLES_WEBGPU_MIXED_TRANSPARENT_PENDING;
+      }
+      if (transparent_weight > 0.0f) {
+        const float total = glossy_weight + transparent_weight;
+        if (sample_mixed_transparent(random, ccl::CLOSURE_BSDF_MICROFACET_GGX_ID,
+                                     glossy_weight, transparent_weight, hair.w < 0.0f))
+        {
+          /* The reflected closure has zero density along the unchanged ray. */
+          next_throughput *= transparent * (total / transparent_weight);
+          return CYCLES_WEBGPU_MIXED_TRANSPARENT_PENDING;
+        }
+        glossy_probability = glossy_weight / total;
+      }
+    }
     const auto closure_normal = CYCLES_WEBGPU_MATERIAL_USES_SPECULAR_NORMAL(material.w) ? Ns : N;
-    const Float4 wi{-std::bit_cast<float>(ray.x),
-                    -std::bit_cast<float>(ray.y),
-                    -std::bit_cast<float>(ray.z),
-                    0};
     Float4 weight, wo;
+    const bool mixed_diffuse = mixed_diffuse_translucent || mixed_glossy || ordered;
+    const Float4 extra = mixed_diffuse ? corrected : glass;
+    const Float4 diffuse_bump = (mixed_flags & CYCLES_WEBGPU_MIXED_BUMP_GLOSSY_ONLY) ?
+                                    Float4{} : bump;
+    const Float4 lobe_data = mixed_glossy ? diffuse_bump : hair;
     label = cycles_standalone_sample(material,
                                      specular,
                                      parameters,
+                                     extra,
+                                     lobe_data,
                                      glass,
-                                     hair,
                                      Float4{closure_normal.x, closure_normal.y, closure_normal.z, 0},
                                      Float4{Ng.x, Ng.y, Ng.z, 0},
                                      wi,
                                      Float4{random.x, random.y, random.z, 0},
                                      cycles_glossy_blur(std::bit_cast<float>(lobe_settings.w), min_ray_pdf),
                                      weight,
-                                     wo);
+                                     wo,
+                                     diffuse_ratio);
+    glossy_ratio = Float4{1.0f, 1.0f, 1.0f, 0.0f} - diffuse_ratio;
     if (label == ccl::LABEL_NONE) {
       return 0;
     }
     D = ccl::make_float3(wo.x, wo.y, wo.z);
-    if (material.w == CYCLES_WEBGPU_MATERIAL_GLOSSY) {
+    if (CYCLES_WEBGPU_MATERIAL_IS_GLOSSY(material.w) || mixed_glossy || ordered)
+    {
       roughness_squared = wo.w;
     }
-    pdf = weight.w;
-    next_throughput *= weight;
+    pdf = weight.w * glossy_probability;
+    next_throughput *= weight / glossy_probability;
+    if (label & ccl::LABEL_TRANSPARENT) {
+      /* The ordered Transparent mixture has only diffuse and singular lobes. */
+      glossy_ratio = {};
+      return CYCLES_WEBGPU_MIXED_TRANSPARENT_PENDING;
+    }
   }
-  else if (material.w == CYCLES_WEBGPU_MATERIAL_GGX ||
-      material.w == CYCLES_WEBGPU_MATERIAL_MULTISCATTER_GGX)
-  {
-    const Float4 wi{-std::bit_cast<float>(ray.x),
-                    -std::bit_cast<float>(ray.y),
-                    -std::bit_cast<float>(ray.z),
-                    0};
+  else if (ggx) {
     Float4 weight, wo;
     label = cycles_ggx_sample(material,
                               specular,
@@ -392,14 +478,19 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
                               Float4{N.x, N.y, N.z, position.w == 2 ? 1.0f : 0.0f},
                               Float4{Ng.x, Ng.y, Ng.z, 0},
                               Float4{Ns.x, Ns.y, Ns.z, 0},
+                              std::bit_cast<Float4>(specular_normal),
+                              bump,
                               wi,
                               Float4{random.x, random.y, random.z, 0},
-                              glass.w == 0.0f ? hair : Float4{},
+                              hair,
                               cycles_glossy_blur(std::bit_cast<float>(lobe_settings.w), min_ray_pdf),
                               ray_differentials != 0,
                               (path_counts.w & ccl::PATH_RAY_TERMINATE_AFTER_TRANSPARENT) != 0,
                               weight,
-                              wo);
+                              wo,
+                              light_passes != 0u,
+                              diffuse_ratio,
+                              glossy_ratio);
     if (label == 0) {
       return 0;
     }
@@ -415,10 +506,18 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
     }
   }
   else {
-    ccl::webgpu_sample_cos_hemisphere(N, ccl::make_float2(random.x, random.y), &D, &pdf);
+    const auto diffuse_normal = bump.w == 0.0f ? N : ccl::make_float3(bump.x, bump.y, bump.z);
+    ccl::webgpu_sample_cos_hemisphere(
+        diffuse_normal, ccl::make_float2(random.x, random.y), &D, &pdf);
     if (!(pdf > 0.0f && ccl::dot(Ng, D) > 0.0f)) {
       return 0;
     }
+    const float shadowing = cycles_bump_shadowing(
+        Float4{N.x, N.y, N.z, 0}, bump, Float4{D.x, D.y, D.z, 0}, false);
+    if (shadowing == 0.0f) {
+      return 0;
+    }
+    next_throughput *= shadowing;
     if (material.w == CYCLES_WEBGPU_MATERIAL_MIXED_TRANSPARENT) {
       /* Transparent has zero directional density in the diffuse direction. */
       const float diffuse_probability = parameters.x / (parameters.x + specular.w);
@@ -426,6 +525,7 @@ unsigned int cycles_surface_bounce(unsigned int rng_pixel,
       next_throughput /= diffuse_probability;
     }
     label = ccl::LABEL_REFLECT | ccl::LABEL_DIFFUSE;
+    diffuse_ratio = {1.0f, 1.0f, 1.0f, 0.0f};
   }
   next_pdf = pdf;
 
@@ -480,6 +580,8 @@ static ccl::float4 camera_row(Float4 row)
   return ccl::make_float4(row.x, row.y, row.z, row.w);
 }
 
+/* Keep the ray outputs as shader-local values when linking the C++ and HLSL stages. */
+[[gnu::always_inline]]
 void cycles_camera_ray(UInt4 pixel,
                        Float4 projection_x,
                        Float4 projection_y,
@@ -489,9 +591,14 @@ void cycles_camera_ray(UInt4 pixel,
                        Float4 world_y,
                        Float4 world_z,
                        Float4 clip,
+                       Float4 lens,
+                       Float4 aperture,
+                       Float4 dx,
+                       Float4 dy,
                        Float4 &origin,
                        Float4 &direction,
                        unsigned int &rng_pixel,
+                       float &dP,
                        float &dD)
 {
   ccl::CameraGlobals globals;
@@ -504,43 +611,44 @@ void cycles_camera_ray(UInt4 pixel,
   camera.nearclip = clip.x;
   camera.cliplength = clip.y;
   camera.differential_scale = clip.w;
-  if (clip.w != 0.0f) {
-    /* Same perspective raster steps as Camera::update(), in the synchronized
-     * camera-to-world frame used by the stock camera kernel. */
-    const auto &projection = camera.rastertocamera;
-    const auto center = ccl::transform_perspective(&projection, ccl::zero_float3());
-    camera.dx = ccl::make_float4(ccl::transform_direction(
-        &camera.cameratoworld,
-        ccl::transform_perspective(&projection, ccl::make_float3(1, 0, 0)) - center));
-    camera.dy = ccl::make_float4(ccl::transform_direction(
-        &camera.cameratoworld,
-        ccl::transform_perspective(&projection, ccl::make_float3(0, 1, 0)) - center));
-  }
+  const bool orthographic = lens.x == float(ccl::CAMERA_ORTHOGRAPHIC);
+  camera.type = orthographic ? ccl::CAMERA_ORTHOGRAPHIC : ccl::CAMERA_PERSPECTIVE;
+  camera.shuttertime = -1.0f;
+  camera.aperturesize = lens.y;
+  camera.focaldistance = lens.z;
+  camera.inv_aperture_ratio = lens.w;
+  camera.blades = aperture.x;
+  camera.bladesrotation = aperture.y;
+  camera.dx = camera_row(dx);
+  camera.dy = camera_row(dy);
 
   ccl::Ray ray{};
   rng_pixel = 0;
-#ifdef CYCLES_PRIMARY_RAY_QUEUE
+#ifdef CYCLES_WEBGPU_CAMERA_SAMPLE
   const auto pattern = cycles_camera_sample_word(0);
   if (pattern != ~0u) {
-    camera.type = ccl::CAMERA_PERSPECTIVE;
-    camera.shuttertime = -1.0f;
     load_sampling(globals.data.integrator, pattern, clip.z);
+    const int x = int(pixel.x);
+    const int y = int(pixel.y);
     const int sample = int(pixel.z);
-    rng_pixel = ccl::path_rng_pixel_init(&globals, sample, int(pixel.x), int(pixel.y));
-    const auto filter = sample == 0 ? ccl::make_float2(0.5f, 0.5f) :
-                                      ccl::path_rng_2D(&globals, rng_pixel, sample, ccl::PRNG_FILTER);
-    int cache_miss;
-    ccl::camera_sample(
-        &globals, int(pixel.x), int(pixel.y), filter, 0.0f, ccl::zero_float2(), &ray, cache_miss);
+    rng_pixel = ccl::path_rng_pixel_init(&globals, sample, x, y);
+    int cache_miss = 0;
+    ccl::integrate_camera_sample(&globals, sample, x, y, rng_pixel, &ray, cache_miss);
   }
   else
 #endif
   {
     const auto raster = ccl::make_float2(float(pixel.x) + 0.5f, float(pixel.y) + 0.5f);
-    ccl::camera_sample_perspective(&globals, raster, ccl::zero_float2(), &ray);
+    if (orthographic) {
+      ccl::camera_sample_orthographic(&globals, raster, ccl::zero_float2(), &ray);
+    }
+    else {
+      ccl::camera_sample_perspective(&globals, raster, ccl::zero_float2(), &ray);
+    }
   }
   origin = {ray.P.x, ray.P.y, ray.P.z, ray.tmin};
   direction = {ray.D.x, ray.D.y, ray.D.z, ray.tmax};
+  dP = ray.dP;
   dD = ray.dD;
 }
 
@@ -591,3 +699,21 @@ UInt4 cycles_work_pixel(unsigned int tile_x,
   context.get_work_pixel(&tile, work_index, &x, &y, &sample);
   return {x, y, sample, 0};
 }
+
+#ifdef CYCLES_WEBGPU_FILM_AO
+[[gnu::always_inline]] Float4 cycles_film_ao_sample(
+    unsigned int rng_pixel, unsigned int sample, unsigned int bounce, Float4 normal)
+{
+  using namespace ccl;
+  CameraGlobals globals;
+  load_sampling(globals.data.integrator,
+                cycles_camera_sample_word(0),
+                std::bit_cast<float>(cycles_camera_sample_word(path_settings_offset() + 2)));
+  const float2 random = path_rng_2D(
+      &globals, rng_pixel, int(sample), (int(bounce) + 1) * PRNG_BOUNCE_NUM + PRNG_SURFACE_BSDF);
+  float3 direction;
+  float pdf;
+  sample_cos_hemisphere(make_float3(normal.x, normal.y, normal.z), random, &direction, &pdf);
+  return {direction.x, direction.y, direction.z, 0.0f};
+}
+#endif

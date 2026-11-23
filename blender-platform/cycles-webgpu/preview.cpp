@@ -109,6 +109,9 @@ bool pack_camera_sampling(const DeviceScene &scene,
     else if (multiple_points) {
       descriptor = encoded.lighting[CYCLES_WEBGPU_POINT_LIGHTS_OFFSET];
     }
+    if (descriptor == 0) {
+      descriptor = encoded.lighting[CYCLES_WEBGPU_LIGHT_RR_SAMPLING];
+    }
     lookup_words = (descriptor ? descriptor : encoded.lighting.size()) -
                    CYCLES_WEBGPU_LIGHT_HEADER_WORDS;
   }
@@ -121,7 +124,7 @@ bool pack_camera_sampling(const DeviceScene &scene,
   for (size_t i = 0; i < sobol_size; ++i) {
     words.push_back(std::bit_cast<uint32_t>(scene.sample_pattern_lut.data()[i]));
   }
-  const bool ray_differentials = encoded.svm[1] & CYCLES_WEBGPU_SVM_PIXEL_WIREFRAME;
+  const bool ray_differentials = encoded.svm[1] & CYCLES_WEBGPU_SVM_NEEDS_DIFFERENTIALS;
   words.push_back((encoded.max_bounces + 1) |
                   (ray_differentials ? CYCLES_WEBGPU_PATH_SETTINGS_DIFFERENTIALS : 0u));
   words.push_back(uint32_t(integrator.min_bounce));
@@ -136,11 +139,14 @@ bool pack_camera_sampling(const DeviceScene &scene,
   words.push_back(uint32_t(integrator.max_glossy_bounce));
   words.push_back(uint32_t(integrator.max_transmission_bounce));
   words.push_back(std::bit_cast<uint32_t>(integrator.filter_glossy));
-  const uint32_t transparent_min = encoded.surface.front() == CYCLES_WEBGPU_SURFACE_TRANSPARENT_OFFSETS ?
-                                       uint32_t(integrator.transparent_min_bounce) :
-                                       0;
+  const uint32_t surface_header = encoded.surface.front();
+  const bool transparent = CYCLES_WEBGPU_SURFACE_HAS_TRANSPARENCY(surface_header) ||
+                           (CYCLES_WEBGPU_SURFACE_HAS_VOLUME(surface_header) &&
+                            encoded.surface[CYCLES_WEBGPU_SURFACE_TRANSPARENT_OFFSET] != 0);
+  const uint32_t transparent_min = transparent ? uint32_t(integrator.transparent_min_bounce) : 0;
   words.push_back(uint32_t(integrator.transparent_max_bounce) | (transparent_min << 16));
   words.push_back(uint32_t(scene.data.background.transparent));
+  words.push_back(std::bit_cast<uint32_t>(integrator.sample_clamp_direct));
   if (lookup_words) {
     const auto first = encoded.lighting.begin() + CYCLES_WEBGPU_LIGHT_HEADER_WORDS;
     words.insert(words.end(), first, first + lookup_words);
@@ -167,7 +173,15 @@ bool supports_passes(const BufferParams &params, const bool volume)
            (pass.mode == PassMode::NOISY &&
             (pass.type == PASS_SAMPLE_COUNT || pass.type == PASS_ADAPTIVE_AUX_BUFFER ||
              pass.type == PASS_DENOISING_ALBEDO || pass.type == PASS_DENOISING_NORMAL ||
-             pass.type == PASS_AOV_COLOR || pass.type == PASS_AOV_VALUE));
+             pass.type == PASS_AOV_COLOR || pass.type == PASS_AOV_VALUE ||
+             pass.type == PASS_DEPTH || pass.type == PASS_OBJECT_ID ||
+             pass.type == PASS_MATERIAL_ID || pass.type == PASS_POSITION ||
+             pass.type == PASS_EMISSION || pass.type == PASS_NORMAL ||
+             pass.type == PASS_DIFFUSE_COLOR || pass.type == PASS_GLOSSY_COLOR ||
+             pass.type == PASS_TRANSMISSION_COLOR || pass.type == PASS_AO ||
+             pass.type == PASS_DIFFUSE_DIRECT || pass.type == PASS_DIFFUSE_INDIRECT ||
+             pass.type == PASS_GLOSSY_DIRECT || pass.type == PASS_GLOSSY_INDIRECT ||
+             pass.type == PASS_TRANSMISSION_DIRECT || pass.type == PASS_TRANSMISSION_INDIRECT));
   });
 }
 
@@ -183,9 +197,13 @@ void WebGPUPreview::prepare(const Scene &scene, bool scene_changed)
   }
 
   const KernelCamera &cam = scene.dscene.data.cam;
-  if (cam.type != CAMERA_PERSPECTIVE || cam.use_dof_or_motion_blur || cam.aperturesize != 0 ||
-      cam.num_motion_steps || cam.interocular_offset != 0 || scene.dscene.data.bake.use)
+  if ((cam.type != CAMERA_PERSPECTIVE && cam.type != CAMERA_ORTHOGRAPHIC) ||
+      cam.shuttertime != -1.0f || cam.num_motion_steps || cam.have_perspective_motion ||
+      cam.interocular_offset != 0.0f || scene.dscene.data.bake.use)
   {
+    if (scene_changed) {
+      LOG_INFO << "Cycles WebGPU using CPU: camera projection, motion blur, stereo, or baking";
+    }
     scene_checked_ = false;
     scene_supported_ = false;
     volume_ = false;
@@ -209,7 +227,7 @@ void WebGPUPreview::prepare(const Scene &scene, bool scene_changed)
       scene_supported_ = false;
     }
     volume_ = scene_supported_ && !scene_.surface.empty() &&
-              scene_.surface.front() == CYCLES_WEBGPU_SURFACE_ABSORPTION_OFFSETS;
+              CYCLES_WEBGPU_SURFACE_HAS_VOLUME(scene_.surface.front());
     if (volume_) {
       for (const Pass *pass : scene.passes) {
         if (volume_auxiliary_pass(pass->get_type()) && !pass->is_auto()) {
@@ -235,15 +253,37 @@ void WebGPUPreview::prepare(const Scene &scene, bool scene_changed)
     }
     scene_pending_ = true;
     reset_pending_ = true;
-    ray_differentials = (scene_.svm[1] & CYCLES_WEBGPU_SVM_PIXEL_WIREFRAME) != 0;
+    ray_differentials = (scene_.svm[1] & CYCLES_WEBGPU_SVM_NEEDS_DIFFERENTIALS) != 0;
   }
 
   const auto camera = pack_camera(cam,
                                   scene.dscene.data.integrator.scrambling_distance,
                                   ray_differentials);
+  /* dx/dy come from Camera::update(), including the full-resolution raster
+   * and the different derivative definitions of each projection. */
+  const std::array<float, CYCLES_WEBGPU_CAMERA_LENS_WORDS> camera_lens = {
+      float(cam.type),
+      cam.aperturesize,
+      cam.focaldistance,
+      cam.inv_aperture_ratio,
+      cam.blades,
+      cam.bladesrotation,
+      0.0f,
+      0.0f,
+      cam.dx.x,
+      cam.dx.y,
+      cam.dx.z,
+      0.0f,
+      cam.dy.x,
+      cam.dy.y,
+      cam.dy.z,
+      0.0f};
   const auto &world_to_camera = cam.worldtocamera;
   std::array<uint32_t, 16> denoising_config = {
-      0, 0, uint32_t(scene.dscene.data.film.denoising_pass_options_flag), 0};
+      0, 0, uint32_t(scene.dscene.data.film.denoising_pass_options_flag),
+      std::bit_cast<uint32_t>(scene.dscene.data.integrator.ao_bounces_distance)};
+  /* Normal transforms use only the XYZ components of these rows. */
+  denoising_config[7] = std::bit_cast<uint32_t>(scene.dscene.data.film.pass_alpha_threshold);
   const std::array rows = {world_to_camera.x, world_to_camera.y, world_to_camera.z};
   for (size_t row = 0; row < rows.size(); ++row) {
     const auto &value = rows[row];
@@ -251,8 +291,9 @@ void WebGPUPreview::prepare(const Scene &scene, bool scene_changed)
     denoising_config[5 + row * 4] = std::bit_cast<uint32_t>(value.y);
     denoising_config[6 + row * 4] = std::bit_cast<uint32_t>(value.z);
   }
-  if (camera != camera_ || denoising_config != denoising_config_) {
+  if (camera != camera_ || camera_lens != camera_lens_ || denoising_config != denoising_config_) {
     camera_ = camera;
+    camera_lens_ = camera_lens;
     denoising_config_ = denoising_config;
     reset_pending_ = true;
   }
@@ -300,7 +341,6 @@ bool WebGPUPreview::begin_batch(const BufferParams &params,
   if (failed_ || !scene_supported_ || !supports_passes(params, volume_) ||
       params.get_pass_offset(PASS_COMBINED) == PASS_UNUSED || params.full_x < 0 ||
       params.full_y < 0 || params.width <= 0 || params.height <= 0 ||
-      uint64_t(params.width) * params.height > WebGPURenderPipeline::max_crop_pixels ||
       start_sample < 0 || (reset_pending_ && start_sample != 0))
   {
     return false;
@@ -316,7 +356,14 @@ bool WebGPUPreview::begin_batch(const BufferParams &params,
                                  scene_.svm,
                                  sampling_,
                                  scene_.has_subsurface,
-                                 scene_.advanced_query_svm))
+                                 scene_.advanced_svm,
+                                 scene_.ao_only_queries,
+                                 scene_.residual_displacement_bump,
+                                 scene_.paired_principled_layers,
+                                 scene_.single_principled_coat,
+                                 scene_.coated_principled_emission,
+                                 scene_.compact_voronoi_distance,
+                                 scene_.has_mixed_diffuse))
     {
       return report_error();
     }
@@ -325,7 +372,9 @@ bool WebGPUPreview::begin_batch(const BufferParams &params,
     std::vector<uint32_t>().swap(sampling_);
   }
   if (reset_pending_) {
-    if (!pipeline_->reset(camera_, denoising_config_, params, film_words, path_capacity)) {
+    if (!pipeline_->reset(
+            camera_, camera_lens_, denoising_config_, params, film_words, path_capacity))
+    {
       return report_error();
     }
     reset_pending_ = false;

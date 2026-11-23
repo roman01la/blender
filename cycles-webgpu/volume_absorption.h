@@ -3,6 +3,7 @@
 #pragma once
 
 #include "../blender-platform/cycles-webgpu/volume_layout.h"
+#include "../blender-platform/cycles-webgpu/material_layout.h"
 #include "kernel/closure/volume.h"
 
 namespace ccl {
@@ -19,7 +20,7 @@ uint absorption_object()
 }
 
 #if defined(CYCLES_WEBGPU_VOLUME_INTERVAL) || defined(CYCLES_WEBGPU_VOLUME_EXTINCTION_SHADOW)
-uint volume_medium(const uint object)
+uint volume_medium_index(const uint object)
 {
   const uint base = absorption_offset();
   const uint count = cycles_volume_word(CYCLES_WEBGPU_SURFACE_VOLUME_COUNT);
@@ -27,10 +28,18 @@ uint volume_medium(const uint object)
     if (cycles_volume_word(base + i * CYCLES_WEBGPU_VOLUME_SCATTER_WORDS +
                            CYCLES_WEBGPU_ABSORPTION_OBJECT) == object)
     {
-      return 1u << i;
+      return i;
     }
   }
-  return 0;
+  return ~0u;
+}
+
+bool volume_only(const uint medium)
+{
+  const uint flags = cycles_volume_word(absorption_offset() +
+                                       medium * CYCLES_WEBGPU_VOLUME_SCATTER_WORDS +
+                                       CYCLES_WEBGPU_VOLUME_SHADER_FLAGS);
+  return (flags & SD_HAS_ONLY_VOLUME) != 0;
 }
 #endif
 
@@ -79,7 +88,7 @@ ccl_device_inline bool bvh_volume_anyhit_triangle_filter(KernelGlobals,
                                                            uint)
 {
 #ifdef CYCLES_WEBGPU_VOLUME_INTERVAL
-  return volume_medium(uint(object)) == 0 || intersection_skip_self(self, object, prim);
+  return volume_medium_index(uint(object)) == ~0u || intersection_skip_self(self, object, prim);
 #else
   return uint(object) != absorption_object() || intersection_skip_self(self, object, prim);
 #endif
@@ -107,7 +116,7 @@ uint absorption_camera_stack(KernelGlobals kg, const float3 origin)
                       bvh_intersect_absorption_boundary(kg, &ray, &hit, PATH_RAY_VISIBILITY_CAMERA);
        ++step)
   {
-    const uint medium = volume_medium(uint(hit.object));
+    const uint medium = 1u << volume_medium_index(uint(hit.object));
     if ((seen & medium) == 0 && absorption_backfacing(kg, hit, ray.D)) {
       inside |= medium;
     }
@@ -150,15 +159,22 @@ AbsorptionFloat4 cycles_absorption_shadow(UInt4 origin,
                                           UInt4 geometric,
                                           unsigned int state
 #  ifdef CYCLES_WEBGPU_VOLUME_EXTINCTION_SHADOW
-                                          , UInt4 rng
+                                          , UInt4 rng, unsigned int transparent_bounce
 #  endif
                                           )
 {
   using namespace ccl;
 #  ifdef CYCLES_WEBGPU_VOLUME_SCATTER_SHADOW
-  if (options.x == 2u) {
+#    ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
+  const bool from_volume = (options.x & CYCLES_WEBGPU_SHADOW_FROM_VOLUME) != 0u;
+#    else
+  const bool from_volume = true;
+#    endif
+  if (from_volume && (options.x & ~CYCLES_WEBGPU_SHADOW_FROM_VOLUME) == 2u) {
     return {1.0f, 1.0f, 1.0f, 0.0f};
   }
+#  else
+  const bool from_volume = false;
 #  endif
   TraversalGlobals globals;
   absorption_globals(globals);
@@ -166,42 +182,74 @@ AbsorptionFloat4 cycles_absorption_shadow(UInt4 origin,
   ray.P = absorption_vector(origin);
   ray.D = absorption_vector(direction);
   ray.tmax = __uint_as_float(direction.w);
-#  ifdef CYCLES_WEBGPU_VOLUME_SCATTER_SHADOW
-  /* A volume scatter point is neither a surface nor a triangle emitter. */
-  ray.self = {PRIM_NONE, OBJECT_NONE, PRIM_NONE, OBJECT_NONE};
-#  else
-  ray.self.object = std::bit_cast<int>(options.y);
-  ray.self.prim = std::bit_cast<int>(options.z);
-  ray.self.light_object = origin.w ? std::bit_cast<int>(options.w) : OBJECT_NONE;
-  ray.self.light_prim = origin.w ? std::bit_cast<int>(origin.w - 1) : PRIM_NONE;
-  if (ray.self.prim != PRIM_NONE && ray.self.object != OBJECT_NONE &&
-      needs_surface_ray_offset(&globals, ray, geometric.w))
-  {
-    ray.P = offset_surface_ray(ray.P, geometric);
+  if (from_volume) {
+    /* A volume scatter point is neither a surface nor a triangle emitter. */
+    ray.self = {PRIM_NONE, OBJECT_NONE, PRIM_NONE, OBJECT_NONE};
   }
-#  endif
+  else {
+    ray.self.object = std::bit_cast<int>(options.y);
+    ray.self.prim = std::bit_cast<int>(options.z);
+    ray.self.light_object = origin.w ? std::bit_cast<int>(options.w) : OBJECT_NONE;
+    ray.self.light_prim = origin.w ? std::bit_cast<int>(origin.w - 1) : PRIM_NONE;
+    if (ray.self.prim != PRIM_NONE && ray.self.object != OBJECT_NONE &&
+        needs_surface_ray_offset(&globals, ray, geometric.w))
+    {
+      ray.P = offset_surface_ray(ray.P, geometric);
+    }
+  }
   if (!intersection_ray_valid(&ray)) {
     return {1.0f, 1.0f, 1.0f, 0.0f};
   }
   Intersection hit;
 #  ifdef CYCLES_WEBGPU_VOLUME_EXTINCTION_SHADOW
-  uint active = state & CYCLES_WEBGPU_VOLUME_MEDIA_MASK;
-  uint bounds = state / CYCLES_WEBGPU_VOLUME_BOUNDARY_INCREMENT;
+  const uint count = cycles_volume_word(CYCLES_WEBGPU_SURFACE_VOLUME_COUNT);
+  uint active = state & CYCLES_WEBGPU_VOLUME_MEDIA_MASK(count);
+  uint bounds = state / CYCLES_WEBGPU_VOLUME_BOUNDARY_INCREMENT(count);
   Spectrum transmittance = one_spectrum();
+  const uint table = cycles_volume_word(CYCLES_WEBGPU_SURFACE_TRANSPARENT_OFFSET);
+  const bool transparent_shadows = table &&
+      (cycles_volume_word(table + 1) & CYCLES_WEBGPU_TRANSPARENT_SHADOW_ENABLE);
+  const uint max_transparent = transparent_shadows ? cycles_volume_word(table) : 0u;
 #  else
   bool inside = (state & CYCLES_WEBGPU_ABSORPTION_INSIDE) != 0;
   uint bounds = state & ~CYCLES_WEBGPU_ABSORPTION_INSIDE;
   float distance = 0.0f;
 #  endif
   float segment_start = ray.tmin;
-  /* The transparent visibility bit requests the closest shadow hit rather
-   * than ending traversal at any hit. Only our boundary can be transparent. */
+  /* The transparent visibility bit requests the closest shadow hit so volume
+   * attenuation and transparent surface throughput are evaluated in order. */
   while (bvh_intersect_static_triangles(
       &globals, &ray, &hit, PATH_RAY_VISIBILITY_SHADOW_TRANSPARENT)) {
 #  ifdef CYCLES_WEBGPU_VOLUME_EXTINCTION_SHADOW
-    const uint medium = volume_medium(uint(hit.object));
-    if (medium == 0 || ++bounds > VOLUME_BOUNDS_MAX) {
-      return {};
+    const uint index = volume_medium_index(uint(hit.object));
+    const bool only_volume = index != ~0u && volume_only(index);
+    const uint medium = index != ~0u ? 1u << index : 0u;
+    if (only_volume) {
+      if (++bounds > VOLUME_BOUNDS_MAX) {
+        return {};
+      }
+    }
+    else {
+      if (!transparent_shadows || ++transparent_bounce > max_transparent) {
+        return {};
+      }
+      const uint shader = cycles_volume_word(cycles_volume_word(1) + hit.prim) & SHADER_MASK;
+      const uint tint = table + CYCLES_WEBGPU_TRANSPARENT_SHADOW_HEADER_WORDS + 3 * shader;
+      const uint red = cycles_volume_word(tint);
+#    ifdef CYCLES_WEBGPU_VOLUME_SHADOW_MATERIALS
+      if (red == CYCLES_WEBGPU_TRANSPARENT_SHADOW_EVAL) {
+        transmittance *= cycles_shadow_surface_transparency(&globals, hit, ray.D);
+      }
+      else
+#    endif
+      {
+        transmittance *= make_float3(__uint_as_float(red),
+                                   __uint_as_float(cycles_volume_word(tint + 1)),
+                                   __uint_as_float(cycles_volume_word(tint + 2)));
+      }
+      if (is_zero(transmittance)) {
+        return {};
+      }
     }
     if (active != 0 && hit.t > segment_start) {
       const AbsorptionFloat4 T = cycles_volume_shadow_transmittance(
@@ -209,7 +257,7 @@ AbsorptionFloat4 cycles_absorption_shadow(UInt4 origin,
           AbsorptionFloat4{ray.D.x, ray.D.y, ray.D.z, hit.t}, rng);
       transmittance *= make_float3(T.x, T.y, T.z);
     }
-    if (absorption_backfacing(&globals, hit, ray.D)) {
+    if (medium && absorption_backfacing(&globals, hit, ray.D)) {
       active &= ~medium;
     }
     else {
@@ -267,10 +315,13 @@ AbsorptionFloat4 cycles_absorption_segment(UInt4 origin,
 #  ifdef CYCLES_WEBGPU_VOLUME_INTERVAL
   prior_state = state;
   const Spectrum T = one_spectrum();
-  const uint medium = hit.x ? volume_medium(hit.z) : 0;
+  const uint index = hit.x ? volume_medium_index(hit.z) : ~0u;
   uint boundary = 0;
-  if (medium) {
-    state += CYCLES_WEBGPU_VOLUME_BOUNDARY_INCREMENT;
+  if (index != ~0u) {
+    const uint medium = 1u << index;
+    const uint count = cycles_volume_word(CYCLES_WEBGPU_SURFACE_VOLUME_COUNT);
+    const uint boundary_increment = CYCLES_WEBGPU_VOLUME_BOUNDARY_INCREMENT(count);
+    state += boundary_increment;
     Intersection isect{};
     isect.prim = std::bit_cast<int>(hit.y);
     isect.object = std::bit_cast<int>(hit.z);
@@ -280,8 +331,10 @@ AbsorptionFloat4 cycles_absorption_segment(UInt4 origin,
     else {
       state |= medium;
     }
-    boundary = state / CYCLES_WEBGPU_VOLUME_BOUNDARY_INCREMENT <= VOLUME_BOUNDS_MAX ?
-                   CYCLES_WEBGPU_ABSORPTION_BOUNDARY : CYCLES_WEBGPU_ABSORPTION_TERMINATE;
+    boundary = state / boundary_increment <= VOLUME_BOUNDS_MAX ?
+                   (volume_only(index) ? CYCLES_WEBGPU_ABSORPTION_BOUNDARY :
+                                         CYCLES_WEBGPU_MIXED_VOLUME_BOUNDARY) :
+                   CYCLES_WEBGPU_ABSORPTION_TERMINATE;
   }
 #  else
   const bool inside = (state & CYCLES_WEBGPU_ABSORPTION_INSIDE) != 0;

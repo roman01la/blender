@@ -6,8 +6,10 @@ export async function verifyFilm(device, code, adaptiveCode) {
   for (const message of (await shader.getCompilationInfo()).messages) {
     if (message.type === 'error') throw Error(message.message);
   }
-  const [accumulate, resolve, accumulateRenderBuffer, retireAdaptive] = await Promise.all(
-    ['accumulate', 'resolve', 'accumulate_render_buffer', 'retire_adaptive_render_buffer'].map(entryPoint =>
+  const [accumulate, resolve, accumulateRenderBuffer, retireAdaptive, writeGeometry,
+    writeSurfacePasses, writeLightPasses] = await Promise.all(
+    ['accumulate', 'resolve', 'accumulate_render_buffer', 'retire_adaptive_render_buffer',
+     'write_geometry_passes', 'accumulate_surface_passes', 'accumulate_light_passes'].map(entryPoint =>
       device.createComputePipelineAsync({ layout: 'auto', compute: { module: shader, entryPoint } }),
     ),
   );
@@ -27,6 +29,8 @@ export async function verifyFilm(device, code, adaptiveCode) {
   }
 
   const workgroupSize = 64;
+  const pathStride = 24; // path_state_layout.h
+  const materialStride = 7 * 4; // material_layout.h
   const padding = 0xBADC0FFE;
   let submissions = 0;
   let samplesChecked = 0;
@@ -197,7 +201,6 @@ export async function verifyFilm(device, code, adaptiveCode) {
       const capacity = 263;
       const queueBase = 1 + 12 * capacity;
       const classBase = queueBase + 1 + capacity;
-      const pathStride = 23;
       // Contend on the same pixel from independent sample lanes across
       // workgroups, then reuse those physical slots with different fragments.
       for (let wave = 0; wave < 2; wave++) {
@@ -282,6 +285,171 @@ export async function verifyFilm(device, code, adaptiveCode) {
     return retired;
   }
 
+  async function checkGeometryPasses() {
+    const capacity = 6;
+    const queueBase = 1 + 12 * capacity;
+    const queues = new Uint32Array(queueBase + 1 + capacity);
+    queues[0] = capacity;
+    queues.set([capacity, 2, 1, 0, 3, 4, 5], queueBase);
+    const paths = new Uint32Array(pathStride * capacity);
+    const points = new Uint32Array(8 * capacity);
+    const pointFloats = new Float32Array(points.buffer);
+    const hits = new Uint32Array(8 * capacity);
+    const materials = new Float32Array(materialStride * capacity);
+    for (let lane = 0; lane < capacity; lane++) {
+      paths[pathStride * lane + 14] = lane === 5 ? 0 : 1 << 9; // Camera visibility.
+      paths.set([5 + lane % 2, 9 + Math.floor(lane / 2), Number(lane === 1)],
+                pathStride * lane + 18);
+      points[8 * lane + 3] = lane === 3 ? 0 : 1; // Background or front-facing hit.
+      pointFloats.set([1, 2, 3], 8 * lane);
+    }
+    hits[8 * 4 + 7] = 1; // Subsurface exit.
+    materials[materialStride * 2 + 3] = 5; // Holdout.
+    const metadata = new Uint32Array(32);
+    metadata.set([8, 31], 5);
+    new Float32Array(metadata.buffer)[8 + 16] = 15; // Object pass ID.
+    metadata[31] = 41; // Material pass ID.
+
+    const layout = new Uint32Array([1, 2, 3, 4, 0, 0, 0, 0]);
+    new Float32Array(layout.buffer).set([0, 0, 1, 5], 4);
+    const render = new Uint32Array([5, 9, 2, 3, 2, 3, 8, 0, 0xffffffff, 0xffffffff, 0, 0]);
+    const filmWords = new Uint32Array(88).fill(padding);
+    const resources = [];
+    function bindData(slot, data, usage = GPUBufferUsage.STORAGE) {
+      const entry = buffer(data, usage);
+      resources.push(entry);
+      return [slot, entry];
+    }
+    try {
+      const filmBinding = bindData(3, filmWords, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const readback = device.createBuffer({
+        size: filmWords.byteLength, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      resources.push(readback);
+      const encoder = device.createCommandEncoder();
+      encodeDispatch(encoder, writeGeometry,
+        [bindData(1, materials), filmBinding, bindData(5, paths), bindData(6, queues),
+         bindData(7, render, GPUBufferUsage.UNIFORM), bindData(12, points), bindData(13, hits),
+         bindData(14, metadata), bindData(15, layout, GPUBufferUsage.UNIFORM)], capacity, false);
+      encoder.copyBufferToBuffer(filmBinding[1], 0, readback, 0, filmWords.byteLength);
+      device.queue.submit([encoder.finish()]);
+      await readback.mapAsync(GPUMapMode.READ);
+      new Float32Array(filmWords.buffer).set([8, 15, 41, 1, 2, 3], 2 * 8 + 1);
+      const actual = new Uint32Array(readback.getMappedRange());
+      for (const [word, expected] of filmWords.entries()) {
+        if (actual[word] !== expected) throw Error(`Unexpected geometry pass at word ${word}`);
+      }
+    } finally {
+      resources.forEach(resource => resource.destroy());
+    }
+    return capacity;
+  }
+
+  async function checkSurfacePasses() {
+    const capacity = 3;
+    const queueBase = 1 + 12 * capacity;
+    const queues = new Uint32Array(queueBase + 1 + capacity);
+    queues[0] = capacity;
+    queues.set([2, 1, 0, 2], queueBase);
+    const paths = new Uint32Array(pathStride * capacity);
+    const contributions = new Float32Array(6 * 4 * capacity);
+    for (let lane = 0; lane < capacity; lane++) {
+      paths.set([5, 9, lane], pathStride * lane + 18);
+      for (let pass = 0; pass < 5; pass++) {
+        contributions.set([lane + 1, pass, -(lane + 1), 17], 4 * (6 * lane + pass));
+      }
+    }
+    const unused = 0xffffffff;
+    const offsets = [1, 4, unused, 7, 10];
+    const render = new Uint32Array([5, 9, 1, 1, 1, 2, 14, 0, unused, unused, 0, 0]);
+    const filmWords = new Uint32Array(42).fill(padding);
+    const expected = new Float32Array(filmWords.buffer);
+    offsets.forEach(offset => {
+      if (offset !== unused) expected.fill(0, 14 + offset, 14 + offset + 3);
+    });
+    const resources = [];
+    function bindData(slot, data, usage = GPUBufferUsage.STORAGE) {
+      const entry = buffer(data, usage);
+      resources.push(entry);
+      return [slot, entry];
+    }
+    try {
+      const filmBinding = bindData(3, filmWords, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const readback = device.createBuffer({
+        size: filmWords.byteLength, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      resources.push(readback);
+      const encoder = device.createCommandEncoder();
+      encodeDispatch(encoder, writeSurfacePasses,
+        [bindData(2, contributions), filmBinding, bindData(5, paths), bindData(6, queues),
+         bindData(7, render, GPUBufferUsage.UNIFORM),
+         bindData(17, new Uint32Array([...offsets, 0, 0, 0]), GPUBufferUsage.UNIFORM)],
+        capacity, false);
+      encoder.copyBufferToBuffer(filmBinding[1], 0, readback, 0, filmWords.byteLength);
+      device.queue.submit([encoder.finish()]);
+      await readback.mapAsync(GPUMapMode.READ);
+      offsets.forEach((offset, pass) => {
+        if (offset !== unused) expected.set([3, pass * 2, -3], 14 + offset);
+      });
+      const actual = new Uint32Array(readback.getMappedRange());
+      for (const [word, value] of filmWords.entries()) {
+        if (actual[word] !== value) throw Error(`Unexpected filtered surface pass at word ${word}`);
+      }
+    } finally {
+      resources.forEach(resource => resource.destroy());
+    }
+    return queues[queueBase];
+  }
+
+  async function checkLightPasses() {
+    const unused = 0xffffffff;
+    const capacity = 1;
+    const queueBase = 1 + 12 * capacity;
+    const queues = new Uint32Array(queueBase + 2);
+    queues[0] = capacity;
+    queues[queueBase] = 1;
+    const paths = new Uint32Array(pathStride);
+    paths.set([5, 9, 0], 18);
+    const samples = new Float32Array(4 * (2 * capacity + 1 + capacity + 6 * capacity));
+    samples.set([1, 0, 0, 1], 4 * 2 * capacity); // Enable lighting and Emission tails.
+    samples.set([
+      0.5, 0.125, 0.25, 0,
+      0.25, 0.5, 0.25, 0,
+      0.125, 0.5, 0.25, 0,
+      0.5, 0.125, 0.5, 0,
+      8, 8, 8, 2, // Later forward hit uses the first surface's fractions.
+      8, 8, 8, 1, // First-bounce NEE uses this light sample's fractions.
+    ], 4 * (3 * capacity + 1));
+    const render = new Uint32Array([5, 9, 1, 1, 0, 1, 22, 0, unused, unused, 0, 0]);
+    const offsets = new Uint32Array([4, 7, 10, 13, 16, 19, 0, 0]);
+    const film = buffer(new Float32Array(22), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const readback = device.createBuffer({
+      size: film.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    const resources = [film, readback];
+    function bindData(slot, data, usage = GPUBufferUsage.STORAGE) {
+      const entry = buffer(data, usage);
+      resources.push(entry);
+      return [slot, entry];
+    }
+    try {
+      const encoder = device.createCommandEncoder();
+      encodeDispatch(encoder, writeLightPasses,
+        [bindData(2, samples), [3, film], bindData(5, paths), bindData(6, queues),
+         bindData(7, render, GPUBufferUsage.UNIFORM), bindData(18, offsets, GPUBufferUsage.UNIFORM)],
+        capacity, false);
+      encoder.copyBufferToBuffer(film, 0, readback, 0, film.size);
+      device.queue.submit([encoder.finish()]);
+      await readback.mapAsync(GPUMapMode.READ);
+      const expected = [0, 0, 0, 0, 1, 4, 2, 4, 1, 2, 4, 1, 4, 2, 4, 2, 3, 3, 2, 2, 3, 4];
+      new Float32Array(readback.getMappedRange()).forEach((value, word) =>
+        checkFloat(value, expected[word], `Lighting pass word ${word}`));
+    } finally {
+      resources.forEach(resource => resource.destroy());
+    }
+    return capacity;
+  }
+
   const state = createFilm([100, 200, 13, 7]);
   const resized = createFilm([400, 500, 3, 2]);
   try {
@@ -310,7 +478,11 @@ export async function verifyFilm(device, code, adaptiveCode) {
   const nativeFilmPathsChecked = await checkRenderBuffer(true) + await checkRenderBuffer(false);
   const adaptiveFilmPathsChecked = adaptiveDelta ? await checkRenderBuffer(true, 'stock') : 0;
   const adaptiveRetirementPathsChecked = await checkRenderBuffer(true, 'retire');
+  const geometryPathsChecked = await checkGeometryPasses();
+  const surfacePassPathsChecked = await checkSurfacePasses();
+  const lightPassPathsChecked = await checkLightPasses();
   return { submissions, samplesChecked, pixelsChecked, nativeFilmPathsChecked, adaptiveFilmPathsChecked,
-    adaptiveRetirementPathsChecked, maxAbsoluteError };
+    adaptiveRetirementPathsChecked, geometryPathsChecked, surfacePassPathsChecked, lightPassPathsChecked,
+    maxAbsoluteError };
 
 }

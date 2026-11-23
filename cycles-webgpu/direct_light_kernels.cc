@@ -2,6 +2,8 @@
 
 #include <bit>
 
+#include "../blender-platform/cycles-webgpu/volume_layout.h"
+
 #ifdef __aarch64__
 #  include <arm_neon.h>
 #endif
@@ -28,7 +30,7 @@ namespace ccl {
 struct LightGlobals {
   KernelData data;
   uint sampling_offset;
-#ifdef CYCLES_WEBGPU_POINT_DISTRIBUTION
+#if defined(CYCLES_WEBGPU_POINT_DISTRIBUTION) || defined(CYCLES_WEBGPU_LIGHT_TREE)
   uint distribution_offset;
 #endif
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
@@ -74,7 +76,7 @@ inline float light_fetch(KernelGlobals kg, sample_pattern_lut_tag, uint index)
 #ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
 #  include "../blender-platform/cycles-webgpu/material_layout.h"
 #  include "../blender-platform/cycles-webgpu/lighting_layout.h"
-#  ifdef CYCLES_WEBGPU_POINT_DISTRIBUTION
+#  if defined(CYCLES_WEBGPU_POINT_DISTRIBUTION) || defined(CYCLES_WEBGPU_LIGHT_TREE)
 namespace ccl {
 
 inline KernelLightDistribution light_fetch(KernelGlobals kg, light_distribution_tag, uint index)
@@ -82,14 +84,17 @@ inline KernelLightDistribution light_fetch(KernelGlobals kg, light_distribution_
   const uint word = kg->distribution_offset + CYCLES_WEBGPU_POINT_DISTRIBUTION_WORDS * index;
   return {std::bit_cast<float>(cycles_light_word(word)),
           std::bit_cast<int>(cycles_light_word(word + 1)),
-          0,
-          0};
+          std::bit_cast<int>(cycles_light_word(word + 2)),
+          std::bit_cast<int>(cycles_light_word(word + 3))};
 }
 
 }  // namespace ccl
 #    include "kernel/light/distribution.h"
 #  endif
 #  include "../blender-platform/cycles-webgpu/svm_material_eval.h"
+#  ifdef CYCLES_WEBGPU_LIGHT_TREE
+#    include "../blender-platform/cycles-webgpu/svm_world_eval.h"
+#  endif
 #  undef ccl_device
 #  define ccl_device static inline __attribute__((always_inline))
 #  include "kernel/camera/projection.h"
@@ -104,6 +109,8 @@ static inline float cycles_rectangle_sinf(const float angle)
 #  undef sinf
 #  ifdef CYCLES_WEBGPU_LIGHT_TREE
 #    include "kernel/bvh/util.h"
+#    include "kernel/closure/emissive.h"
+#    include "kernel/light/sun.h"
 namespace ccl {
 
 inline float2 light_fetch(KernelGlobals kg, light_background_marginal_cdf_tag, uint index)
@@ -127,6 +134,8 @@ inline float2 light_fetch(KernelGlobals kg, light_background_conditional_cdf_tag
 #  include "kernel/sample/pattern.h"
 #  include "ggx_closures.h"
 #endif
+
+#include "surface_shadow.h"
 
 using UInt4 = unsigned int __attribute__((ext_vector_type(4)));
 using Float4 = float __attribute__((ext_vector_type(4)));
@@ -188,6 +197,47 @@ float read_float(const unsigned int offset)
 {
   return std::bit_cast<float>(cycles_light_word(offset));
 }
+
+#  ifdef CYCLES_WEBGPU_LIGHT_TREE
+unsigned int lamp_falloff_record(const unsigned int lamp)
+{
+  const unsigned int offset = cycles_light_word(CYCLES_WEBGPU_TREE_LAMP_FALLOFF_OFFSET);
+  if (offset == 0) {
+    return 0;
+  }
+  const unsigned int record = offset + lamp * CYCLES_WEBGPU_LAMP_FALLOFF_WORDS;
+  return cycles_light_word(record + CYCLES_WEBGPU_LAMP_FALLOFF_MODE) ? record : 0;
+}
+
+ccl::Spectrum evaluate_lamp_falloff(const unsigned int record,
+                                    const float distance,
+                                    const ccl::float3 light_normal,
+                                    const ccl::float3 light_to_receiver)
+{
+  using namespace ccl;
+  const unsigned int mode = cycles_light_word(record + CYCLES_WEBGPU_LAMP_FALLOFF_MODE);
+  const Spectrum emission = emissive_simple_eval(light_normal, light_to_receiver) *
+                            rgb_to_spectrum(read_rgb(record + CYCLES_WEBGPU_LAMP_FALLOFF_COLOR));
+  // Cycles WebGPU ray-length lamp emission
+  if (mode == CYCLES_WEBGPU_LAMP_RAY_LENGTH || mode == CYCLES_WEBGPU_LAMP_RAY_LENGTH_INVERTED) {
+    const float divisor = read_float(record + CYCLES_WEBGPU_LAMP_RAY_LENGTH_DIVISOR);
+    const float factor = saturatef(smootherstep(0.0f, 1.0f, safe_divide(distance, divisor)));
+    const float weight = mode == CYCLES_WEBGPU_LAMP_RAY_LENGTH ? factor : 1.0f - factor;
+    return emission * read_float(record + CYCLES_WEBGPU_LAMP_FALLOFF_STRENGTH) * weight;
+  }
+  const SVMNodeLightFalloff falloff{
+      .falloff_type = NodeLightFalloff(mode - 1),
+      .strength = {cycles_light_word(record + CYCLES_WEBGPU_LAMP_FALLOFF_STRENGTH)},
+      .smooth = {cycles_light_word(record + CYCLES_WEBGPU_LAMP_FALLOFF_SMOOTH)},
+      .out_offset = 0,
+  };
+  ShaderData sd;
+  sd.ray_length = distance;
+  float strength[1];
+  svm_node_light_falloff(&sd, strength, falloff);
+  return emission * strength[0];
+}
+#  endif
 
 [[gnu::always_inline]] void setup_light_sampling(ccl::LightGlobals &globals,
                                                 const unsigned int words)
@@ -304,25 +354,121 @@ ccl::Spectrum environment_radiance(const unsigned int width,
 }
 
 #  ifdef CYCLES_WEBGPU_LIGHT_TREE
+/* Inline this at shader link time. Inlining before the C++ optimization pass
+ * changes the sampled-world contribution after SPIR-V lowering. */
+[[gnu::noinline]] ccl::Spectrum evaluate_world_program(const unsigned int width,
+                                                           const unsigned int height,
+                                                           const unsigned int interpolation,
+                                                           const unsigned int offset,
+                                                           const ccl::float3 direction)
+{
+  const unsigned int begin = offset + CYCLES_WEBGPU_WORLD_SVM_HEADER_WORDS;
+  const unsigned int end = begin + cycles_light_word(offset + CYCLES_WEBGPU_WORLD_SVM_WORD_COUNT);
+  const auto texel = [&](const unsigned int index) {
+    return read_rgb(end + 3 * index);
+  };
+  const auto sample = [&](const int, const ccl::float2 uv, const bool, ccl::float4 &value) {
+    value = ccl::make_float4(
+        ccl::webgpu_svm_sample_image(texel, width, height, ccl::EXTENSION_REPEAT, interpolation, uv),
+        1.0f);
+    return true;
+  };
+  /* Direct light stages use the same checked stack accesses as the host. */
+#    ifdef CYCLES_WEBGPU_SHADE_BACKGROUND
+  constexpr bool validate = false;
+#    else
+  constexpr bool validate = true;
+#    endif
+  ccl::Spectrum radiance;
+  if (!ccl::webgpu_svm_eval_world<validate>(cycles_light_word,
+                                           sample,
+                                           begin,
+                                           end,
+                                           direction,
+                                           read_rgb(offset + CYCLES_WEBGPU_WORLD_SVM_RGB_TO_Y),
+                                           radiance))
+  {
+    return ccl::zero_spectrum();
+  }
+  return radiance;
+}
+#  endif
+
+[[gnu::always_inline]] ccl::Spectrum world_environment(const unsigned int width,
+                                                         const unsigned int height,
+                                                         const unsigned int interpolation,
+                                                         const unsigned int offset,
+                                                         const ccl::float3 direction)
+{
+  if (width == 0) {
+    return read_rgb(8);
+  }
+#  ifdef CYCLES_WEBGPU_LIGHT_TREE
+  if (interpolation & CYCLES_WEBGPU_WORLD_SVM_FLAG) {
+    return evaluate_world_program(
+        width, height, interpolation & ~CYCLES_WEBGPU_WORLD_SVM_FLAG, offset, direction);
+  }
+#  endif
+  if (interpolation & CYCLES_WEBGPU_WORLD_SKY_FLAG) {
+    unsigned int parameters = offset + CYCLES_WEBGPU_SKY_PARAMETERS;
+    ccl::SVMNodeTexSkyNishitaData sky;
+    if (!ccl::webgpu_svm_read(cycles_light_word, parameters,
+                              parameters + sizeof(sky) / sizeof(unsigned int), sky))
+    {
+      return ccl::zero_spectrum();
+    }
+
+    const unsigned int color = offset + CYCLES_WEBGPU_SKY_XYZ_TO_RGB;
+    const ccl::WebGPUSvmColorSpace color_space{
+        {}, read_rgb(color), read_rgb(color + 3), read_rgb(color + 6)};
+    const auto texel = [&](const unsigned int index) {
+      return read_rgb(parameters + 3 * index);
+    };
+    const auto sample = [&](const int, const ccl::float2 uv, const bool, ccl::float4 &value) {
+      value = ccl::make_float4(ccl::webgpu_svm_sample_image(texel,
+                                                          width,
+                                                          height,
+                                                          ccl::EXTENSION_EXTEND,
+                                                          ccl::INTERPOLATION_LINEAR,
+                                                          uv),
+                               1.0f);
+      return true;
+    };
+    ccl::float3 rgb;
+    ccl::webgpu_svm_sky_nishita(color_space, direction, sky, sample, rgb);
+    return rgb * read_float(offset + CYCLES_WEBGPU_SKY_STRENGTH);
+  }
+  return environment_radiance(width, height, interpolation, offset, direction);
+}
+
+#  ifdef CYCLES_WEBGPU_LIGHT_TREE
 [[gnu::always_inline]] void setup_world_sampling(ccl::LightGlobals &globals, const unsigned int descriptor)
 {
-  globals.data.background.map_res_x = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_MAP_WIDTH);
-  globals.data.background.map_res_y = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_MAP_HEIGHT);
+  auto &world = globals.data.background;
+  world.map_res_x = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_MAP_WIDTH);
+  world.map_res_y = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_MAP_HEIGHT);
+  world.map_weight = 1.0f;
+  world.portal_weight = 0.0f;
+  world.sun_weight = 0.0f;
   globals.world_marginal_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_MARGINAL_CDF);
   globals.world_conditional_offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_CONDITIONAL_CDF);
+  if (cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_INTERPOLATION) &
+      CYCLES_WEBGPU_WORLD_SKY_FLAG)
+  {
+    const unsigned int offset = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_PIXELS);
+    world.sun = ccl::make_float4(read_rgb(offset + CYCLES_WEBGPU_SKY_SUN),
+                                  read_float(offset + CYCLES_WEBGPU_SKY_SUN + 3));
+    world.sun_weight = read_float(offset + CYCLES_WEBGPU_SKY_SUN_WEIGHT);
+  }
 }
 
 [[gnu::always_inline]] ccl::Spectrum tree_environment(const unsigned int descriptor, const ccl::float3 direction)
 {
-  const unsigned int width = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_WIDTH);
-  if (width == 0) {
-    return read_rgb(8);
-  }
-  return environment_radiance(width,
-                              cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_HEIGHT),
-                              cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_INTERPOLATION),
-                              cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_PIXELS),
-                              direction);
+  return world_environment(cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_WIDTH),
+                           cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_HEIGHT),
+                           cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_INTERPOLATION),
+                           cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_PIXELS),
+                           direction);
 }
 
 #    ifndef CYCLES_WEBGPU_SHADE_BACKGROUND
@@ -338,17 +484,30 @@ template<bool in_volume_segment, bool allow_triangles = true>
                                                        ccl::Spectrum &strength,
                                                        bool &sample_emission)
 {
-  const auto emitter = ccl::light_fetch(&globals, ccl::light_tree_emitters_tag{}, light.emitter_id);
-  if (allow_triangles && ccl::is_triangle(&emitter)) {
-    /* The tree sampler keeps the selected instance in light.object. The emitter
-     * record itself may belong to the instance sharing its mesh subtree. */
-    const int object = light.object == OBJECT_NONE ? emitter.object_id : light.object;
-    if (!ccl::triangle_light_sample<in_volume_segment>(
-            &globals, emitter.triangle.id, object, rand, -1.0f, &light, P))
+  int primitive, object, visibility;
+  if (globals.data.integrator.use_light_tree) {
+    const auto emitter = ccl::light_fetch(&globals, ccl::light_tree_emitters_tag{}, light.emitter_id);
+    if (!ccl::is_triangle(&emitter) && !ccl::is_light(&emitter)) {
+      return false;
+    }
+    primitive = emitter.light.id;
+    /* A tree emitter can belong to another instance sharing its mesh subtree. */
+    object = primitive >= 0 && light.object != OBJECT_NONE ? light.object : emitter.object_id;
+    visibility = emitter.visibility_flag;
+  }
+  else {
+    const auto entry = ccl::light_fetch(&globals, ccl::light_distribution_tag{}, light.emitter_id);
+    primitive = entry.prim;
+    object = entry.object_id;
+    visibility = entry.visibility_flag;
+  }
+  if (primitive >= 0) {
+    if (!allow_triangles || !ccl::triangle_light_sample<in_volume_segment>(
+                                &globals, primitive, object, rand, -1.0f, &light, P))
     {
       return false;
     }
-    light.shader |= emitter.visibility_flag;
+    light.shader |= visibility;
     const auto shader = ccl::light_tree_shader_word(&globals, light.shader & ccl::SHADER_MASK);
 #      ifdef CYCLES_WEBGPU_DEFER_SHADOW
     sample_emission = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_TEXTURED_EMITTERS) != 0 &&
@@ -362,10 +521,7 @@ template<bool in_volume_segment, bool allow_triangles = true>
     return in_volume_segment || light.pdf > 0.0f;
   }
 
-  if (!ccl::is_light(&emitter)) {
-    return false;
-  }
-  light.prim = ~emitter.light.id;
+  light.prim = ~primitive;
   const ccl::KernelLight lamp = ccl::light_fetch(&globals, ccl::lights_tag{}, light.prim);
   if (float(bounce) > lamp.max_bounces) {
     return false;
@@ -378,14 +534,20 @@ template<bool in_volume_segment, bool allow_triangles = true>
     }
   }
   else if (light.type == ccl::LIGHT_AREA) {
-    auto area = lamp;
-    /* Only full-spread rectangles are admitted by the host. */
-    area.area.invarea = fabsf(area.area.invarea);
-    area.area.tan_half_spread = FLT_MAX;
-    area.area.normalize_spread = 0.0f;
-    if (!ccl::area_light_sample<in_volume_segment>(&area, rand, P, &light)) {
+    if (!ccl::area_light_sample<in_volume_segment>(&lamp, rand, P, &light)) {
       return false;
     }
+  }
+  else if (light.type == ccl::LIGHT_SUN) {
+    if constexpr (in_volume_segment) {
+      light.P = light.D = ccl::zero_float3();
+      light.t = FLT_MAX;
+      light.pdf = light.pdf_selection;
+      light.eval_fac = 0.0f;
+      strength = ccl::zero_spectrum();
+      return true;
+    }
+    ccl::sun_light_sample(&lamp, rand, &light);
   }
   else {
     if constexpr (in_volume_segment) {
@@ -397,9 +559,8 @@ template<bool in_volume_segment, bool allow_triangles = true>
       strength = ccl::zero_spectrum();
       return true;
     }
-    /* With only the world map enabled, the stock sampler uses its CDF directly. */
     setup_world_sampling(globals, descriptor);
-    light.D = ccl::background_map_sample(&globals, rand, &light.pdf);
+    light.D = ccl::background_light_sample(&globals, P, rand, &light.pdf);
     light.t = FLT_MAX;
     light.eval_fac = 1.0f;
     strength = tree_environment(descriptor, light.D);
@@ -430,10 +591,13 @@ template<bool in_volume_segment, bool allow_triangles = true>
   setup_light_sampling(globals, cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_SAMPLING));
   const auto random = light_sample_random(&globals, sampling.x, sampling.y, bounce + subsurface_steps);
   light.object = OBJECT_NONE;
-  return ccl::light_tree_sample<false>(
-             &globals, random.z, P, N, 0.0f, OBJECT_NONE, runtime_flags, &light) &&
-         sample_selected_tree_light<false>(globals, descriptor, ccl::make_float2(random), bounce,
-                                           P, N, runtime_flags, light, strength, sample_emission);
+  const bool selected = globals.data.integrator.use_light_tree ?
+                            ccl::light_tree_sample<false>(
+                                &globals, random.z, P, N, 0.0f, OBJECT_NONE, runtime_flags, &light) :
+                            ccl::light_distribution_sample(&globals, random.z, &light);
+  return selected && sample_selected_tree_light<false>(
+                         globals, descriptor, ccl::make_float2(random), bounce,
+                         P, N, runtime_flags, light, strength, sample_emission);
 }
 #    endif
 #  endif
@@ -468,14 +632,26 @@ unsigned int direct_surface_light(UInt4 position,
                                   [[maybe_unused]] unsigned int subsurface_steps = 0,
                                   [[maybe_unused]] ShadowRay *shadow = nullptr,
                                   [[maybe_unused]] Float4 hair = {},
-                                  [[maybe_unused]] unsigned int *hair_lcg = nullptr)
+                                  [[maybe_unused]] unsigned int *hair_lcg = nullptr,
+                                  [[maybe_unused]] Float4 bump = {},
+                                  [[maybe_unused]] bool light_passes = false,
+                                  [[maybe_unused]] Float4 *diffuse_ratio = nullptr,
+                                  [[maybe_unused]] Float4 *glossy_ratio = nullptr)
 {
   result = {0, 0, 0, 1};
   const ccl::float3 P = unpack_rgb(position);
-  const ccl::float3 N = unpack_rgb(normal);
+  const ccl::float3 N = bump.w >= CYCLES_WEBGPU_NORMAL_BOTH ?
+                            ccl::make_float3(hair.x, hair.y, hair.z) :
+                        bump.w >= CYCLES_WEBGPU_NORMAL_SHADER ?
+                            ccl::make_float3(bump.x, bump.y, bump.z) : unpack_rgb(normal);
   int runtime_flags = ccl::SR_BSDF;
 #ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
-  const bool translucent = material.w == CYCLES_WEBGPU_MATERIAL_TRANSLUCENT;
+  const bool mixed_diffuse_translucent = material.w == CYCLES_WEBGPU_MATERIAL_DIFFUSE_TRANSLUCENT;
+  const bool translucent = material.w == CYCLES_WEBGPU_MATERIAL_TRANSLUCENT ||
+                           (mixed_diffuse_translucent && parameters.y > 0.0f) ||
+                           (is_ggx(material) && CYCLES_WEBGPU_GGX_HAS_TRANSLUCENT(glass)) ||
+                           (CYCLES_WEBGPU_MATERIAL_HAS_ORDERED_CLOSURES(material.w) &&
+                            (unsigned(hair.w) & CYCLES_WEBGPU_ORDERED_HAS_TRANSLUCENT));
   if (translucent || CYCLES_WEBGPU_MATERIAL_HAIR_TRANSMITS(material.w)) {
     runtime_flags |= ccl::SR_BSDF_HAS_TRANSMISSION;
   }
@@ -554,34 +730,52 @@ unsigned int direct_surface_light(UInt4 position,
   float bsdf_pdf;
   ccl::Spectrum bsdf;
 #ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
+  Float4 pass_diffuse{}, pass_glossy{};
   if (CYCLES_WEBGPU_MATERIAL_IS_STANDALONE(material.w)) {
+    const auto wi = -unpack_rgb(ray);
+    const auto Ng = unpack_rgb(geometric);
+    const bool mixed_glossy = material.w == CYCLES_WEBGPU_MATERIAL_DIFFUSE_GLOSSY;
+    const unsigned int mixed_flags = mixed_glossy ? static_cast<unsigned int>(parameters.z) : 0u;
+    const Float4 glossy_bump = cycles_mixed_glossy_bump(bump, hair, mixed_flags);
+    const Float4 corrected = cycles_bump_specular_normal(
+        glossy_bump, Float4{Ng.x, Ng.y, Ng.z, 0}, Float4{wi.x, wi.y, wi.z, 0},
+        std::bit_cast<Float4>(spec_normal));
     const auto n = CYCLES_WEBGPU_MATERIAL_USES_SPECULAR_NORMAL(material.w) ?
-                       unpack_rgb(spec_normal) : N;
+                       ccl::make_float3(corrected.x, corrected.y, corrected.z) : N;
     /* The stock bump shadowing term rejects a direction crossing the corrected
      * closure normal but still on the other side of the smooth surface normal. */
     if (ccl::dot(N, light.D) * ccl::dot(N, n) * ccl::dot(n, light.D) < 0.0f) {
       return Backlit;
     }
-    const auto wi = -unpack_rgb(ray);
     const float blur = cycles_glossy_blur(read_float(CYCLES_WEBGPU_LIGHT_FILTER_GLOSSY),
                                          std::bit_cast<float>(path.w));
-    const auto Ng = unpack_rgb(geometric);
     unsigned int lcg = hair_lcg ? *hair_lcg : 0u;
     /* Preserve all bits of the stock LCG, including patterns that encode NaN. */
-    hair.z = float(lcg & 0xffffu);
-    hair.w = float(lcg >> 16u);
+    if (CYCLES_WEBGPU_MATERIAL_IS_HAIR(material.w)) {
+      hair.z = float(lcg & 0xffffu);
+      hair.w = float(lcg >> 16u);
+    }
+    const bool mixed_diffuse = mixed_diffuse_translucent || mixed_glossy ||
+                               CYCLES_WEBGPU_MATERIAL_HAS_ORDERED_CLOSURES(material.w);
+    const Float4 extra = mixed_diffuse ? corrected : glass;
+    const Float4 diffuse_bump = (mixed_flags & CYCLES_WEBGPU_MIXED_BUMP_GLOSSY_ONLY) ?
+                                    Float4{} : bump;
+    const Float4 lobe_data = mixed_glossy ? diffuse_bump : hair;
     const Float4 eval = cycles_standalone_eval(
         material,
         specular,
         parameters,
+        extra,
+        lobe_data,
         glass,
-        hair,
         Float4{n.x, n.y, n.z, 0},
         Float4{Ng.x, Ng.y, Ng.z, 0},
         Float4{wi.x, wi.y, wi.z, 0},
         Float4{light.D.x, light.D.y, light.D.z, 0},
         blur,
-        lcg);
+        lcg,
+        pass_diffuse);
+    pass_glossy = Float4{1.0f, 1.0f, 1.0f, 0.0f} - pass_diffuse;
     if (hair_lcg) {
       *hair_lcg = lcg;
     }
@@ -592,21 +786,28 @@ unsigned int direct_surface_light(UInt4 position,
   else if (is_ggx(material)) {
     /* Glass lobes can also sample the light through the back of the interface. */
 #  ifdef CYCLES_WEBGPU_REFLECTION_ONLY
-    valid_hemisphere = ccl::dot(N, light.D) > 0.0f;
+    valid_hemisphere = translucent || ccl::dot(N, light.D) > 0.0f;
 #  else
-    valid_hemisphere = glass.x > 0.0f || ccl::dot(N, light.D) > 0.0f;
+    valid_hemisphere = translucent || glass.x > 0.0f || ccl::dot(N, light.D) > 0.0f;
 #  endif
     const auto wi = -unpack_rgb(ray);
-    const auto spec_N = unpack_rgb(spec_normal);
+    const auto Ng = unpack_rgb(geometric);
+    const Float4 spec_N = cycles_bump_specular_normal(
+        bump, Float4{Ng.x, Ng.y, Ng.z, 0}, Float4{wi.x, wi.y, wi.z, 0},
+        std::bit_cast<Float4>(spec_normal));
     const float blur = cycles_glossy_blur(read_float(CYCLES_WEBGPU_LIGHT_FILTER_GLOSSY),
                                            std::bit_cast<float>(path.w));
-    const Float4 eval = cycles_ggx_eval(material, specular, parameters, glass,
+    const Float4 eval = cycles_ggx_eval(material, specular, parameters, glass, hair,
                                        Float4{N.x, N.y, N.z, position.w == 2 ? 1.0f : 0.0f},
-                                       Float4{spec_N.x, spec_N.y, spec_N.z, 0},
+                                       spec_N,
+                                       std::bit_cast<Float4>(spec_normal),
+                                       bump,
                                        Float4{wi.x, wi.y, wi.z, 0},
                                        Float4{light.D.x, light.D.y, light.D.z, 0},
                                        blur,
-                                       glass.w == 0.0f ? fabsf(hair.w) : 0.0f);
+                                       light_passes,
+                                       pass_diffuse,
+                                       pass_glossy);
     bsdf = ccl::make_float3(eval.x, eval.y, eval.z);
     bsdf_pdf = eval.w;
   }
@@ -614,11 +815,22 @@ unsigned int direct_surface_light(UInt4 position,
 #endif
   {
     ccl::DiffuseBsdf diffuse{};
+#ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
+    const float shadowing = cycles_bump_shadowing(
+        Float4{N.x, N.y, N.z, 0}, bump, Float4{light.D.x, light.D.y, light.D.z, 0}, true);
+    if (shadowing == 0.0f) {
+      return Backlit;
+    }
+    diffuse.N = bump.w == 0.0f ? N : ccl::make_float3(bump.x, bump.y, bump.z);
+#else
     diffuse.N = N;
+#endif
     const auto albedo = ccl::make_float3(material.x, material.y, material.z);
     bsdf = albedo * ccl::bsdf_diffuse_eval(
         reinterpret_cast<const ccl::ShaderClosure *>(&diffuse), N, light.D, &bsdf_pdf);
 #ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
+    bsdf *= shadowing;
+    pass_diffuse = {1.0f, 1.0f, 1.0f, 0.0f};
     if (material.w == CYCLES_WEBGPU_MATERIAL_MIXED_TRANSPARENT) {
       const float weight_sum = parameters.x + specular.w;
       bsdf_pdf *= weight_sum > 0.0f ? parameters.x / weight_sum : 0.0f;
@@ -629,31 +841,88 @@ unsigned int direct_surface_light(UInt4 position,
   if (!valid_hemisphere || !(light.pdf > 0.0f)) {
     return Backlit;
   }
+#ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
+  if (light_passes) {
+    *diffuse_ratio = pass_diffuse;
+    *glossy_ratio = pass_glossy;
+  }
+#endif
 
+#ifndef CYCLES_WEBGPU_LIGHT_TREE
+  const ccl::Spectrum strength = read_rgb(strength_offset);
+#endif
+  float mis_weight = 1.0f;
+#ifdef CYCLES_WEBGPU_LIGHT_TREE
+  /* surface_shader_bsdf_eval() supplies zero forward PDF for NEE-only lamps. */
+  if (light.shader & ccl::SHADER_USE_MIS) {
+    mis_weight = ccl::power_heuristic(light.pdf, bsdf_pdf);
+  }
+#elif defined(CYCLES_WEBGPU_WAVEFRONT_LIGHT) && !defined(CYCLES_WEBGPU_POINT_DISTRIBUTION)
+  if (area_light) {
+    mis_weight = ccl::power_heuristic(light.pdf, bsdf_pdf);
+  }
+#endif
   ccl::float3 shadow_origin = P;
   ccl::float3 shadow_direction = light.D;
   float shadow_distance = light.t;
   bool skip_self = true;
 #ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
-  const float cutoff = std::bit_cast<float>(shadow_along.w);
-  if (cutoff > 0.0f) {
-    /* Match shadow_ray_offset() using the two offsets prepared by the surface shader. */
-    const float NL = ccl::dot(N, light.D);
-    const bool transmit = NL < 0.0f;
-    const auto Ng = unpack_rgb(geometric);
-    const float NgL = ccl::dot(transmit ? -Ng : Ng, light.D);
-    const float abs_NL = fabsf(NL);
-    const float amount = abs_NL < cutoff ?
-                             ccl::clamp(2.0f - (NgL + abs_NL) / cutoff, 0.0f, 1.0f) :
-                             ccl::clamp(1.0f - NgL / cutoff, 0.0f, 1.0f);
-    if (amount > 0.0f) {
-      shadow_origin += unpack_rgb(transmit ? shadow_opposite : shadow_along) * amount;
-      skip_self = NgL > 0.0f;
-    }
-  }
+  skip_self = ccl::webgpu_shadow_ray_offset(shadow_origin, light.D, N, unpack_rgb(geometric),
+                                             unpack_rgb(shadow_along), unpack_rgb(shadow_opposite),
+                                             std::bit_cast<float>(shadow_along.w));
   if (light.t != FLT_MAX) {
     /* Match Cycles' shadow_ray_setup() for a finite light sample. */
     shadow_direction = ccl::safe_normalize_len(light.P - shadow_origin, &shadow_distance);
+  }
+#endif
+
+  ccl::Spectrum rgb = bsdf * strength * (light.eval_fac / light.pdf * mis_weight);
+#ifdef CYCLES_WEBGPU_LIGHT_TREE
+  const unsigned int falloff = (light.type == ccl::LIGHT_POINT || light.type == ccl::LIGHT_AREA ||
+                                light.type == ccl::LIGHT_SUN) ? lamp_falloff_record(light.prim) : 0;
+  const ccl::Spectrum emission = falloff ?
+                                     evaluate_lamp_falloff(falloff, shadow_distance,
+                                                           ccl::make_float3(light.Ng),
+                                                           -shadow_direction) :
+                                     ccl::one_spectrum();
+  /* Stock SHADE_LIGHT_NEE terminates nonconstant emission against the average
+   * unshaded BSDF contribution, including the original lamp strength. */
+  const float falloff_average = falloff ? ccl::average(rgb) : 0.0f;
+  if (falloff) {
+    rgb *= emission;
+    if (ccl::is_zero(rgb)) {
+      return Backlit;
+    }
+  }
+#endif
+#ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
+  /* Match light_sample_terminate() and path_state_rng_light_termination() from
+   * the stock integrator. Roulette operates on the BSDF evaluation before
+   * multiplying by path throughput or launching a shadow ray. */
+  const float inv_threshold = read_float(CYCLES_WEBGPU_LIGHT_INV_RR_THRESHOLD);
+  if (inv_threshold > 0.0f
+#  ifdef CYCLES_WEBGPU_LIGHT_TREE
+      && !sample_emission
+#  endif
+  )
+  {
+    const ccl::Spectrum rr_eval =
+#  ifdef CYCLES_WEBGPU_LIGHT_TREE
+        falloff ? emission * falloff_average :
+#  endif
+                  rgb;
+    const float probability = ccl::reduce_max(ccl::fabs(rr_eval)) * inv_threshold;
+    if (probability < 1.0f) {
+      ccl::LightGlobals globals;
+      setup_light_sampling(globals, cycles_light_word(CYCLES_WEBGPU_LIGHT_RR_SAMPLING));
+      const int dimension = (int(path.x + subsurface_steps) + 1) * ccl::PRNG_BOUNCE_NUM +
+                            ccl::PRNG_LIGHT_TERMINATE;
+      const float terminate = ccl::path_rng_1D(&globals, sampling.x, sampling.y, dimension);
+      if (terminate >= probability) {
+        return Backlit;
+      }
+      rgb /= probability;
+    }
   }
 #endif
 
@@ -663,14 +932,24 @@ unsigned int direct_surface_light(UInt4 position,
       UInt4{ccl::PATH_RAY_VISIBILITY_SHADOW_OPAQUE,
             skip_self ? hit.z : static_cast<unsigned int>(OBJECT_NONE),
             skip_self ? hit.y : static_cast<unsigned int>(PRIM_NONE), 0}};
+#ifdef CYCLES_WEBGPU_VOLUME_FORWARD
+  /* integrate_surface_direct_light() enters/exits a copy of the volume stack
+   * for NEE only when the unoffset light direction transmits through sd->N. */
+  if (ccl::dot(N, light.D) < 0.0f) {
+    shadow_ray.options.x |= CYCLES_WEBGPU_SHADOW_TRANSMIT_VOLUME;
+  }
+#endif
+#ifdef CYCLES_WEBGPU_LIGHT_TREE
+  /* Stock shadow setup gives these lights an empty intersection interval. */
+  if (!(light.shader & ccl::SHADER_CAST_SHADOW)) {
+    shadow_ray.options.x = 0;
+  }
+#endif
   if (light.type == ccl::LIGHT_TRIANGLE) {
     /* The shadow ray starts at tmin 0. These two unused words carry the
      * sampled primitive and object for the stock BVH endpoint exclusion. */
     shadow_ray.origin.w = unsigned(light.prim) + 1;
     shadow_ray.options.w = unsigned(light.object);
-    if (!(light.shader & ccl::SHADER_CAST_SHADOW)) {
-      shadow_ray.options.x = 0;
-    }
 #if defined(CYCLES_WEBGPU_LIGHT_TREE) && defined(CYCLES_WEBGPU_DEFER_SHADOW)
     if (sample_emission) {
       ccl::LightGlobals tree;
@@ -703,20 +982,6 @@ unsigned int direct_surface_light(UInt4 position,
   }
 #endif
 
-#ifndef CYCLES_WEBGPU_LIGHT_TREE
-  const ccl::Spectrum strength = read_rgb(strength_offset);
-#endif
-  float mis_weight = 1.0f;
-#ifdef CYCLES_WEBGPU_LIGHT_TREE
-  if (light.type != ccl::LIGHT_POINT || (light.shader & ccl::SHADER_USE_MIS)) {
-    mis_weight = ccl::power_heuristic(light.pdf, bsdf_pdf);
-  }
-#elif defined(CYCLES_WEBGPU_WAVEFRONT_LIGHT) && !defined(CYCLES_WEBGPU_POINT_DISTRIBUTION)
-  if (area_light) {
-    mis_weight = ccl::power_heuristic(light.pdf, bsdf_pdf);
-  }
-#endif
-  const ccl::Spectrum rgb = bsdf * strength * (light.eval_fac / light.pdf * mis_weight);
   result = {rgb.x, rgb.y, rgb.z, 1};
   return Lit;
 #endif
@@ -737,6 +1002,9 @@ Float4 background_radiance()
     const unsigned int emitter,
     [[maybe_unused]] const float volume_segment_length)
 {
+  if (!tree->data.integrator.use_light_tree) {
+    return ccl::light_distribution_pdf_lamp(tree);
+  }
 #  ifdef CYCLES_WEBGPU_VOLUME_FORWARD
   if (volume_segment_length > 0.0f) {
     /* At a volume bounce, Cycles stores D * scatter_distance in the normal
@@ -832,8 +1100,15 @@ Float4 background_radiance()
                                                               volume_segment_length);
       mis = ccl::power_heuristic(std::bit_cast<float>(path.z), pdf);
     }
-    auto contribution = ccl::ensure_finite(
-        throughput * (read_rgb(words + CYCLES_WEBGPU_TREE_LAMP_STRENGTH) * (eval.eval_fac * mis)));
+    auto emission = read_rgb(words + CYCLES_WEBGPU_TREE_LAMP_STRENGTH);
+    if (const unsigned int falloff = lamp_falloff_record(nearest)) {
+      const auto normal = lamp.type == ccl::LIGHT_AREA ? ccl::make_float3(lamp.area.dir) :
+                          lamp.spot.is_sphere ?
+                              ccl::normalize(ray.P + distance * direction - lamp.co) :
+                              -direction;
+      emission *= evaluate_lamp_falloff(falloff, distance, normal, -direction);
+    }
+    auto contribution = ccl::ensure_finite(throughput * (emission * (eval.eval_fac * mis)));
     const float sum = ccl::reduce_add(ccl::fabs(contribution));
     if (sum > clamp_limit) {
       contribution *= clamp_limit / sum;
@@ -882,9 +1157,12 @@ Float4 background_radiance()
   bool sampled_emission = false;
   Interval<float> range{0.0f, position.w};
   if (emitter == ~0u) {
-    if (!light_tree_sample<true>(
-            &globals, random.z, P, D, position.w, OBJECT_NONE, flags, &light) ||
-        !sample_selected_tree_light<true, false>(
+    /* Match light_sample_from_volume_segment() for both stock selectors. */
+    const bool selected = globals.data.integrator.use_light_tree ?
+                              light_tree_sample<true>(
+                                  &globals, random.z, P, D, position.w, OBJECT_NONE, flags, &light) :
+                              light_distribution_sample(&globals, random.z, &light);
+    if (!selected || !sample_selected_tree_light<true, false>(
             globals, descriptor, rand, bounce, P, D, flags, light, strength, sampled_emission))
     {
       return;
@@ -918,13 +1196,25 @@ Float4 background_radiance()
     }
   }
   if ((light.shader & SHADER_EXCLUDE_SCATTER) ||
-      !(light.type == LIGHT_AREA || light.type == LIGHT_POINT || light.type == LIGHT_BACKGROUND))
+      !(light.type == LIGHT_AREA || light.type == LIGHT_POINT ||
+        light.type == LIGHT_SUN || light.type == LIGHT_BACKGROUND))
   {
     return;
   }
   sampled = {uint(light.emitter_id), uint(light.shader), uint(light.type), uint(light.prim)};
   point_pdf = {light.P.x, light.P.y, light.P.z, light.pdf};
   direction_distance = {light.D.x, light.D.y, light.D.z, light.t};
+  if (emitter != ~0u && (light.type == LIGHT_POINT || light.type == LIGHT_AREA ||
+                        light.type == LIGHT_SUN))
+  {
+    if (const unsigned int falloff = lamp_falloff_record(light.prim)) {
+      /* The volume shadow starts at P, with no surface-origin offset. */
+      float distance = light.t;
+      const float3 direction = distance == FLT_MAX ?
+                                   light.D : safe_normalize_len(light.P - P, &distance);
+      strength *= evaluate_lamp_falloff(falloff, distance, make_float3(light.Ng), -direction);
+    }
+  }
   strength *= light.eval_fac;
   strength_selection = {strength.x, strength.y, strength.z, light.pdf_selection};
   interval = {range.min, range.max, 0.0f, 0.0f};
@@ -965,19 +1255,6 @@ float cycles_triangle_hit_mis(UInt4 hit,
     return 1.0f;
   }
 
-  const auto first_primitive = ccl::light_fetch(&tree, ccl::object_prim_offset_tag{}, hit.z);
-  const auto first_triangle = ccl::light_fetch(&tree, ccl::object_lookup_offset_tag{}, hit.z);
-  const auto lookup = hit.y - first_primitive + first_triangle;
-  if (hit.y < first_primitive || lookup < first_triangle ||
-      lookup >= cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_TRIANGLE_TO_TREE_COUNT))
-  {
-    return 1.0f;
-  }
-  const auto emitter = ccl::light_fetch(&tree, ccl::triangle_to_tree_tag{}, lookup);
-  if (emitter == CYCLES_WEBGPU_TREE_NO_LAMP) {
-    return 1.0f;
-  }
-
   /* Match light_sample_mis_weight_forward_surface(), using the already
    * available hit, previous surface normal and BSDF PDF. */
   ccl::ShaderData sd{};
@@ -988,16 +1265,75 @@ float cycles_triangle_hit_mis(UInt4 hit,
   sd.prim = std::bit_cast<int>(hit.y);
   sd.time = -1.0f;
   const float t = std::bit_cast<float>(hit.w);
-  const float pdf = ccl::triangle_light_pdf(&tree, &sd, t) *
-                    ccl::light_tree_pdf<false>(&tree,
-                                               unpack_rgb(origin),
-                                               unpack_rgb(mis_origin_normal),
-                                               0.0f,
-                                               path.y,
-                                               sd.object,
-                                               emitter,
-                                               OBJECT_NONE);
+  float pdf = ccl::triangle_light_pdf(&tree, &sd, t);
+  if (tree.data.integrator.use_light_tree) {
+    const auto first_primitive = ccl::light_fetch(&tree, ccl::object_prim_offset_tag{}, hit.z);
+    const auto first_triangle = ccl::light_fetch(&tree, ccl::object_lookup_offset_tag{}, hit.z);
+    const auto lookup = hit.y - first_primitive + first_triangle;
+    if (hit.y < first_primitive || lookup < first_triangle ||
+        lookup >= cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_TRIANGLE_TO_TREE_COUNT))
+    {
+      return 1.0f;
+    }
+    const auto emitter = ccl::light_fetch(&tree, ccl::triangle_to_tree_tag{}, lookup);
+    if (emitter == CYCLES_WEBGPU_TREE_NO_LAMP) {
+      return 1.0f;
+    }
+    pdf *= ccl::light_tree_pdf<false>(&tree,
+                                     unpack_rgb(origin),
+                                     unpack_rgb(mis_origin_normal),
+                                     0.0f,
+                                     path.y,
+                                     sd.object,
+                                     emitter,
+                                     OBJECT_NONE);
+  }
   return ccl::power_heuristic(std::bit_cast<float>(path.z), pdf);
+}
+#endif
+
+#if defined(CYCLES_WEBGPU_LIGHT_TREE) && defined(CYCLES_WEBGPU_SHADE_BACKGROUND)
+static ccl::Spectrum accumulate_sun_lights(ccl::KernelGlobals globals,
+                                            const unsigned int descriptor,
+                                            const ccl::float3 direction,
+                                            const ccl::PathRayVisibility visibility,
+                                            const UInt4 path,
+                                            const ccl::Spectrum throughput,
+                                            const float clamp_limit)
+{
+  using namespace ccl;
+  const uint count = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_LAMP_COUNT);
+  Spectrum radiance = zero_spectrum();
+  for (uint index = 0; index < count; ++index) {
+    const uint words = light_tree_lamp_word(globals, index);
+    if (cycles_light_word(words + CYCLES_WEBGPU_TREE_LAMP_TYPE) != LIGHT_SUN) {
+      continue;
+    }
+    const KernelLight lamp = light_fetch(globals, lights_tag{}, index);
+    if (!(lamp.shader_id & SHADER_USE_MIS) ||
+        !is_light_shader_visible_to_path(lamp.shader_id, visibility, path.y))
+    {
+      continue;
+    }
+    const auto eval = sun_light_eval_from_intersection(&lamp, direction);
+    if (eval.eval_fac == 0.0f) {
+      continue;
+    }
+    const float pdf = eval.pdf * light_distribution_pdf_lamp(globals);
+    const float mis = (path.y & PATH_RAY_MIS_SKIP) ? 1.0f :
+                                                   power_heuristic(std::bit_cast<float>(path.z), pdf);
+    auto emission = read_rgb(words + CYCLES_WEBGPU_TREE_LAMP_STRENGTH);
+    if (const unsigned int falloff = lamp_falloff_record(index)) {
+      emission *= evaluate_lamp_falloff(falloff, FLT_MAX, -direction, -direction);
+    }
+    auto contribution = ensure_finite(throughput * emission * (eval.eval_fac * mis));
+    const float sum = reduce_add(fabs(contribution));
+    if (sum > clamp_limit) {
+      contribution *= clamp_limit / sum;
+    }
+    radiance += contribution;
+  }
+  return radiance;
 }
 #endif
 
@@ -1019,11 +1355,18 @@ float cycles_triangle_hit_mis(UInt4 hit,
                             Float4 parameters,
                             Float4 glass,
                             Float4 hair,
+                            Float4 bump,
                             Float4 &result,
                             Float4 &area_result,
-                            unsigned int &hair_lcg
+                            unsigned int &hair_lcg,
+                            unsigned int light_passes,
+                            Float4 &diffuse_ratio,
+                            Float4 &glossy_ratio
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
                             , UInt4 mis_origin_normal, Float4 throughput
+#  ifdef CYCLES_WEBGPU_SHADE_BACKGROUND
+                            , Float4 &sun_emission
+#  endif
 #endif
 #ifdef CYCLES_WEBGPU_DEFER_SHADOW
                             , UInt4 &shadow_origin,
@@ -1045,6 +1388,10 @@ float cycles_triangle_hit_mis(UInt4 hit,
 #  endif
 #endif
   area_result = {};
+  diffuse_ratio = glossy_ratio = {};
+#if defined(CYCLES_WEBGPU_LIGHT_TREE) && defined(CYCLES_WEBGPU_SHADE_BACKGROUND)
+  sun_emission = {};
+#endif
   hair_lcg = 0;
   if (material.w == CYCLES_WEBGPU_MATERIAL_HAIR_HUANG) {
     hair_lcg = ccl::lcg_state_init(
@@ -1052,10 +1399,11 @@ float cycles_triangle_hit_mis(UInt4 hit,
         sampling.y, 0xb4bc3953u);
   }
   const bool primary = (ray.w & ccl::PATH_RAY_VISIBILITY_CAMERA) != 0;
+  const float direct_clamp = read_float(CYCLES_WEBGPU_LIGHT_DIRECT_CLAMP);
   const float indirect_clamp = read_float(3);
   /* Cycles uses bounce - 1 for forward emission and bounce for NEE. */
-  const float forward_clamp = path.x <= 1 ? FLT_MAX : indirect_clamp;
-  const float nee_clamp = path.x == 0 ? FLT_MAX : indirect_clamp;
+  const float forward_clamp = path.x <= 1 ? direct_clamp : indirect_clamp;
+  const float nee_clamp = path.x == 0 ? direct_clamp : indirect_clamp;
 #ifdef CYCLES_WEBGPU_POINT_DISTRIBUTION
   const unsigned int descriptor = cycles_light_word(CYCLES_WEBGPU_POINT_LIGHTS_OFFSET);
   if (position.w == 0) {
@@ -1131,6 +1479,18 @@ float cycles_triangle_hit_mis(UInt4 hit,
 #  endif
   if (position.w == 0) {
 #  ifdef CYCLES_WEBGPU_SHADE_BACKGROUND
+#    ifdef CYCLES_WEBGPU_LIGHT_TREE
+    if (!tree.data.integrator.use_light_tree) {
+      const auto sun = accumulate_sun_lights(&tree,
+                                            descriptor,
+                                            direction,
+                                            visibility,
+                                            path,
+                                            ccl::make_float3(throughput.x, throughput.y, throughput.z),
+                                            forward_clamp);
+      sun_emission = {sun.x, sun.y, sun.z, 0.0f};
+    }
+#    endif
     /* Film Transparent hides camera misses without changing world lighting
      * on surfaces. Match the stock background kernel's early skip. */
     if ((path.y & ccl::PATH_RAY_TRANSPARENT_BACKGROUND) && cycles_film_transparent()) {
@@ -1147,7 +1507,7 @@ float cycles_triangle_hit_mis(UInt4 hit,
       const unsigned int emitter = cycles_light_word(descriptor + CYCLES_WEBGPU_TREE_WORLD_EMITTER);
       if (emitter != CYCLES_WEBGPU_TREE_NO_LAMP && !(path.y & ccl::PATH_RAY_MIS_SKIP) && !primary) {
         setup_world_sampling(tree, descriptor);
-        const float pdf = ccl::background_map_pdf(&tree, direction) *
+        const float pdf = ccl::background_light_pdf(&tree, previous_P, direction) *
                           forward_tree_selection_pdf(&tree, previous_P, previous_N, path.y,
                                                      emitter, volume_segment_length);
         rgb *= ccl::power_heuristic(std::bit_cast<float>(path.z), pdf);
@@ -1161,12 +1521,11 @@ float cycles_triangle_hit_mis(UInt4 hit,
       const unsigned int width = cycles_light_word(descriptor + CYCLES_WEBGPU_WORLD_WIDTH);
       auto rgb = ccl::zero_spectrum();
       if (ccl::is_light_shader_visible_to_path(world_shader, visibility, path.y)) {
-        rgb = width ? environment_radiance(width,
-                                           cycles_light_word(descriptor + CYCLES_WEBGPU_WORLD_HEIGHT),
-                                           cycles_light_word(descriptor + CYCLES_WEBGPU_WORLD_INTERPOLATION),
-                                           descriptor + CYCLES_WEBGPU_EXTENDED_LIGHT_WORDS,
-                                           direction) :
-                      read_rgb(8);
+        rgb = world_environment(width,
+                                cycles_light_word(descriptor + CYCLES_WEBGPU_WORLD_HEIGHT),
+                                cycles_light_word(descriptor + CYCLES_WEBGPU_WORLD_INTERPOLATION),
+                                descriptor + CYCLES_WEBGPU_EXTENDED_LIGHT_WORDS,
+                                direction);
       }
       result = {rgb.x, rgb.y, rgb.z, -forward_clamp};
     }
@@ -1207,7 +1566,11 @@ float cycles_triangle_hit_mis(UInt4 hit,
                          nullptr,
 #endif
                          hair,
-                         &hair_lcg);
+                         &hair_lcg,
+                         bump,
+                         light_passes != 0u,
+                         &diffuse_ratio,
+                         &glossy_ratio);
 #ifdef CYCLES_WEBGPU_DEFER_SHADOW
     shadow_origin = shadow.origin;
     shadow_direction = shadow.direction;

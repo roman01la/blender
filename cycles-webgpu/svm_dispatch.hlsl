@@ -2,6 +2,7 @@
 
 #include "../blender-platform/cycles-webgpu/material_layout.h"
 #include "../blender-platform/cycles-webgpu/path_state_layout.h"
+#include "../blender-platform/cycles-webgpu/volume_layout.h"
 
 StructuredBuffer<uint> svm_words : register(t0);
 StructuredBuffer<uint> surface_words : register(t1);
@@ -54,9 +55,10 @@ uint cycles_svm_hit_word(uint index)
 }
 
 extern void cycles_svm_material(uint shader, uint primitive, float u, float v,
-                                uint lane, uint film_aov,
+                                uint lane, uint eval_options,
                                 out float4 base, out float4 specular, out float4 layers,
-                                out float4 glass, out float4 subsurface, out float4 emission);
+                                out float4 glass, out float4 subsurface, out float4 emission,
+                                out float4 closure_normal);
 
 void cycles_svm_write_aov(uint lane, uint offset, uint color, float4 value)
 {
@@ -68,6 +70,23 @@ void cycles_svm_write_aov(uint lane, uint offset, uint color, float4 value)
     materials[base + (color != 0 ? slot : colors + slot)] += value;
   }
 }
+
+#ifdef CYCLES_WEBGPU_ORDERED_CLOSURES
+uint cycles_svm_ordered_base(uint lane)
+{
+  const uint aov_slots = camera_words[CYCLES_WEBGPU_CAMERA_AOV_COLORS] +
+                         camera_words[CYCLES_WEBGPU_CAMERA_AOV_VALUES];
+  return (CYCLES_WEBGPU_MATERIAL_VECTORS + aov_slots) * ray_words[0] +
+         CYCLES_WEBGPU_ORDERED_PATH_VECTORS * lane;
+}
+
+void cycles_svm_write_ordered_lobe(uint lane, uint index, float4 color, float4 normal)
+{
+  const uint address = cycles_svm_ordered_base(lane) + CYCLES_WEBGPU_ORDERED_LOBE_VECTORS * index;
+  materials[address] = color;
+  materials[address + 1u] = normal;
+}
+#endif
 
 uint4 cycles_svm_context(uint lane, uint field)
 {
@@ -96,11 +115,11 @@ uint4 cycles_svm_context(uint lane, uint field)
                  path_words[path + CYCLES_WEBGPU_PATH_TRANSMISSION_BOUNCE]);
   }
   if (field == CYCLES_WEBGPU_SVM_DIFFERENTIAL) {
-    if ((svm_words[1] & CYCLES_WEBGPU_SVM_PIXEL_WIREFRAME) == 0) {
+    if ((svm_words[1] & CYCLES_WEBGPU_SVM_NEEDS_DIFFERENTIALS) == 0) {
       return uint4(0, 0, 0, 0);
     }
     const uint base = CYCLES_WEBGPU_RAY_DIFFERENTIAL_BASE(ray_words[0], lane);
-    return uint4(ray_words[base], ray_words[base + 1], 0, 0);
+    return uint4(ray_words[base], ray_words[base + 1], cycles_svm_hit_word(surface + 4), 0);
   }
 #ifdef CYCLES_WEBGPU_SCENE_QUERIES
   if (field == CYCLES_WEBGPU_QUERY_RNG) {
@@ -132,8 +151,10 @@ uint4 cycles_svm_context(uint lane, uint field)
     return cycles_svm_scene_context(field, cycles_svm_hit_word(surface + 2),
                                    surface_words[surface + 7]);
   }
+  const uint shader = surface_words[surface + 7] & CYCLES_WEBGPU_SVM_SHADER_ID_MASK;
+  const uint shader_flags = metadata_words[metadata_words[4] + shader];
   return uint4(ray_words[ray + 8], path_words[path + CYCLES_WEBGPU_PATH_FLAGS],
-               path_words[path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE], 0);
+               path_words[path + CYCLES_WEBGPU_PATH_TRANSPARENT_BOUNCE], shader_flags);
 }
 
 [numthreads(64, 1, 1)]
@@ -174,19 +195,46 @@ void main(uint3 id : SV_DispatchThreadID)
   float4 glass = float4(0, 0, 0, 0);
   float4 subsurface = float4(0, 0, 0, 0);
   float4 emission = float4(0, 0, 0, 0);
+  float4 closure_normal = float4(0, 0, 0, 0);
   const uint special_hit = cycles_svm_hit_word(base + CYCLES_WEBGPU_HIT_SPECIAL);
-  if (special_hit == CYCLES_WEBGPU_HIT_SUBSURFACE_EXIT) {
-    // Cycles replaces the entry material with white diffuse scattering at the exit.
+  const bool subsurface_exit = special_hit == CYCLES_WEBGPU_HIT_SUBSURFACE_EXIT;
+  const uint shader = surface_words[base + 7] & CYCLES_WEBGPU_SVM_SHADER_ID_MASK;
+  const uint shader_flags = surface_status == 1 || surface_status == 2 ?
+                                metadata_words[metadata_words[4] + shader] : 0u;
+  const bool bump_correction = (shader_flags & CYCLES_WEBGPU_SHADER_BUMP_CORRECTION) != 0u;
+  const bool bump_exit = subsurface_exit &&
+                         (shader_flags & CYCLES_WEBGPU_SHADER_BSSRDF_BUMP) != 0u;
+  if (subsurface_exit && !bump_exit) {
+    // The stock exit shader always replaces the material with white diffuse.
     result = float4(1, 1, 1, 1);
   }
-  else if (special_hit == 0u && (surface_status == 1 || surface_status == 2)) {
+  else if ((special_hit == 0u || special_hit == CYCLES_WEBGPU_MIXED_VOLUME_BOUNDARY || bump_exit) &&
+           (surface_status == 1 || surface_status == 2)) {
+    const uint eval_options = (film_aov && !subsurface_exit ? CYCLES_WEBGPU_SVM_EVAL_AOV : 0u) |
+                              (bump_exit ? CYCLES_WEBGPU_SVM_EVAL_SUBSURFACE_EXIT : 0u) |
+                              (bump_correction ? CYCLES_WEBGPU_SVM_EVAL_BUMP_CORRECTION : 0u);
     cycles_svm_material(surface_words[base + 7], cycles_svm_hit_word(base + 1),
                         __builtin_bit_cast(float, cycles_svm_hit_word(base + 5)),
-                        __builtin_bit_cast(float, cycles_svm_hit_word(base + 6)), lane, uint(film_aov),
-                        result, specular, layers, glass, subsurface, emission);
+                        __builtin_bit_cast(float, cycles_svm_hit_word(base + 6)), lane, eval_options,
+                        result, specular, layers, glass, subsurface, emission, closure_normal);
+#ifdef CYCLES_WEBGPU_ORDERED_CLOSURES
+    if (CYCLES_WEBGPU_MATERIAL_HAS_ORDERED_CLOSURES(result.w)) {
+      result.x = float(cycles_svm_ordered_base(lane));
+      result.z = float(bump_correction);
+    }
+#endif
+    const bool diffuse_translucent = result.w == CYCLES_WEBGPU_MATERIAL_DIFFUSE_TRANSLUCENT;
+    if (closure_normal.w != 0.0f || diffuse_translucent) {
+      if (closure_normal.w != 0.0f && bump_correction) {
+        closure_normal.w += 1.0f;
+      }
+      if (diffuse_translucent) {
+        layers.w = float(bump_correction);
+      }
+    }
   }
   else if (surface_status != 0) {
-    result.w = 2;
+    result.w = CYCLES_WEBGPU_MATERIAL_UNSHADED;
   }
   const uint material = CYCLES_WEBGPU_MATERIAL_VECTORS * lane;
   materials[material] = result;
@@ -195,4 +243,5 @@ void main(uint3 id : SV_DispatchThreadID)
   materials[material + 3] = glass;
   materials[material + 4] = subsurface;
   materials[material + CYCLES_WEBGPU_MATERIAL_EMISSION_SLOT] = emission;
+  materials[material + CYCLES_WEBGPU_MATERIAL_NORMAL_SLOT] = closure_normal;
 }

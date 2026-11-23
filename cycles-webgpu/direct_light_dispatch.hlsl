@@ -1,5 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
+#include "../blender-platform/cycles-webgpu/lighting_layout.h"
+
+typedef float float3 __attribute__((ext_vector_type(3)));
+
 #ifdef CYCLES_WEBGPU_DEFER_SHADOW
 RWStructuredBuffer<uint4> shadow_words : register(u0);
 #else
@@ -27,6 +31,8 @@ StructuredBuffer<float4> materials : register(t6);
 StructuredBuffer<uint> path_words : register(t7);
 #endif
 
+#include "ordered_closure_access.hlsl"
+
 #ifndef CYCLES_WEBGPU_DEFER_SHADOW
 uint cycles_scene_word(uint index)
 {
@@ -41,6 +47,8 @@ uint cycles_light_word(uint index)
 
 #ifdef CYCLES_WEBGPU_WAVEFRONT_LIGHT
 #  include "wavefront_light.hlsl"
+#  define CYCLES_WEBGPU_LIGHT_PASS_BUFFER samples
+#  include "light_passes.hlsl"
 #  ifdef CYCLES_WEBGPU_LIGHT_TREE
 extern float cycles_triangle_hit_mis(uint4 hit, uint4 position, uint4 geometric,
                                     uint4 ray, uint4 origin, uint4 path,
@@ -107,7 +115,10 @@ void main(uint3 id : SV_DispatchThreadID)
   uint volume_segment_length = 0u;
 #  ifdef CYCLES_WEBGPU_VOLUME_FORWARD
   if ((ray.w & CYCLES_WEBGPU_VOLUME_SCATTER_VISIBILITY) != 0u) {
-    volume_segment_length = ray_words[CYCLES_WEBGPU_RAY_VOLUME_MIS_LENGTH(ray_words[0], lane)];
+    const bool differentials = (cycles_light_word(CYCLES_WEBGPU_LIGHT_EXTENDED) &
+                                CYCLES_WEBGPU_LIGHT_VOLUME_DIFFERENTIALS) != 0u;
+    volume_segment_length = ray_words[CYCLES_WEBGPU_RAY_VOLUME_MIS_LENGTH(
+        ray_words[0], lane, differentials)];
   }
 #  endif
   const uint4 mis_origin_normal = uint4(path_words[mis_normal_word],
@@ -126,12 +137,18 @@ void main(uint3 id : SV_DispatchThreadID)
   }
 #endif
   uint hair_lcg;
+  float4 diffuse_ratio, glossy_ratio;
+  const uint capacity = ray_words[0];
+  const bool save_ratios = path.x == 0u && cycles_light_pass_enabled(capacity);
   const float4 hair = materials[material + 4];
   cycles_wavefront_light(position, normal, spec_normal, geometric, shadow_along, shadow_opposite,
                          closest, ray, origin, path, sampling,
                          path_words[path_base + CYCLES_WEBGPU_PATH_EXTRA_RNG_STEPS],
                          materials[material], materials[material + 1], materials[material + 2],
-                         materials[material + 3], hair, result, area_result, hair_lcg
+                         materials[material + 3], hair,
+                         materials[material + CYCLES_WEBGPU_MATERIAL_NORMAL_SLOT],
+                         result, area_result, hair_lcg, uint(save_ratios), diffuse_ratio,
+                         glossy_ratio
 #ifdef CYCLES_WEBGPU_LIGHT_TREE
                          , mis_origin_normal, throughput
 #endif
@@ -142,6 +159,11 @@ void main(uint3 id : SV_DispatchThreadID)
 #  endif
 #endif
                          );
+  if (save_ratios) {
+    const uint record = cycles_light_pass_record(capacity, lane);
+    samples[record + 2u] = diffuse_ratio;
+    samples[record + 3u] = glossy_ratio;
+  }
 #ifdef CYCLES_WEBGPU_DEFER_SHADOW
   const uint shadow = 4 * lane;
   shadow_words[shadow] = shadow_origin;
