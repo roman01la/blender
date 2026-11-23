@@ -56,9 +56,10 @@ def package(installation: Path, output: Path, python_process: Path | None = None
     if cycles_webgpu is not None:
         shaders = [cycles_webgpu.resolve() / name for name in (
             "stock-camera.wgsl", "bvh2-compact.wgsl", "surface-compact.wgsl",
-            "svm-compact.wgsl", "wavefront-light.wgsl", "path-update.wgsl",
+            "svm-compact.wgsl", "svm-compact-core.wgsl", "local-closures.wgsl",
+            "wavefront-light.wgsl", "path-update.wgsl",
         )]
-        for name in ("svm-compact-core.wgsl", "svm-compact-textures.wgsl",
+        for name in ("svm-compact-textures.wgsl",
                      "svm-compact-textures-validated.wgsl",
                      "svm-compact-textures-validated-hardware.wgsl"):
             svm_variant = cycles_webgpu.resolve() / name
@@ -172,7 +173,7 @@ def package(installation: Path, output: Path, python_process: Path | None = None
             if want_light_tree:
                 shaders.append(cycles_webgpu.resolve() / "shade-background-tree-guides.wgsl")
         for name in ("path-update-closures.wgsl", "path-update-reflection-closures.wgsl",
-                     "denoise-surface-closures.wgsl", "local-closures.wgsl"):
+                     "denoise-surface-closures.wgsl"):
             variant = cycles_webgpu.resolve() / name
             if variant.is_file():
                 shaders.append(variant)

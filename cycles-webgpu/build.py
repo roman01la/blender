@@ -1229,3 +1229,5 @@ if __name__ == "__main__":
     if options.denoise_background and not options.shade_background:
         parser.error("--denoise-background requires --shade-background")
     build(options)
+    if options.svm_core and not (options.svm_textures or options.local_closures):
+        build(argparse.Namespace(**{**vars(options), "local_closures": True}))

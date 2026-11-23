@@ -2649,8 +2649,9 @@ bool WebGPURenderPipeline::reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WOR
   }
   /* This kernel fuses the legacy opaque reflection stages, including inline visibility.
    * Leave the split stages registered for scenes and passes outside that contract. */
-  const char *enable_local_closures = std::getenv("CYCLES_WEBGPU_FUSED_CLOSURES");
-  p.local_closures = enable_local_closures && std::string_view(enable_local_closures) == "1" &&
+  const char *fused_closures = std::getenv("CYCLES_WEBGPU_FUSED_CLOSURES");
+  const bool allow_fusion = !fused_closures || std::string_view(fused_closures) != "0";
+  p.local_closures = allow_fusion &&
                      !adaptive && !guided && !p.aov_materials && !p.surface_passes_active &&
                      !p.light_passes_active && !p.emission_pass_active &&
                      std::ranges::none_of(geometry_passes, [&](const PassType type) {
