@@ -119,6 +119,7 @@ def package(installation: Path, output: Path, python_process: Path | None = None
             shaders.extend(grid_guide_shaders)
         shaders.extend(port / "cycles-webgpu" / name for name in (
             "film.wgsl", "path-state.wgsl", "wavefront-queue.wgsl", "wavefront-sort.wgsl",
+            "surface-roulette-queue.wgsl",
         ))
         for name in ("film-surface.wgsl", "film-ao.wgsl", "film-ao-prepare.wgsl"):
             surface_pass = cycles_webgpu.resolve() / name

@@ -37,6 +37,10 @@ constexpr DeviceKernel webgpu_reset_volume_shadow_queue = DeviceKernel(DEVICE_KE
 constexpr DeviceKernel webgpu_compact_volume_shadow_queue = DeviceKernel(DEVICE_KERNEL_NUM + 7);
 constexpr DeviceKernel webgpu_compact_guided_volume_shadow_queue = DeviceKernel(DEVICE_KERNEL_NUM + 8);
 constexpr DeviceKernel webgpu_finish_volume_shadow_grid_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 9);
+constexpr DeviceKernel webgpu_reset_surface_roulette_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 10);
+constexpr DeviceKernel webgpu_filter_surface_roulette_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 11);
+constexpr DeviceKernel webgpu_publish_surface_roulette_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 12);
+constexpr DeviceKernel webgpu_restore_surface_roulette_kernel = DeviceKernel(DEVICE_KERNEL_NUM + 13);
 
 struct WebGPUKernelBinding {
   enum class Type {

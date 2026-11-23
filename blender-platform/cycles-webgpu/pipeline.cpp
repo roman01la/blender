@@ -134,6 +134,10 @@ constexpr uint32_t radiance_header_words = 4;
 constexpr uint32_t denoising_words_per_path = 12;
 constexpr uint32_t work_tile_header_words = 4;
 constexpr uint32_t work_tile_words = 8;
+/* Keep the original and filtered surface indices until SVM is complete. */
+constexpr uint32_t surface_roulette_queue_words_per_path = 2;
+constexpr uint32_t surface_roulette_queue_header_words = 2;
+constexpr uint32_t surface_roulette_dispatch_words = 5;
 /* Origin, direction, self-intersection IDs, and source triangle geometry. */
 constexpr uint32_t shadow_words_per_path = 16;
 
@@ -173,7 +177,8 @@ constexpr auto path_buffer_sizes(const bool adaptive,
                                  const bool emission = false,
                                  const bool surface_passes = false,
                                  const bool light_passes = false,
-                                 const bool compact_volume_shadows = false)
+                                 const bool compact_volume_shadows = false,
+                                 const bool compact_surface_roulette = false)
 {
   return std::array{PathBufferSize{pixel_words_per_path},
                     PathBufferSize{
@@ -192,6 +197,10 @@ constexpr auto path_buffer_sizes(const bool adaptive,
                     PathBufferSize{CYCLES_WEBGPU_PATH_WORDS},
                     PathBufferSize{scattering ? CYCLES_WEBGPU_VOLUME_STATE_WORDS :
                                                 (absorption ? 1u : 0u)},
+                    PathBufferSize{
+                        compact_surface_roulette ? surface_roulette_queue_words_per_path : 0u,
+                        compact_surface_roulette ? surface_roulette_queue_header_words : 0u},
+                    PathBufferSize{0, compact_surface_roulette ? surface_roulette_dispatch_words : 0u},
                     /* A batch cannot admit more than one work tile per path slot. */
                     PathBufferSize{work_tile_words, work_tile_header_words}};
 }
@@ -205,11 +214,11 @@ constexpr uint32_t path_capacity_for_limits(const WebGPUComputeLimits &limits,
   uint64_t capacity = std::numeric_limits<int>::max();
   size_t words_per_path = 0;
   for (const auto &buffer : buffers) {
-    if (buffer.words_per_path == 0) {
-      continue;
-    }
     if (binding_words < buffer.header_words) {
       return 0;
+    }
+    if (buffer.words_per_path == 0) {
+      continue;
     }
     capacity = std::min<uint64_t>(
         capacity, (binding_words - buffer.header_words) / buffer.words_per_path);
@@ -735,6 +744,10 @@ struct WebGPURenderPipeline::Impl {
   WebGPUPathStateStorage path_state{device};
   device_only_memory<uint32_t> absorption_state{&device, "WebGPU homogeneous absorption paths"};
   WebGPUWavefrontQueue wavefront_queue{device};
+  device_only_memory<uint32_t> surface_roulette_queue{&device, "WebGPU surface roulette queue"};
+  device_only_memory<uint32_t> surface_roulette_dispatch{&device, "WebGPU SVM indirect dispatch"};
+  std::array<uint32_t, size_t(webgpu_svm_hardware_textures_kernel) + 1> svm_workgroup_widths{};
+  bool surface_roulette_loaded = false;
   device_only_memory<float> materials{&device, "WebGPU evaluated materials"};
   device_only_memory<float> radiance{&device, "WebGPU sampled radiance"};
   device_only_memory<float> denoising{&device, "WebGPU denoising paths"};
@@ -994,6 +1007,7 @@ struct WebGPURenderPipeline::Impl {
       return false;
     }
     if (svm) {
+      svm_workgroup_widths[kernel] = compiled_width;
       LOG_INFO << "Cycles WebGPU SVM workgroup width " << compiled_width << ", negotiated maximum "
                << max_svm_width;
     }
@@ -1582,6 +1596,103 @@ struct WebGPURenderPipeline::Impl {
     return DeviceKernelArguments(&buffer.device_pointer...);
   }
 
+  bool prepare_surface_roulette()
+  {
+    const auto source = load_shader("surface-roulette-queue.wgsl");
+    if (source.empty()) {
+      return true;
+    }
+    constexpr auto storage = WebGPUKernelBinding::Type::Storage;
+    constexpr auto read_only = WebGPUKernelBinding::Type::ReadOnlyStorage;
+    constexpr WebGPUKernelBinding ray = {0, storage, sizeof(uint32_t)};
+    constexpr WebGPUKernelBinding queue = {
+        4, storage, surface_roulette_queue_header_words * sizeof(uint32_t)};
+    constexpr WebGPUKernelBinding reset[] = {ray, queue};
+    constexpr WebGPUKernelBinding filter[] = {
+        ray, {1, read_only, CYCLES_WEBGPU_PATH_WORDS * sizeof(uint32_t)},
+        {2, read_only, 16 * sizeof(uint32_t)}, {3, read_only, 5 * sizeof(uint32_t)}, queue,
+        {5, storage, CYCLES_WEBGPU_MATERIAL_WORDS * sizeof(uint32_t)}};
+    constexpr WebGPUKernelBinding publish[] = {
+        ray, queue, {6, storage, surface_roulette_dispatch_words * sizeof(uint32_t)}};
+    surface_roulette_loaded =
+        device_webgpu_register_kernel(device, webgpu_reset_surface_roulette_kernel, source, 1,
+                                      reset, "reset_surface_roulette") &&
+        device_webgpu_register_kernel(device, webgpu_filter_surface_roulette_kernel, source,
+                                      workgroup_size, filter, "filter_surface_roulette") &&
+        device_webgpu_register_kernel(device, webgpu_publish_surface_roulette_kernel, source,
+                                      workgroup_size, publish, "publish_surface_roulette") &&
+        device_webgpu_register_kernel(device, webgpu_restore_surface_roulette_kernel, source,
+                                      workgroup_size, reset, "restore_surface_roulette");
+    return surface_roulette_loaded;
+  }
+
+  bool surface_roulette_enabled() const
+  {
+    return surface_roulette_loaded && !portal_materials && !absorption;
+  }
+
+  bool reserve_surface_roulette(const uint32_t capacity)
+  {
+    if (!surface_roulette_enabled()) {
+      surface_roulette_queue.free();
+      surface_roulette_dispatch.free();
+      return true;
+    }
+
+    const auto limits = device_webgpu_compute_limits(device);
+    const uint32_t width = svm_workgroup_widths[active_svm_kernel];
+    if (limits.workgroups_per_dimension == 0 || width == 0) {
+      return fail("Cycles WebGPU could not initialize the surface roulette dispatch dimensions");
+    }
+    surface_roulette_queue.alloc_to_device(
+        surface_roulette_queue_header_words + surface_roulette_queue_words_per_path * size_t(capacity));
+    if (!surface_roulette_queue.device_pointer) {
+      return fail("Cycles WebGPU could not allocate the surface roulette queue");
+    }
+
+    const std::array<uint32_t, surface_roulette_dispatch_words> grid = {
+        0, 1, 1, limits.workgroups_per_dimension, width};
+    if (!upload(device, surface_roulette_dispatch, std::span(grid))) {
+      return fail("Cycles WebGPU could not initialize the surface roulette indirect dispatch");
+    }
+    LOG_INFO << "Cycles WebGPU compacts roulette-rejected material lanes";
+    return true;
+  }
+
+  bool enqueue_compact_surface_roulette(const uint32_t count,
+                                        const WebGPUDispatch &setup,
+                                        const WebGPUDispatch &evaluate)
+  {
+    auto &paths = path_state.words();
+    const auto reset = bind(rays, surface_roulette_queue);
+    const auto filter = bind(rays, paths, points, scene.surface, surface_roulette_queue, materials);
+    const auto publish = bind(rays, surface_roulette_queue, surface_roulette_dispatch);
+    const auto sort = bind(rays, points, scene.svm);
+
+    const WebGPUDispatch before[] = {
+        setup,
+        {webgpu_reset_surface_roulette_kernel, reset, 1},
+        {webgpu_filter_surface_roulette_kernel, filter, count},
+        {webgpu_publish_surface_roulette_kernel, publish, count},
+        {webgpu_sort_surface_paths_kernel, sort, WebGPUWavefrontQueue::surface_sort_work_size(count)},
+    };
+    const size_t before_count = sort_surface_shaders && count > 1 ? 5 : 4;
+    if (!wavefront_queue.enqueue_stage(DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE,
+                                       int(path_capacity), rays, paths,
+                                       std::span(before).first(before_count))) {
+      return false;
+    }
+
+    // The published indirect grid and filtered queue belong only to SVM.
+    // Restore the complete shading queue before forward lighting and retirement.
+    const WebGPUDispatch after[] = {
+        {evaluate.kernel, evaluate.args, count, surface_roulette_dispatch.device_pointer,
+         1, evaluate.texture_atlas},
+        {webgpu_restore_surface_roulette_kernel, reset, count},
+    };
+    return device_webgpu_enqueue(device, count, after);
+  }
+
   bool prepare_compact_volume_shadow_queue()
   {
     if (compact_volume_shadow_queue_loaded) {
@@ -1674,6 +1785,9 @@ bool WebGPURenderPipeline::initialize(const WebGPURenderShaders &shaders)
     return p.fail("Cycles WebGPU render pipeline failed to compile a kernel");
   }
   p.load_shader = shaders.load_shader;
+  if (!p.prepare_surface_roulette()) {
+    return p.fail("Cycles WebGPU could not prepare surface roulette compaction");
+  }
   if (!p.wavefront_queue.prepare_surface_sort(p.load_shader("wavefront-sort.wgsl"))) {
     return p.fail("Cycles WebGPU could not compile the shader sorting kernel");
   }
@@ -2496,7 +2610,7 @@ bool WebGPURenderPipeline::reset(std::span<const float, CYCLES_WEBGPU_CAMERA_WOR
       adaptive, p.deferred_shadow, guided, p.textured_lights, extra_material_words,
       !p.query_sampling.empty(), p.ray_differentials, p.triangle_tangents, p.absorption,
       p.scattering, p.emission_pass_active, p.surface_passes_active, p.light_passes_active,
-      p.compact_volume_shadows);
+      p.compact_volume_shadows, p.surface_roulette_enabled());
   const uint32_t device_capacity = path_capacity_for_limits(
       limits, path_buffers, bytes_per_path);
   if (device_capacity < min_path_capacity) {
@@ -2997,6 +3111,9 @@ bool WebGPURenderPipeline::Impl::reserve_paths(const uint32_t capacity)
       !path_state.alloc(capacity) || !wavefront_queue.alloc()) {
     return fail("Cycles WebGPU could not allocate path state and queue counters");
   }
+  if (!reserve_surface_roulette(capacity)) {
+    return false;
+  }
   queue->zero_to_device(path_state.words());
   if (!wavefront_queue.set_capacity(*queue, rays, path_state.words()) ||
       !device_webgpu_error(device).empty())
@@ -3007,7 +3124,7 @@ bool WebGPURenderPipeline::Impl::reserve_paths(const uint32_t capacity)
   const device_memory *allocations[] = {
       &pixels, &rays, &hits, &shadow_rays, &points, &radiance, &denoising,
       &surface_pass_values, &materials, &path_state.words(), &absorption_state,
-      &volume_shadow_indirect};
+      &volume_shadow_indirect, &surface_roulette_queue, &surface_roulette_dispatch};
   uint64_t allocated_bytes = 0;
   size_t largest_binding_bytes = 0;
   for (const device_memory *buffer : allocations) {
@@ -3339,9 +3456,14 @@ bool WebGPURenderPipeline::enqueue_stage(const DeviceKernel stage)
   continuation.push_back(accumulate);
   /* Visibility traversal and BSDF continuation are the expensive stages.
    * Submit them separately to bound the work in each browser command buffer. */
-  if (!p.wavefront_queue.enqueue_material_stage(
-          stage, capacity, p.rays, paths, p.points, p.scene.svm, p.sort_surface_shaders,
-          setup_surface, evaluate_material) ||
+  const bool material_ready = p.surface_roulette_enabled() &&
+                                      stage == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE ?
+                                  p.enqueue_compact_surface_roulette(count, setup_surface,
+                                                                     evaluate_material) :
+                                  p.wavefront_queue.enqueue_material_stage(
+                                      stage, capacity, p.rays, paths, p.points, p.scene.svm,
+                                      p.sort_surface_shaders, setup_surface, evaluate_material);
+  if (!material_ready ||
       (p.aov_active && !device_webgpu_enqueue(p.device, count, {&accumulate_aovs, 1})) ||
       !device_webgpu_enqueue(p.device, count, {&sample_light, 1}) ||
       (p.textured_lights && !device_webgpu_enqueue(p.device, count, {&shade_emission, 1})) ||

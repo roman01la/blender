@@ -131,14 +131,19 @@ class WebGPUWavefrontQueue {
       return enqueue_stage(stage, capacity, rays, paths, commands);
     }
 
-    const uint32_t partitions = (evaluate.work_size - 1) / surface_sort_partition_size + 1;
     const DeviceKernelArguments sort_args(
         &rays.device_pointer, &surfaces.device_pointer, &svm.device_pointer);
     const WebGPUDispatch commands[] = {
         setup,
-        {webgpu_sort_surface_paths_kernel, sort_args, partitions * surface_sort_group_size},
+        {webgpu_sort_surface_paths_kernel, sort_args, surface_sort_work_size(evaluate.work_size)},
         evaluate};
     return enqueue(compact_surface_kernel, capacity, rays, paths, commands);
+  }
+
+  static uint32_t surface_sort_work_size(const uint32_t count)
+  {
+    const uint32_t partitions = (count - 1) / surface_sort_partition_size + 1;
+    return partitions * surface_sort_group_size;
   }
 
   bool read(int capacity,
